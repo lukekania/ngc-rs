@@ -85,8 +85,9 @@ fn resolve_tsconfig_inner(
         source: e,
     })?;
 
+    let stripped = strip_jsonc_comments(&contents);
     let raw: RawTsConfig =
-        serde_json::from_str(&contents).map_err(|e| NgcError::TsConfigParse {
+        serde_json::from_str(&stripped).map_err(|e| NgcError::TsConfigParse {
             path: config_path.to_path_buf(),
             source: e,
         })?;
@@ -138,6 +139,64 @@ fn resolve_tsconfig_inner(
         exclude,
         files,
     })
+}
+
+/// Strip `//` line comments and `/* */` block comments from JSONC input.
+///
+/// Preserves comment-like sequences inside JSON string literals.
+/// tsconfig.json files are JSONC (JSON with Comments) by convention.
+fn strip_jsonc_comments(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        match bytes[i] {
+            b'"' => {
+                // String literal — copy verbatim until closing quote
+                out.push('"');
+                i += 1;
+                while i < len {
+                    if bytes[i] == b'\\' && i + 1 < len {
+                        out.push(bytes[i] as char);
+                        out.push(bytes[i + 1] as char);
+                        i += 2;
+                    } else if bytes[i] == b'"' {
+                        out.push('"');
+                        i += 1;
+                        break;
+                    } else {
+                        out.push(bytes[i] as char);
+                        i += 1;
+                    }
+                }
+            }
+            b'/' if i + 1 < len && bytes[i + 1] == b'/' => {
+                // Line comment — skip to end of line
+                i += 2;
+                while i < len && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
+                // Block comment — skip to */
+                i += 2;
+                while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                if i + 1 < len {
+                    i += 2; // skip */
+                }
+            }
+            _ => {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+    }
+
+    out
 }
 
 /// Merge compiler options from parent and child, with child taking precedence.
@@ -233,6 +292,67 @@ mod tests {
             result.unwrap_err(),
             NgcError::TsConfigExtendsNotFound { .. }
         ));
+    }
+
+    #[test]
+    fn test_jsonc_with_line_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("tsconfig.json");
+        fs::write(
+            &config_path,
+            r#"// this is a comment
+{
+  // another comment
+  "compilerOptions": {
+    "baseUrl": "."
+  }
+}"#,
+        )
+        .unwrap();
+
+        let config = resolve_tsconfig(&config_path).unwrap();
+        assert_eq!(config.compiler_options.base_url.as_deref(), Some("."));
+    }
+
+    #[test]
+    fn test_jsonc_with_block_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("tsconfig.json");
+        fs::write(
+            &config_path,
+            r#"/* To learn more about Typescript configuration file: https://www.typescriptlang.org/docs/handbook/tsconfig-json.html. */
+/* To learn more about Angular compiler options: https://angular.dev/reference/configs/angular-compiler-options. */
+{
+  "compilerOptions": {
+    "baseUrl": "."
+  }
+}"#,
+        )
+        .unwrap();
+
+        let config = resolve_tsconfig(&config_path).unwrap();
+        assert_eq!(config.compiler_options.base_url.as_deref(), Some("."));
+    }
+
+    #[test]
+    fn test_jsonc_preserves_strings_with_slashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("tsconfig.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "compilerOptions": {
+    "baseUrl": "https://example.com"
+  }
+}"#,
+        )
+        .unwrap();
+
+        let config = resolve_tsconfig(&config_path).unwrap();
+        assert_eq!(
+            config.compiler_options.base_url.as_deref(),
+            Some("https://example.com")
+        );
     }
 
     #[test]
