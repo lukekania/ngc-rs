@@ -1,0 +1,12 @@
+---
+source: crates/project-resolver/tests/snapshot_tests.rs
+expression: "edges.join(\"\\n\")"
+---
+src/app/app.component.ts -> src/app/shared/index.ts
+src/app/app.config.ts -> src/app/app.routes.ts
+src/app/shared/index.ts -> src/app/shared/logger.ts
+src/app/shared/index.ts -> src/app/shared/utils.ts
+src/app/shared/utils.ts -> src/app/shared/logger.ts
+src/app/shared/utils.ts -> src/environments/environment.ts
+src/main.ts -> src/app/app.component.ts
+src/main.ts -> src/app/app.config.ts

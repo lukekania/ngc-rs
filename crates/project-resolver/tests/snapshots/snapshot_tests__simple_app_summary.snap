@@ -1,0 +1,10 @@
+---
+source: crates/project-resolver/tests/snapshot_tests.rs
+expression: "format!(\"{summary:#?}\")"
+---
+GraphSummary {
+    file_count: 9,
+    entry_point_count: 2,
+    edge_count: 8,
+    unresolved_count: 0,
+}
