@@ -91,9 +91,7 @@ fn resolve_tsconfig_inner(
             source: e,
         })?;
 
-    let config_dir = config_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
+    let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
 
     // If extends is set, resolve the parent first
     let base = if let Some(ref extends_path) = raw.extends {
@@ -120,17 +118,17 @@ fn resolve_tsconfig_inner(
 
     let include = raw
         .include
-        .or(base.as_ref().and_then(|b| Some(b.include.clone())))
+        .or(base.as_ref().map(|b| b.include.clone()))
         .unwrap_or_default();
 
     let exclude = raw
         .exclude
-        .or(base.as_ref().and_then(|b| Some(b.exclude.clone())))
+        .or(base.as_ref().map(|b| b.exclude.clone()))
         .unwrap_or_default();
 
     let files = raw
         .files
-        .or(base.as_ref().and_then(|b| Some(b.files.clone())))
+        .or(base.as_ref().map(|b| b.files.clone()))
         .unwrap_or_default();
 
     Ok(ResolvedTsConfig {

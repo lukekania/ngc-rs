@@ -70,11 +70,7 @@ impl ResolverConfig {
             .as_ref()
             .map(|b| root_dir.join(b));
 
-        let path_aliases = config
-            .compiler_options
-            .paths
-            .clone()
-            .unwrap_or_default();
+        let path_aliases = config.compiler_options.paths.clone().unwrap_or_default();
 
         Ok(ResolverConfig {
             root_dir,
@@ -93,7 +89,10 @@ pub fn build_file_graph(config: &ResolvedTsConfig) -> NgcResult<FileGraph> {
     let resolver_config = ResolverConfig::from_tsconfig(config)?;
     let discovered_files = discover_files(config)?;
 
-    debug!(file_count = discovered_files.len(), "discovered project files");
+    debug!(
+        file_count = discovered_files.len(),
+        "discovered project files"
+    );
 
     let mut graph = DiGraph::new();
     let mut path_index: HashMap<PathBuf, NodeIndex> = HashMap::new();
@@ -225,9 +224,7 @@ fn discover_files(config: &ResolvedTsConfig) -> NgcResult<Vec<PathBuf>> {
             })?;
 
             // Check against exclude patterns
-            let excluded = exclude_patterns
-                .iter()
-                .any(|ex| ex.matches_path(&path));
+            let excluded = exclude_patterns.iter().any(|ex| ex.matches_path(&path));
 
             if !excluded {
                 let canonical = path.canonicalize().map_err(|e| NgcError::Io {
@@ -285,10 +282,7 @@ fn resolve_specifier(
             if let Some(rest) = specifier.strip_prefix(prefix) {
                 for replacement in replacements {
                     if let Some(rep_prefix) = replacement.strip_suffix('*') {
-                        let base = config
-                            .base_url
-                            .as_ref()
-                            .unwrap_or(&config.root_dir);
+                        let base = config.base_url.as_ref().unwrap_or(&config.root_dir);
                         let candidate = base.join(rep_prefix).join(rest);
                         if let Some(resolved) = resolve_with_extensions(&candidate) {
                             return Some(resolved);
@@ -299,10 +293,7 @@ fn resolve_specifier(
         } else if specifier == alias {
             // Exact match alias
             for replacement in replacements {
-                let base = config
-                    .base_url
-                    .as_ref()
-                    .unwrap_or(&config.root_dir);
+                let base = config.base_url.as_ref().unwrap_or(&config.root_dir);
                 let candidate = base.join(replacement);
                 if let Some(resolved) = resolve_with_extensions(&candidate) {
                     return Some(resolved);
@@ -366,8 +357,8 @@ mod tests {
     }
 
     fn fixture_resolver_config() -> ResolverConfig {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/simple-app");
+        let root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/simple-app");
         let root = root.canonicalize().unwrap();
         ResolverConfig {
             root_dir: root.clone(),

@@ -15,8 +15,7 @@ static SIDE_EFFECT_IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Matches dynamic imports: `import('./lazy')` or `import("./lazy")`.
 static DYNAMIC_IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"import\(\s*['"]([^'"]+)['"]\s*\)"#)
-        .expect("DYNAMIC_IMPORT_RE is a valid regex")
+    Regex::new(r#"import\(\s*['"]([^'"]+)['"]\s*\)"#).expect("DYNAMIC_IMPORT_RE is a valid regex")
 });
 
 /// Scan a TypeScript source file's contents and extract all import specifiers.
