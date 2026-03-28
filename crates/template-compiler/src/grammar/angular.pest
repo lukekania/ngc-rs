@@ -2,17 +2,26 @@
 
 template = { SOI ~ node* ~ EOI }
 
-node = _{ control_flow | element | interpolation | text }
+node = _{ control_flow | html_comment | element | interpolation | text }
+
+// HTML comments: <!-- ... -->
+html_comment = { "<!--" ~ (!"-->" ~ ANY)* ~ "-->" }
 
 // Text: anything not starting a tag, interpolation, or control flow keyword
 text = @{ (!("<" | "{{" | "}" | "@if" | "@for" | "@switch" | "@else" | "@case" | "@default" | "@empty") ~ ANY)+ }
 
 // Text interpolation: {{ expression | pipe }}
+// Handles || (logical OR), balanced parens, and | only as top-level pipe separator
 interpolation = { "{{" ~ interp_expression ~ "}}" }
-interp_expression = { interp_raw ~ ("|" ~ pipe_call)* }
-interp_raw = @{ (!("}}" | "|") ~ ANY)+ }
+interp_expression = { interp_segment ~ ("|" ~ !"|" ~ pipe_call)* }
+interp_segment = { interp_token+ }
+interp_token = _{ interp_paren_group | interp_or | interp_atom }
+interp_paren_group = { "(" ~ (interp_paren_group | interp_or | interp_atom_in_paren)* ~ ")" }
+interp_or = { "||" }
+interp_atom = @{ (!("}}" | "|" | "(" | ")") ~ ANY)+ }
+interp_atom_in_paren = @{ (!"(" ~ !")" ~ ANY)+ }
 pipe_call = { identifier ~ (":" ~ pipe_arg)* }
-pipe_arg = @{ (!("}}" | "|") ~ ANY)+ }
+pipe_arg = @{ (!("}}") ~ ("||" | (!"|" ~ ANY)))+ }
 
 // HTML elements
 element = { void_element | paired_element }
@@ -35,15 +44,15 @@ static_attribute = { attr_name ~ ("=" ~ quoted_value)? }
 
 event_name = @{ (ASCII_ALPHANUMERIC | "." | "-")+ }
 prop_name = @{ (ASCII_ALPHANUMERIC | "-")+ }
-class_name = @{ (ASCII_ALPHANUMERIC | "-")+ }
-style_prop = @{ (ASCII_ALPHANUMERIC | "-")+ }
+class_name = @{ (ASCII_ALPHANUMERIC | "-" | ":" | "_" | "." | "/")+ }
+style_prop = @{ (ASCII_ALPHANUMERIC | "-" | "." | "%")+ }
 attr_name = @{ (ASCII_ALPHANUMERIC | "-" | "_")+ }
 
 quoted_value = { "\"" ~ inner_value ~ "\"" | "'" ~ inner_value_sq ~ "'" }
 inner_value = @{ (!("\"") ~ ANY)* }
 inner_value_sq = @{ (!("'") ~ ANY)* }
 
-identifier = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
+identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 
 // Control flow blocks
 control_flow = _{ if_block | for_block | switch_block }
@@ -53,14 +62,20 @@ if_block = { "@if" ~ "(" ~ ctrl_expression ~ ")" ~ "{" ~ node* ~ "}" ~ else_if_b
 else_if_block = { "@else" ~ "if" ~ "(" ~ ctrl_expression ~ ")" ~ "{" ~ node* ~ "}" }
 else_block = { "@else" ~ "{" ~ node* ~ "}" }
 
-// Control flow expression — captures everything up to closing )
-ctrl_expression = @{ (!(")") ~ ANY)+ }
+// Control flow expression — handles balanced parentheses
+ctrl_expression = { ctrl_token+ }
+ctrl_token = _{ ctrl_paren_group | ctrl_char }
+ctrl_paren_group = { "(" ~ (ctrl_paren_group | ctrl_char)* ~ ")" }
+ctrl_char = @{ (!"(" ~ !")" ~ ANY)+ }
 
 // @for / @empty
 for_block = { "@for" ~ "(" ~ for_vars ~ ")" ~ "{" ~ node* ~ "}" ~ empty_block? }
 for_vars = { identifier ~ "of" ~ for_iterable ~ ";" ~ "track" ~ track_expression }
 for_iterable = @{ (!(";") ~ ANY)+ }
-track_expression = @{ (!(")") ~ ANY)+ }
+track_expression = { track_token+ }
+track_token = _{ track_paren_group | track_char }
+track_paren_group = { "(" ~ (track_paren_group | track_char)* ~ ")" }
+track_char = @{ (!"(" ~ !")" ~ ANY)+ }
 empty_block = { "@empty" ~ "{" ~ node* ~ "}" }
 
 // @switch / @case / @default
