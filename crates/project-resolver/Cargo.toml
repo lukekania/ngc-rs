@@ -1,7 +1,11 @@
 [package]
 name = "ngc-project-resolver"
-version = "0.1.0"
-edition = "2021"
+description = "Angular project file graph resolver for ngc-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
 
 [dependencies]
 ngc-diagnostics = { path = "../diagnostics" }

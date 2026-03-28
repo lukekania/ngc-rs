@@ -3,3 +3,7 @@
 *.swo
 .idea/
 .vscode/
+.claude/
+MILESTONES.md
+.env
+.env.*
