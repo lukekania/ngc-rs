@@ -15,6 +15,7 @@ path = "src/main.rs"
 ngc-diagnostics = { path = "../diagnostics" }
 ngc-project-resolver = { path = "../project-resolver" }
 ngc-ts-transform = { path = "../ts-transform" }
+ngc-bundler = { path = "../bundler" }
 clap = { version = "4.5", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
