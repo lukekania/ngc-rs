@@ -33,7 +33,11 @@ close_tag = { "</" ~ tag_name ~ ">" }
 tag_name = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "-")* }
 
 // Attributes (ordered by specificity to avoid ambiguity)
-attribute = _{ class_binding | style_binding | attr_binding | event_binding | property_binding | static_attribute }
+attribute = _{ class_binding | style_binding | attr_binding | two_way_binding | event_binding | property_binding | structural_directive | ref_variable | static_attribute }
+
+two_way_binding = { "[(" ~ prop_name ~ ")]" ~ "=" ~ quoted_value }
+structural_directive = { "*" ~ attr_name ~ "=" ~ quoted_value }
+ref_variable = { "#" ~ identifier }
 
 event_binding = { "(" ~ event_name ~ ")" ~ "=" ~ quoted_value }
 property_binding = { "[" ~ prop_name ~ "]" ~ "=" ~ quoted_value }

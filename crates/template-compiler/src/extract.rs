@@ -44,30 +44,12 @@ pub struct ExtractedComponent {
 
 impl ExtractedComponent {
     /// Check whether the component should use JIT fallback.
+    ///
+    /// Returns true only for patterns not yet supported by the native compiler.
+    /// Most constructs are now compiled natively: elements, bindings, events,
+    /// @if/@for/@switch, pipes, ng-content, ng-container, ng-template,
+    /// *ngIf/*ngFor, [(two-way)], #ref, and templateUrl.
     pub fn needs_jit_fallback(&self) -> bool {
-        // templateUrl always requires JIT
-        if self.template_url.is_some() {
-            return true;
-        }
-        // Check template for unsupported patterns
-        if let Some(ref tpl) = self.template {
-            if tpl.contains("*ngIf")
-                || tpl.contains("*ngFor")
-                || tpl.contains("[(")
-                || tpl.contains("<ng-content")
-                || tpl.contains("<ng-template")
-                || tpl.contains("<ng-container")
-            {
-                return true;
-            }
-            // Check for template reference variables (# followed by a letter)
-            let bytes = tpl.as_bytes();
-            for i in 0..bytes.len().saturating_sub(1) {
-                if bytes[i] == b'#' && bytes[i + 1].is_ascii_alphabetic() {
-                    return true;
-                }
-            }
-        }
         false
     }
 }
@@ -367,7 +349,7 @@ export class AppComponent {}
     }
 
     #[test]
-    fn test_extract_template_url_triggers_jit() {
+    fn test_extract_template_url() {
         let source = r#"import { Component } from '@angular/core';
 
 @Component({
@@ -379,7 +361,9 @@ export class AppComponent {}
         let result = extract_component(source, &test_path())
             .expect("should extract")
             .expect("should find component");
-        assert!(result.needs_jit_fallback());
+        assert_eq!(result.template_url.as_deref(), Some("./app.component.html"));
+        // templateUrl is now natively compiled (no JIT fallback)
+        assert!(!result.needs_jit_fallback());
     }
 
     #[test]
@@ -390,7 +374,7 @@ export class AppComponent {}
     }
 
     #[test]
-    fn test_ngif_triggers_jit() {
+    fn test_ngif_natively_compiled() {
         let source = r#"import { Component } from '@angular/core';
 
 @Component({
@@ -402,7 +386,8 @@ export class TestComponent {}
         let result = extract_component(source, &test_path())
             .expect("should extract")
             .expect("should find component");
-        assert!(result.needs_jit_fallback());
+        // *ngIf is now natively compiled (no JIT fallback)
+        assert!(!result.needs_jit_fallback());
     }
 
     #[test]
