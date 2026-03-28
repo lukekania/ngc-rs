@@ -13,6 +13,6 @@ AppComponent = _decorate([Component({
 	selector: 'app-root',
 	standalone: true,
 	imports: [RouterOutlet],
-	template: '<router-outlet />'
+	template: '<h1>{{ title }}</h1><router-outlet />'
 })], AppComponent);
 export { AppComponent };

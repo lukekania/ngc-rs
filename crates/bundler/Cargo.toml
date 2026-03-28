@@ -19,4 +19,5 @@ tracing = "0.1"
 [dev-dependencies]
 ngc-project-resolver = { path = "../project-resolver" }
 ngc-ts-transform = { path = "../ts-transform" }
+ngc-template-compiler = { path = "../template-compiler" }
 insta = { version = "1.46", features = ["glob"] }
