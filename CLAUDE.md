@@ -55,7 +55,9 @@ Goal: compile Angular component templates natively.
 - [x] Parser for Angular template syntax (pest grammar)
 - [x] Ivy codegen: emit ɵɵdefineComponent, ɵfac, and template function
 - [x] Supports elements, text, interpolation, bindings, events, @if/@for/@switch, pipes
-- [x] JIT fallback for unsupported templates (templateUrl, *ngIf/*ngFor, ng-content)
+- [x] templateUrl resolution, two-way binding, ng-content, ng-container, ng-template
+- [x] Structural directives (*ngIf, *ngFor), template reference variables (#ref)
+- [x] Styles extraction and emission in defineComponent
 
 ### v1.0 — Angular CLI Drop-in
 
