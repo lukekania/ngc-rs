@@ -19,6 +19,15 @@ pub struct TransformResult {
     pub out_dir: PathBuf,
 }
 
+/// A single transformed module held in memory.
+#[derive(Debug, Clone)]
+pub struct TransformedModule {
+    /// The original canonical source path (matches the graph node).
+    pub source_path: PathBuf,
+    /// The generated JavaScript code.
+    pub code: String,
+}
+
 /// Transform a single TypeScript source string into JavaScript.
 ///
 /// Parses the input as TypeScript, strips type annotations, interfaces,
@@ -141,6 +150,34 @@ pub fn transform_project(
         files_transformed: count,
         out_dir: out_dir.to_path_buf(),
     })
+}
+
+/// Transform all TypeScript files and return JavaScript in memory.
+///
+/// Each input file is read, parsed, and transformed (stripping types and
+/// decorators). Results are returned as in-memory `TransformedModule` values
+/// instead of being written to disk. Files are processed in parallel using rayon.
+pub fn transform_to_memory(files: &[PathBuf]) -> NgcResult<Vec<TransformedModule>> {
+    let results: Vec<NgcResult<TransformedModule>> = files
+        .par_iter()
+        .map(|file_path| {
+            let source = std::fs::read_to_string(file_path).map_err(|e| NgcError::Io {
+                path: file_path.clone(),
+                source: e,
+            })?;
+
+            let file_name = file_path.to_string_lossy();
+            let code = transform_source(&source, &file_name)?;
+
+            debug!(?file_path, "transformed to memory");
+            Ok(TransformedModule {
+                source_path: file_path.clone(),
+                code,
+            })
+        })
+        .collect();
+
+    results.into_iter().collect()
 }
 
 /// Map TypeScript extensions to JavaScript equivalents.

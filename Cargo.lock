@@ -679,8 +679,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "ngc-bundler"
+version = "0.3.0"
+dependencies = [
+ "insta",
+ "ngc-diagnostics",
+ "ngc-project-resolver",
+ "ngc-ts-transform",
+ "oxc_allocator",
+ "oxc_ast",
+ "oxc_parser",
+ "oxc_span",
+ "petgraph",
+ "tracing",
+]
+
+[[package]]
 name = "ngc-diagnostics"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde_json",
  "thiserror",
@@ -688,7 +704,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-project-resolver"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "glob",
@@ -705,10 +721,11 @@ dependencies = [
 
 [[package]]
 name = "ngc-rs"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "colored",
+ "ngc-bundler",
  "ngc-diagnostics",
  "ngc-project-resolver",
  "ngc-ts-transform",
@@ -718,7 +735,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-ts-transform"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "insta",
  "ngc-diagnostics",
