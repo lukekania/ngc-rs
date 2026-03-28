@@ -680,7 +680,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-diagnostics"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde_json",
  "thiserror",
@@ -688,7 +688,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-project-resolver"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "glob",
@@ -705,7 +705,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-rs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "colored",
@@ -718,7 +718,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-ts-transform"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "insta",
  "ngc-diagnostics",
