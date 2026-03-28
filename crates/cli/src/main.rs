@@ -135,11 +135,12 @@ fn run_build(project: &Path, out_dir_override: Option<&Path>) -> NgcResult<Build
     }
 
     // Transform compiled sources (template-compiled TS → JS)
+    // If a compiled source fails oxc parsing, fall back to the original file
     let sources: Vec<(PathBuf, String)> = compiled
         .into_iter()
         .map(|cf| (cf.source_path, cf.source))
         .collect();
-    let transformed = ngc_ts_transform::transform_sources_to_memory(&sources)?;
+    let transformed = transform_with_fallback(&sources)?;
 
     // Build modules map (canonical source path → JS code)
     let modules: HashMap<PathBuf, String> = transformed
@@ -186,6 +187,44 @@ fn run_build(project: &Path, out_dir_override: Option<&Path>) -> NgcResult<Build
         modules_bundled,
         output_path,
     })
+}
+
+/// Transform sources with fallback: if a compiled source fails oxc parsing,
+/// re-read the original file and transform that instead.
+fn transform_with_fallback(
+    sources: &[(PathBuf, String)],
+) -> NgcResult<Vec<ngc_ts_transform::TransformedModule>> {
+    let results: Vec<NgcResult<ngc_ts_transform::TransformedModule>> = sources
+        .iter()
+        .map(|(path, source)| {
+            let file_name = path.to_string_lossy();
+            match ngc_ts_transform::transform_source(source, &file_name) {
+                Ok(code) => Ok(ngc_ts_transform::TransformedModule {
+                    source_path: path.clone(),
+                    code,
+                }),
+                Err(_) => {
+                    // Compiled source failed — fall back to original file
+                    eprintln!(
+                        "{} transform fallback for {}",
+                        "Warning:".yellow().bold(),
+                        path.display()
+                    );
+                    let original = std::fs::read_to_string(path).map_err(|e| NgcError::Io {
+                        path: path.clone(),
+                        source: e,
+                    })?;
+                    let code = ngc_ts_transform::transform_source(&original, &file_name)?;
+                    Ok(ngc_ts_transform::TransformedModule {
+                        source_path: path.clone(),
+                        code,
+                    })
+                }
+            }
+        })
+        .collect();
+
+    results.into_iter().collect()
 }
 
 /// Find the entry point from graph entry points by looking for main.ts.

@@ -49,6 +49,7 @@ fn parse_node(pair: pest::iterators::Pair<Rule>) -> NgcResult<Option<TemplateNod
             }
             Ok(Some(TemplateNode::Text(crate::ast::TextNode { value })))
         }
+        Rule::html_comment => Ok(None), // Skip HTML comments
         Rule::interpolation => Ok(Some(parse_interpolation(pair)?)),
         Rule::if_block => Ok(Some(parse_if_block(pair)?)),
         Rule::for_block => Ok(Some(parse_for_block(pair)?)),
@@ -247,6 +248,7 @@ fn parse_interp_expression(
     pair: pest::iterators::Pair<Rule>,
 ) -> NgcResult<(String, Vec<crate::ast::PipeCall>)> {
     let mut inner = pair.into_inner();
+    // interp_segment contains the full expression text (including balanced parens)
     let raw_expr = inner
         .next()
         .map(|p| p.as_str().trim().to_string())
@@ -431,8 +433,10 @@ fn parse_switch_block(pair: pest::iterators::Pair<Rule>) -> NgcResult<TemplateNo
     }))
 }
 
-/// Extract the text content from an expression pair.
+/// Extract the text content from an expression pair, handling nested rules.
 fn extract_expression_text(pair: pest::iterators::Pair<Rule>) -> String {
+    // For ctrl_expression and track_expression, the text comes from
+    // the span of the full pair (including inner paren groups)
     pair.as_str().trim().to_string()
 }
 
