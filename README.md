@@ -1,15 +1,15 @@
 # ngc-rs
 
-A native Rust replacement for `ng build` in Angular projects. Drop-in swap, **~19x faster**.
+A native Rust replacement for `ng build` in Angular projects. Drop-in swap, **~34x faster**.
 
 ### Benchmarks
 
 | Command | vs tsc equivalent | Ratio |
 |---------|-------------------|-------|
 | `ngc-rs info` (file graph resolution) | `tsc --listFiles --noEmit` | **~34x faster** |
-| `ngc-rs build` (full pipeline: resolve + compile + bundle) | `tsc --outDir` | **~19x faster** |
+| `ngc-rs build` (full pipeline: resolve + compile + bundle) | `tsc --outDir` | **~34x faster** |
 
-Measured with [hyperfine](https://github.com/sharkdp/hyperfine) on a real-world 77-module Angular project. ngc-rs completes the full build pipeline in **~20ms** vs **~370ms** for tsc.
+Measured with [hyperfine](https://github.com/sharkdp/hyperfine) on a real-world 77-module Angular project. ngc-rs completes the full build pipeline in **~15ms** vs **~500ms** for tsc.
 
 > **Status: v0.4 — Angular Template Compiler**
 > ngc-rs can resolve, transform, compile Angular templates to Ivy, and bundle into a single `dist/main.js`.
