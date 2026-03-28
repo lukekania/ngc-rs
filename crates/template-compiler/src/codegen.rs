@@ -672,7 +672,6 @@ fn format_static_attrs(attrs: &[(&str, &str)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::*;
     use crate::extract::ExtractedComponent;
 
     fn test_component() -> ExtractedComponent {
