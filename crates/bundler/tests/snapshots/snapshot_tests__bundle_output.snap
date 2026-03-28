@@ -1,0 +1,49 @@
+---
+source: crates/bundler/tests/snapshot_tests.rs
+expression: bundle
+---
+import { Component } from '@angular/core';
+import { RouterOutlet, provideRouter } from '@angular/router';
+import _decorate from '@oxc-project/runtime/helpers/decorate';
+import { bootstrapApplication } from '@angular/platform-browser';
+
+// src/app/shared/logger.js
+class Logger {
+	static log(message) {
+		console.log(message);
+	}
+}
+
+// src/environments/environment.js
+const environment = {
+	production: false,
+	appName: 'simple-app'
+};
+
+// src/app/shared/utils.js
+class SharedUtils {
+	static appName() {
+		Logger.log('Getting app name');
+		return environment.appName;
+	}
+}
+
+// src/app/app.component.js
+let AppComponent = class AppComponent {
+	title = SharedUtils.appName();
+};
+AppComponent = _decorate([Component({
+	selector: 'app-root',
+	standalone: true,
+	imports: [RouterOutlet],
+	template: '<router-outlet />'
+})], AppComponent);
+
+// src/app/app.routes.js
+const routes = [];
+
+// src/app/app.config.js
+const appConfig = { providers: [provideRouter(routes)] };
+
+// src/main.js
+bootstrapApplication(AppComponent, appConfig);

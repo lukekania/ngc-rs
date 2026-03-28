@@ -5,4 +5,6 @@
 
 mod transform;
 
-pub use transform::{transform_project, transform_source, TransformResult};
+pub use transform::{
+    transform_project, transform_source, transform_to_memory, TransformResult, TransformedModule,
+};
