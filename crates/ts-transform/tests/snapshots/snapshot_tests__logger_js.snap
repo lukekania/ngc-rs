@@ -1,0 +1,9 @@
+---
+source: crates/ts-transform/tests/snapshot_tests.rs
+expression: result
+---
+export class Logger {
+	static log(message) {
+		console.log(message);
+	}
+}

@@ -1,0 +1,12 @@
+---
+source: crates/ts-transform/tests/snapshot_tests.rs
+expression: result
+---
+import { Logger } from './logger';
+import { environment } from '@env/environment';
+export class SharedUtils {
+	static appName() {
+		Logger.log('Getting app name');
+		return environment.appName;
+	}
+}

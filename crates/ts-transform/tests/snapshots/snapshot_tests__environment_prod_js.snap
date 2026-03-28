@@ -1,0 +1,8 @@
+---
+source: crates/ts-transform/tests/snapshot_tests.rs
+expression: result
+---
+export const environment = {
+	production: true,
+	appName: 'simple-app'
+};
