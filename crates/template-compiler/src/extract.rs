@@ -38,6 +38,8 @@ pub struct ExtractedComponent {
     pub angular_core_import_span: Option<(u32, u32)>,
     /// Named imports from `@angular/core` other than `Component`.
     pub other_angular_core_imports: Vec<String>,
+    /// Raw source text of the `styles` array (e.g. `['\`.sidebar { ... }\`']`).
+    pub styles_source: Option<String>,
 }
 
 impl ExtractedComponent {
@@ -168,6 +170,7 @@ pub fn extract_component(source: &str, file_path: &Path) -> NgcResult<Option<Ext
             class_keyword_start,
             angular_core_import_span,
             other_angular_core_imports,
+            styles_source: metadata.styles_source,
         }));
     }
 
@@ -194,6 +197,7 @@ struct DecoratorMetadata {
     standalone: bool,
     imports_source: Option<String>,
     imports_identifiers: Vec<String>,
+    styles_source: Option<String>,
 }
 
 /// Extract metadata from the `@Component({...})` decorator argument.
@@ -208,6 +212,7 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
                 standalone: false,
                 imports_source: None,
                 imports_identifiers: Vec::new(),
+                styles_source: None,
             });
         }
     };
@@ -222,6 +227,7 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
                 standalone: false,
                 imports_source: None,
                 imports_identifiers: Vec::new(),
+                styles_source: None,
             });
         }
     };
@@ -232,6 +238,7 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
     let mut standalone = false;
     let mut imports_source = None;
     let mut imports_identifiers = Vec::new();
+    let mut styles_source = None;
 
     for prop in &arg.properties {
         if let ObjectPropertyKind::ObjectProperty(prop) = prop {
@@ -268,6 +275,13 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
                         standalone = b.value;
                     }
                 }
+                "styles" | "styleUrl" | "styleUrls" => {
+                    let start = prop.value.span().start as usize;
+                    let end = prop.value.span().end as usize;
+                    if start < source.len() && end <= source.len() {
+                        styles_source = Some(source[start..end].to_string());
+                    }
+                }
                 "imports" => {
                     // Capture the raw source text for the imports array
                     let start = prop.value.span().start as usize;
@@ -296,6 +310,7 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
         standalone,
         imports_source,
         imports_identifiers,
+        styles_source,
     })
 }
 

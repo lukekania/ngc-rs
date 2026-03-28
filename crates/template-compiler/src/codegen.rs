@@ -115,6 +115,9 @@ pub fn generate_ivy(
     if let Some(ref imports_src) = component.imports_source {
         dc.push_str(&format!(",\n    dependencies: {imports_src}"));
     }
+    if let Some(ref styles_src) = component.styles_source {
+        dc.push_str(&format!(",\n    styles: {styles_src}"));
+    }
     dc.push_str("\n  })");
 
     // Collect child template functions
@@ -689,6 +692,7 @@ mod tests {
             class_keyword_start: 0,
             angular_core_import_span: None,
             other_angular_core_imports: Vec::new(),
+            styles_source: None,
         }
     }
 

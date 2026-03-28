@@ -143,6 +143,7 @@ mod tests {
             class_keyword_start: 138,
             angular_core_import_span: Some((0, 44)),
             other_angular_core_imports: Vec::new(),
+            styles_source: None,
         }
     }
 
