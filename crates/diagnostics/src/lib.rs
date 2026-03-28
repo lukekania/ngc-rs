@@ -69,6 +69,20 @@ pub enum NgcError {
         /// The error message from the transformer.
         message: String,
     },
+
+    /// A bundling operation failed.
+    #[error("bundle error: {message}")]
+    BundleError {
+        /// Description of what went wrong during bundling.
+        message: String,
+    },
+
+    /// A circular dependency was detected in the module graph.
+    #[error("circular dependency detected: {cycle:?}")]
+    CircularDependency {
+        /// The file paths forming the dependency cycle.
+        cycle: Vec<PathBuf>,
+    },
 }
 
 /// A type alias for Results using NgcError.
