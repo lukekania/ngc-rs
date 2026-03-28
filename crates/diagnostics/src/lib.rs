@@ -83,6 +83,24 @@ pub enum NgcError {
         /// The file paths forming the dependency cycle.
         cycle: Vec<PathBuf>,
     },
+
+    /// An Angular template could not be parsed.
+    #[error("template parse error in {path}: {message}")]
+    TemplateParseError {
+        /// The path to the file containing the template.
+        path: PathBuf,
+        /// The error message from the template parser.
+        message: String,
+    },
+
+    /// Angular template compilation (Ivy codegen) failed.
+    #[error("template compile error in {path}: {message}")]
+    TemplateCompileError {
+        /// The path to the file that failed to compile.
+        path: PathBuf,
+        /// The error message from the compiler.
+        message: String,
+    },
 }
 
 /// A type alias for Results using NgcError.

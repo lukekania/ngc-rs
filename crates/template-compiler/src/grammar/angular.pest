@@ -1,0 +1,72 @@
+// Angular template grammar for ngc-rs
+
+template = { SOI ~ node* ~ EOI }
+
+node = _{ control_flow | element | interpolation | text }
+
+// Text: anything not starting a tag, interpolation, or control flow keyword
+text = @{ (!("<" | "{{" | "}" | "@if" | "@for" | "@switch" | "@else" | "@case" | "@default" | "@empty") ~ ANY)+ }
+
+// Text interpolation: {{ expression | pipe }}
+interpolation = { "{{" ~ interp_expression ~ "}}" }
+interp_expression = { interp_raw ~ ("|" ~ pipe_call)* }
+interp_raw = @{ (!("}}" | "|") ~ ANY)+ }
+pipe_call = { identifier ~ (":" ~ pipe_arg)* }
+pipe_arg = @{ (!("}}" | "|") ~ ANY)+ }
+
+// HTML elements
+element = { void_element | paired_element }
+void_element = { "<" ~ tag_name ~ attribute* ~ "/>" }
+paired_element = { open_tag ~ node* ~ close_tag }
+open_tag = { "<" ~ tag_name ~ attribute* ~ ">" }
+close_tag = { "</" ~ tag_name ~ ">" }
+
+tag_name = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "-")* }
+
+// Attributes (ordered by specificity to avoid ambiguity)
+attribute = _{ class_binding | style_binding | attr_binding | event_binding | property_binding | static_attribute }
+
+event_binding = { "(" ~ event_name ~ ")" ~ "=" ~ quoted_value }
+property_binding = { "[" ~ prop_name ~ "]" ~ "=" ~ quoted_value }
+class_binding = { "[class." ~ class_name ~ "]" ~ "=" ~ quoted_value }
+style_binding = { "[style." ~ style_prop ~ "]" ~ "=" ~ quoted_value }
+attr_binding = { "[attr." ~ attr_name ~ "]" ~ "=" ~ quoted_value }
+static_attribute = { attr_name ~ ("=" ~ quoted_value)? }
+
+event_name = @{ (ASCII_ALPHANUMERIC | "." | "-")+ }
+prop_name = @{ (ASCII_ALPHANUMERIC | "-")+ }
+class_name = @{ (ASCII_ALPHANUMERIC | "-")+ }
+style_prop = @{ (ASCII_ALPHANUMERIC | "-")+ }
+attr_name = @{ (ASCII_ALPHANUMERIC | "-" | "_")+ }
+
+quoted_value = { "\"" ~ inner_value ~ "\"" | "'" ~ inner_value_sq ~ "'" }
+inner_value = @{ (!("\"") ~ ANY)* }
+inner_value_sq = @{ (!("'") ~ ANY)* }
+
+identifier = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
+
+// Control flow blocks
+control_flow = _{ if_block | for_block | switch_block }
+
+// @if / @else if / @else
+if_block = { "@if" ~ "(" ~ ctrl_expression ~ ")" ~ "{" ~ node* ~ "}" ~ else_if_block* ~ else_block? }
+else_if_block = { "@else" ~ "if" ~ "(" ~ ctrl_expression ~ ")" ~ "{" ~ node* ~ "}" }
+else_block = { "@else" ~ "{" ~ node* ~ "}" }
+
+// Control flow expression — captures everything up to closing )
+ctrl_expression = @{ (!(")") ~ ANY)+ }
+
+// @for / @empty
+for_block = { "@for" ~ "(" ~ for_vars ~ ")" ~ "{" ~ node* ~ "}" ~ empty_block? }
+for_vars = { identifier ~ "of" ~ for_iterable ~ ";" ~ "track" ~ track_expression }
+for_iterable = @{ (!(";") ~ ANY)+ }
+track_expression = @{ (!(")") ~ ANY)+ }
+empty_block = { "@empty" ~ "{" ~ node* ~ "}" }
+
+// @switch / @case / @default
+switch_block = { "@switch" ~ "(" ~ ctrl_expression ~ ")" ~ "{" ~ switch_body* ~ "}" }
+switch_body = _{ case_block | default_block }
+case_block = { "@case" ~ "(" ~ ctrl_expression ~ ")" ~ "{" ~ node* ~ "}" }
+default_block = { "@default" ~ "{" ~ node* ~ "}" }
+
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }

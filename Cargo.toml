@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/cli", "crates/diagnostics", "crates/project-resolver", "crates/ts-transform", "crates/bundler"]
+members = ["crates/cli", "crates/diagnostics", "crates/project-resolver", "crates/ts-transform", "crates/bundler", "crates/template-compiler"]
 
 [workspace.package]
 version = "0.3.0"
