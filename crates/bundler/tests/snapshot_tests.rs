@@ -25,8 +25,16 @@ fn build_bundle() -> String {
     let root_dir = root_dir.canonicalize().expect("root_dir should exist");
 
     let files: Vec<PathBuf> = file_graph.graph.node_weights().cloned().collect();
+
+    // Compile templates, then transform to JS (mirrors the full CLI pipeline)
+    let compiled =
+        ngc_template_compiler::compile_templates(&files).expect("should compile templates");
+    let sources: Vec<(PathBuf, String)> = compiled
+        .into_iter()
+        .map(|cf| (cf.source_path, cf.source))
+        .collect();
     let transformed =
-        ngc_ts_transform::transform_to_memory(&files).expect("should transform files");
+        ngc_ts_transform::transform_sources_to_memory(&sources).expect("should transform files");
 
     let modules: HashMap<PathBuf, String> = transformed
         .into_iter()

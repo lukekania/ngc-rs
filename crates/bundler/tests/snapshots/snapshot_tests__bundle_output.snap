@@ -2,9 +2,8 @@
 source: crates/bundler/tests/snapshot_tests.rs
 expression: bundle
 ---
-import { Component } from '@angular/core';
+import { ɵɵStandaloneFeature, ɵɵadvance, ɵɵdefineComponent, ɵɵelement, ɵɵelementEnd, ɵɵelementStart, ɵɵtext, ɵɵtextInterpolate } from '@angular/core';
 import { RouterOutlet, provideRouter } from '@angular/router';
-import _decorate from '@oxc-project/runtime/helpers/decorate';
 import { bootstrapApplication } from '@angular/platform-browser';
 
 // src/app/shared/logger.js
@@ -29,15 +28,33 @@ class SharedUtils {
 }
 
 // src/app/app.component.js
-let AppComponent = class AppComponent {
+class AppComponent {
+	static ɵfac = function AppComponent_Factory(t) {
+		return new (t || AppComponent)();
+	};
+	static ɵcmp = ɵɵdefineComponent({
+		type: AppComponent,
+		selectors: [['app-root']],
+		standalone: true,
+		features: [ɵɵStandaloneFeature],
+		decls: 3,
+		vars: 1,
+		template: function AppComponent_Template(rf, ctx) {
+			if (rf & 1) {
+				ɵɵelementStart(0, 'h1');
+				ɵɵtext(1);
+				ɵɵelementEnd();
+				ɵɵelement(2, 'router-outlet');
+			}
+			if (rf & 2) {
+				ɵɵadvance();
+				ɵɵtextInterpolate(ctx.title);
+			}
+		},
+		dependencies: [RouterOutlet]
+	});
 	title = SharedUtils.appName();
-};
-AppComponent = _decorate([Component({
-	selector: 'app-root',
-	standalone: true,
-	imports: [RouterOutlet],
-	template: '<router-outlet />'
-})], AppComponent);
+}
 
 // src/app/app.routes.js
 const routes = [];

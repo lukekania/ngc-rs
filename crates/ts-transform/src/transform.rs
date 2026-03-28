@@ -180,6 +180,31 @@ pub fn transform_to_memory(files: &[PathBuf]) -> NgcResult<Vec<TransformedModule
     results.into_iter().collect()
 }
 
+/// Transform pre-compiled TypeScript sources to JavaScript in memory.
+///
+/// Unlike `transform_to_memory`, this takes source strings directly rather than
+/// reading from disk. Each tuple maps a canonical file path to its (potentially
+/// template-compiled) TypeScript source. Files are processed in parallel using rayon.
+pub fn transform_sources_to_memory(
+    sources: &[(PathBuf, String)],
+) -> NgcResult<Vec<TransformedModule>> {
+    let results: Vec<NgcResult<TransformedModule>> = sources
+        .par_iter()
+        .map(|(file_path, source)| {
+            let file_name = file_path.to_string_lossy();
+            let code = transform_source(source, &file_name)?;
+
+            debug!(?file_path, "transformed source to memory");
+            Ok(TransformedModule {
+                source_path: file_path.clone(),
+                code,
+            })
+        })
+        .collect();
+
+    results.into_iter().collect()
+}
+
 /// Map TypeScript extensions to JavaScript equivalents.
 fn map_extension(path: &Path) -> PathBuf {
     match path.extension().and_then(|e| e.to_str()) {
