@@ -6,7 +6,7 @@ import { SharedUtils } from '@app/shared';
   selector: 'app-root',
   standalone: true,
   imports: [RouterOutlet],
-  template: '<router-outlet />'
+  template: '<h1>{{ title }}</h1><router-outlet />'
 })
 export class AppComponent {
   title = SharedUtils.appName();

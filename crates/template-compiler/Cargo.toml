@@ -1,6 +1,6 @@
 [package]
-name = "ngc-bundler"
-description = "ESM concatenation bundler for ngc-rs"
+name = "ngc-template-compiler"
+description = "Angular template compiler for ngc-rs — compiles @Component templates to Ivy instructions"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,11 +13,12 @@ oxc_allocator = "0.122"
 oxc_parser = "0.122"
 oxc_span = "0.122"
 oxc_ast = "0.122"
-petgraph = "0.8"
+pest = "2.7"
+pest_derive = "2.7"
+rayon = "1.11"
 tracing = "0.1"
 
 [dev-dependencies]
 ngc-project-resolver = { path = "../project-resolver" }
 ngc-ts-transform = { path = "../ts-transform" }
-ngc-template-compiler = { path = "../template-compiler" }
 insta = { version = "1.46", features = ["glob"] }
