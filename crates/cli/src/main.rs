@@ -1,10 +1,19 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;
+use ngc_bundler::BundleInput;
 use ngc_diagnostics::{NgcError, NgcResult};
-use ngc_ts_transform::TransformResult;
+
+/// Result of the bundled build pipeline.
+struct BuildResult {
+    /// Number of modules included in the bundle.
+    modules_bundled: usize,
+    /// Path to the output bundle file.
+    output_path: PathBuf,
+}
 
 #[derive(Parser)]
 #[command(name = "ngc-rs", about = "Fast Angular project toolchain")]
@@ -21,7 +30,7 @@ enum Commands {
         #[arg(long, default_value = "tsconfig.json")]
         project: PathBuf,
     },
-    /// Build the project: transform TypeScript files to JavaScript.
+    /// Build the project: bundle TypeScript files into a single JavaScript output.
     Build {
         /// Path to tsconfig.json
         #[arg(long, default_value = "tsconfig.json")]
@@ -62,8 +71,12 @@ fn main() {
         Commands::Build { project, out_dir } => match run_build(&project, out_dir.as_deref()) {
             Ok(result) => {
                 println!("{}", "ngc-rs build complete".bold().green());
-                println!("  {:<16}{}", "Files:".dimmed(), result.files_transformed);
-                println!("  {:<16}{}", "Output:".dimmed(), result.out_dir.display());
+                println!("  {:<16}{}", "Bundled:".dimmed(), result.modules_bundled);
+                println!(
+                    "  {:<16}{}",
+                    "Output:".dimmed(),
+                    result.output_path.display()
+                );
             }
             Err(e) => {
                 eprintln!("{} {e}", "Error:".red().bold());
@@ -73,8 +86,8 @@ fn main() {
     }
 }
 
-/// Orchestrate the full build pipeline: resolve project, then transform all files.
-fn run_build(project: &Path, out_dir_override: Option<&Path>) -> NgcResult<TransformResult> {
+/// Orchestrate the full build pipeline: resolve → transform in memory → bundle → write.
+fn run_build(project: &Path, out_dir_override: Option<&Path>) -> NgcResult<BuildResult> {
     let config = ngc_project_resolver::tsconfig::resolve_tsconfig(project)?;
     let file_graph = ngc_project_resolver::resolve_project(project)?;
 
@@ -104,9 +117,75 @@ fn run_build(project: &Path, out_dir_override: Option<&Path>) -> NgcResult<Trans
                 .as_ref()
                 .map(|o| config_dir.join(o))
         })
-        .unwrap_or_else(|| config_dir.join("out"));
+        .unwrap_or_else(|| config_dir.join("dist"));
 
+    // Transform all files to memory
     let files: Vec<PathBuf> = file_graph.graph.node_weights().cloned().collect();
+    let transformed = ngc_ts_transform::transform_to_memory(&files)?;
 
-    ngc_ts_transform::transform_project(&files, &root_dir, &out_dir)
+    // Build modules map (canonical source path → JS code)
+    let modules: HashMap<PathBuf, String> = transformed
+        .into_iter()
+        .map(|m| (m.source_path, m.code))
+        .collect();
+
+    // Find the entry point (look for main.ts among graph entry points)
+    let entry = find_entry_point(&file_graph.entry_points)?;
+
+    // Derive local prefixes from tsconfig path aliases
+    let mut local_prefixes = vec![".".to_string()];
+    if let Some(paths) = &config.compiler_options.paths {
+        for alias in paths.keys() {
+            if let Some(prefix) = alias.strip_suffix('*') {
+                local_prefixes.push(prefix.to_string());
+            }
+        }
+    }
+
+    let bundle_input = BundleInput {
+        modules,
+        graph: file_graph.graph,
+        entry,
+        local_prefixes,
+        root_dir,
+    };
+
+    let bundle_output = ngc_bundler::bundle(&bundle_input)?;
+    let modules_bundled = bundle_output.matches("\n// ").count() + 1;
+
+    // Write the bundle
+    std::fs::create_dir_all(&out_dir).map_err(|e| NgcError::Io {
+        path: out_dir.clone(),
+        source: e,
+    })?;
+    let output_path = out_dir.join("main.js");
+    std::fs::write(&output_path, &bundle_output).map_err(|e| NgcError::Io {
+        path: output_path.clone(),
+        source: e,
+    })?;
+
+    Ok(BuildResult {
+        modules_bundled,
+        output_path,
+    })
+}
+
+/// Find the entry point from graph entry points by looking for main.ts.
+fn find_entry_point(entry_points: &[PathBuf]) -> NgcResult<PathBuf> {
+    entry_points
+        .iter()
+        .find(|p| {
+            p.file_name()
+                .is_some_and(|name| name == "main.ts" || name == "main.tsx")
+        })
+        .cloned()
+        .ok_or_else(|| NgcError::BundleError {
+            message: format!(
+                "no main.ts entry point found among candidates: {:?}",
+                entry_points
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+            ),
+        })
 }
