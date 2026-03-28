@@ -245,8 +245,9 @@ impl IvyCodegen {
                     self.ivy_imports
                         .insert("\u{0275}\u{0275}property".to_string());
                     self.update.push(format!(
-                        "\u{0275}\u{0275}property('{}', ctx.{});",
-                        name, expression
+                        "\u{0275}\u{0275}property('{}', {});",
+                        name,
+                        ctx_expr(expression)
                     ));
                     self.var_count += 1;
                 }
@@ -257,8 +258,9 @@ impl IvyCodegen {
                     self.ivy_imports
                         .insert("\u{0275}\u{0275}classProp".to_string());
                     self.update.push(format!(
-                        "\u{0275}\u{0275}classProp('{}', ctx.{});",
-                        class_name, expression
+                        "\u{0275}\u{0275}classProp('{}', {});",
+                        class_name,
+                        ctx_expr(expression)
                     ));
                     self.var_count += 1;
                 }
@@ -269,8 +271,9 @@ impl IvyCodegen {
                     self.ivy_imports
                         .insert("\u{0275}\u{0275}styleProp".to_string());
                     self.update.push(format!(
-                        "\u{0275}\u{0275}styleProp('{}', ctx.{});",
-                        property, expression
+                        "\u{0275}\u{0275}styleProp('{}', {});",
+                        property,
+                        ctx_expr(expression)
                     ));
                     self.var_count += 1;
                 }
@@ -278,8 +281,9 @@ impl IvyCodegen {
                     self.ivy_imports
                         .insert("\u{0275}\u{0275}attribute".to_string());
                     self.update.push(format!(
-                        "\u{0275}\u{0275}attribute('{}', ctx.{});",
-                        name, expression
+                        "\u{0275}\u{0275}attribute('{}', {});",
+                        name,
+                        ctx_expr(expression)
                     ));
                     self.var_count += 1;
                 }
@@ -311,7 +315,7 @@ impl IvyCodegen {
 
         // Build the expression with pipe wrapping
         let expr = if interp.pipes.is_empty() {
-            format!("ctx.{}", interp.expression)
+            ctx_expr(&interp.expression)
         } else {
             self.wrap_with_pipes(&interp.expression, &interp.pipes)
         };
@@ -426,8 +430,10 @@ impl IvyCodegen {
         }
 
         self.add_advance(slot);
-        self.update
-            .push(format!("\u{0275}\u{0275}repeater(ctx.{});", block.iterable));
+        self.update.push(format!(
+            "\u{0275}\u{0275}repeater({});",
+            ctx_expr(&block.iterable)
+        ));
         self.var_count += 1;
     }
 
@@ -478,7 +484,12 @@ impl IvyCodegen {
             if i > 0 {
                 cond.push_str(" : ");
             }
-            cond.push_str(&format!("ctx.{} === {} ? {}", block.expression, expr, idx));
+            cond.push_str(&format!(
+                "{} === {} ? {}",
+                ctx_expr(&block.expression),
+                expr,
+                idx
+            ));
         }
         if let Some(default_idx) = default_fn {
             cond.push_str(&format!(" : {default_idx}"));
@@ -601,7 +612,7 @@ impl IvyCodegen {
     }
 
     fn wrap_with_pipes(&mut self, base_expr: &str, pipes: &[PipeCall]) -> String {
-        let mut expr = format!("ctx.{base_expr}");
+        let mut expr = ctx_expr(base_expr);
         for pipe in pipes {
             let pipe_slot = self.slot_index;
             self.slot_index += 1;
@@ -642,16 +653,39 @@ impl IvyCodegen {
     }
 }
 
+/// Wrap a template expression with `ctx.` if it's a simple property path.
+///
+/// Simple paths like `title` or `foo.bar` become `ctx.title` / `ctx.foo.bar`.
+/// Complex expressions like `'text' + prop` or `fn()` are left as-is.
+fn ctx_expr(expr: &str) -> String {
+    let trimmed = expr.trim();
+    if is_simple_property_path(trimmed) {
+        format!("ctx.{trimmed}")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Check if a string is a simple property path (e.g. `foo`, `foo.bar`, `$data`).
+fn is_simple_property_path(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .next()
+            .is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$')
+        && s.chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '$')
+}
+
 /// Build a conditional expression for @if chains.
 fn build_conditional_expr(
     condition: &str,
     else_ifs: &[(String, String)],
     else_fn: &Option<String>,
 ) -> String {
-    let mut expr = format!("ctx.{condition} ? 0 : ");
+    let mut expr = format!("{} ? 0 : ", ctx_expr(condition));
 
     for (i, (cond, _fn_name)) in else_ifs.iter().enumerate() {
-        expr.push_str(&format!("ctx.{cond} ? {} : ", i + 1));
+        expr.push_str(&format!("{} ? {} : ", ctx_expr(cond), i + 1));
     }
 
     if else_fn.is_some() {
@@ -740,7 +774,7 @@ mod tests {
         assert!(output.define_component_code.contains("vars: 1"));
         assert!(output
             .define_component_code
-            .contains("\u{0275}\u{0275}textInterpolate(ctx.title)"));
+            .contains("\u{0275}\u{0275}textInterpolate(ctx.title);"));
     }
 
     #[test]

@@ -203,12 +203,13 @@ fn transform_with_fallback(
                     source_path: path.clone(),
                     code,
                 }),
-                Err(_) => {
+                Err(e) => {
                     // Compiled source failed — fall back to original file
                     eprintln!(
-                        "{} transform fallback for {}",
+                        "{} transform fallback for {} ({})",
                         "Warning:".yellow().bold(),
-                        path.display()
+                        path.display(),
+                        e
                     );
                     let original = std::fs::read_to_string(path).map_err(|e| NgcError::Io {
                         path: path.clone(),
