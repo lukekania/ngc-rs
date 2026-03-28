@@ -1,0 +1,5 @@
+---
+source: crates/ts-transform/tests/snapshot_tests.rs
+expression: result
+---
+export const routes = [];

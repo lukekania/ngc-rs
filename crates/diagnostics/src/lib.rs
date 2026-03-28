@@ -51,6 +51,24 @@ pub enum NgcError {
         /// The malformed pattern.
         pattern: String,
     },
+
+    /// A TypeScript file could not be parsed.
+    #[error("parse error in {path}: {message}")]
+    ParseError {
+        /// The path to the file that failed to parse.
+        path: PathBuf,
+        /// The error message from the parser.
+        message: String,
+    },
+
+    /// A TypeScript transform failed.
+    #[error("transform error in {path}: {message}")]
+    TransformError {
+        /// The path to the file that failed to transform.
+        path: PathBuf,
+        /// The error message from the transformer.
+        message: String,
+    },
 }
 
 /// A type alias for Results using NgcError.
