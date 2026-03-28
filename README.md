@@ -1,13 +1,19 @@
 # ngc-rs
 
-A native Rust replacement for `ng build` in Angular projects. Drop-in swap, **~34x faster**.
+A native Rust replacement for `ng build` in Angular projects. Drop-in swap, **~20x faster**.
 
-### Early benchmark
+### Benchmarks
 
-> `ngc-rs info` resolves a project's file graph **34.4 ± 4.0x faster** than `tsc --listFiles --noEmit`.
+| Command | vs tsc equivalent | Ratio |
+|---------|-------------------|-------|
+| `ngc-rs info` (file graph resolution) | `tsc --listFiles --noEmit` | **~34x faster** |
+| `ngc-rs build` (TS → JS transform) | `tsc --outDir` | **~20x faster** |
+| `ngc-rs build` (TS → JS transform) | `tsc --outDir --noCheck` | **~19x faster** |
 
-> **Status: v0.1 — Project Resolver**
-> ngc-rs can resolve an Angular project's full file dependency graph from `tsconfig.json`.
+Measured with [hyperfine](https://github.com/sharkdp/hyperfine) on a real-world Angular project (~1200 files). ngc-rs completes the transform in ~17ms vs ~335ms for tsc.
+
+> **Status: v0.2 — TS Transform**
+> ngc-rs can resolve an Angular project's file graph and transform TypeScript to JavaScript using oxc.
 > See the [milestones](https://github.com/lukekania/ngc-rs/milestones) for the roadmap toward a full `ng build` replacement.
 
 ## Why is it faster?
@@ -54,12 +60,28 @@ ngc-rs project info
   Unresolved:     12
 ```
 
-### Benchmark comparison
+### `ngc-rs build`
 
-Compare resolution time against `tsc --listFiles` (requires [hyperfine](https://github.com/sharkdp/hyperfine)):
+Transform TypeScript files to JavaScript (strips types, interfaces, decorators):
 
 ```sh
-./scripts/bench_compare.sh /path/to/angular-project
+ngc-rs build --project tsconfig.app.json --out-dir out
+```
+
+### Benchmark comparison
+
+Compare against `tsc` (requires [hyperfine](https://github.com/sharkdp/hyperfine)):
+
+```sh
+# Resolution
+hyperfine --warmup 3 -i -N \
+  './target/release/ngc-rs info --project /path/to/tsconfig.app.json' \
+  'npx tsc --project /path/to/tsconfig.app.json --listFiles --noEmit'
+
+# Transform
+hyperfine --warmup 3 -i -N \
+  './target/release/ngc-rs build --project /path/to/tsconfig.app.json --out-dir /tmp/ngc-rs-out' \
+  'npx tsc --project /path/to/tsconfig.app.json --outDir /tmp/tsc-out --noCheck'
 ```
 
 ## Development
@@ -82,8 +104,8 @@ cargo test --workspace && cargo clippy -- -D warnings && cargo fmt --check
 
 See the [GitHub milestones](https://github.com/lukekania/ngc-rs/milestones) for the full plan:
 
-- **v0.1** — Project Resolver (current)
-- **v0.2** — TS Transform (strip types with oxc, emit plain JS)
+- **v0.1** — Project Resolver
+- **v0.2** — TS Transform (current — strip types with oxc, emit plain JS)
 - **v0.3** — Bundling (produce `dist/` matching `ng build` output)
 - **v0.4** — Angular Template Compiler (native template compilation)
 - **v1.0** — Angular CLI Drop-in (swap one line in `angular.json`)
