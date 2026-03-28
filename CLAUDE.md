@@ -48,13 +48,14 @@ Goal: produce a single bundle from the JS file tree.
 - [x] ngc-rs build produces dist/main.js with all project code bundled
 - [x] Integration + snapshot tests verify bundle structure and content
 
-### v0.4 — Angular Template Compiler
+### v0.4 — Angular Template Compiler ✅
 
 Goal: compile Angular component templates natively.
 
-- [ ] Parser for Angular template syntax (pest grammar)
-- [ ] Code-gen: emit \_\_decorate and component factory boilerplate
-- [ ] Drop dependency on tsc subprocess for template compilation
+- [x] Parser for Angular template syntax (pest grammar)
+- [x] Ivy codegen: emit ɵɵdefineComponent, ɵfac, and template function
+- [x] Supports elements, text, interpolation, bindings, events, @if/@for/@switch, pipes
+- [x] JIT fallback for unsupported templates (templateUrl, *ngIf/*ngFor, ng-content)
 
 ### v1.0 — Angular CLI Drop-in
 
