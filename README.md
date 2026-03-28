@@ -1,19 +1,18 @@
 # ngc-rs
 
-A native Rust replacement for `ng build` in Angular projects. Drop-in swap, **~20x faster**.
+A native Rust replacement for `ng build` in Angular projects. Drop-in swap, **~19x faster**.
 
 ### Benchmarks
 
 | Command | vs tsc equivalent | Ratio |
 |---------|-------------------|-------|
 | `ngc-rs info` (file graph resolution) | `tsc --listFiles --noEmit` | **~34x faster** |
-| `ngc-rs build` (TS → JS transform) | `tsc --outDir` | **~20x faster** |
-| `ngc-rs build` (TS → JS transform) | `tsc --outDir --noCheck` | **~19x faster** |
+| `ngc-rs build` (full pipeline: resolve + compile + bundle) | `tsc --outDir` | **~19x faster** |
 
-Measured with [hyperfine](https://github.com/sharkdp/hyperfine) on a real-world Angular project (~1200 files). ngc-rs completes the transform in ~17ms vs ~335ms for tsc.
+Measured with [hyperfine](https://github.com/sharkdp/hyperfine) on a real-world 77-module Angular project. ngc-rs completes the full build pipeline in **~20ms** vs **~370ms** for tsc.
 
-> **Status: v0.2 — TS Transform**
-> ngc-rs can resolve an Angular project's file graph and transform TypeScript to JavaScript using oxc.
+> **Status: v0.4 — Angular Template Compiler**
+> ngc-rs can resolve, transform, compile Angular templates to Ivy, and bundle into a single `dist/main.js`.
 > See the [milestones](https://github.com/lukekania/ngc-rs/milestones) for the roadmap toward a full `ng build` replacement.
 
 ## Why is it faster?
@@ -62,11 +61,13 @@ ngc-rs project info
 
 ### `ngc-rs build`
 
-Transform TypeScript files to JavaScript (strips types, interfaces, decorators):
+Compile templates, transform TypeScript, and bundle into a single file:
 
 ```sh
-ngc-rs build --project tsconfig.app.json --out-dir out
+ngc-rs build --project tsconfig.app.json --out-dir dist
 ```
+
+Produces `dist/main.js` — a single ESM bundle with Ivy-compiled templates, hoisted external imports, and all project-local code concatenated in dependency order.
 
 ### Benchmark comparison
 
@@ -104,10 +105,10 @@ cargo test --workspace && cargo clippy -- -D warnings && cargo fmt --check
 
 See the [GitHub milestones](https://github.com/lukekania/ngc-rs/milestones) for the full plan:
 
-- **v0.1** — Project Resolver
-- **v0.2** — TS Transform (current — strip types with oxc, emit plain JS)
-- **v0.3** — Bundling (produce `dist/` matching `ng build` output)
-- **v0.4** — Angular Template Compiler (native template compilation)
+- **v0.1** — Project Resolver ✅
+- **v0.2** — TS Transform ✅ (strip types with oxc, emit plain JS)
+- **v0.3** — Bundling ✅ (ESM concatenation with dependency ordering)
+- **v0.4** — Angular Template Compiler ✅ (Ivy codegen, pest parser)
 - **v1.0** — Angular CLI Drop-in (swap one line in `angular.json`)
 
 ## Contributing
