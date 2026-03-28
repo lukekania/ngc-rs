@@ -38,34 +38,18 @@ pub struct ExtractedComponent {
     pub angular_core_import_span: Option<(u32, u32)>,
     /// Named imports from `@angular/core` other than `Component`.
     pub other_angular_core_imports: Vec<String>,
+    /// Raw source text of the `styles` array (e.g. `['\`.sidebar { ... }\`']`).
+    pub styles_source: Option<String>,
 }
 
 impl ExtractedComponent {
     /// Check whether the component should use JIT fallback.
+    ///
+    /// Returns true only for patterns not yet supported by the native compiler.
+    /// Most constructs are now compiled natively: elements, bindings, events,
+    /// @if/@for/@switch, pipes, ng-content, ng-container, ng-template,
+    /// *ngIf/*ngFor, [(two-way)], #ref, and templateUrl.
     pub fn needs_jit_fallback(&self) -> bool {
-        // templateUrl always requires JIT
-        if self.template_url.is_some() {
-            return true;
-        }
-        // Check template for unsupported patterns
-        if let Some(ref tpl) = self.template {
-            if tpl.contains("*ngIf")
-                || tpl.contains("*ngFor")
-                || tpl.contains("[(")
-                || tpl.contains("<ng-content")
-                || tpl.contains("<ng-template")
-                || tpl.contains("<ng-container")
-            {
-                return true;
-            }
-            // Check for template reference variables (# followed by a letter)
-            let bytes = tpl.as_bytes();
-            for i in 0..bytes.len().saturating_sub(1) {
-                if bytes[i] == b'#' && bytes[i + 1].is_ascii_alphabetic() {
-                    return true;
-                }
-            }
-        }
         false
     }
 }
@@ -168,6 +152,7 @@ pub fn extract_component(source: &str, file_path: &Path) -> NgcResult<Option<Ext
             class_keyword_start,
             angular_core_import_span,
             other_angular_core_imports,
+            styles_source: metadata.styles_source,
         }));
     }
 
@@ -194,6 +179,7 @@ struct DecoratorMetadata {
     standalone: bool,
     imports_source: Option<String>,
     imports_identifiers: Vec<String>,
+    styles_source: Option<String>,
 }
 
 /// Extract metadata from the `@Component({...})` decorator argument.
@@ -208,6 +194,7 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
                 standalone: false,
                 imports_source: None,
                 imports_identifiers: Vec::new(),
+                styles_source: None,
             });
         }
     };
@@ -222,6 +209,7 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
                 standalone: false,
                 imports_source: None,
                 imports_identifiers: Vec::new(),
+                styles_source: None,
             });
         }
     };
@@ -232,6 +220,7 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
     let mut standalone = false;
     let mut imports_source = None;
     let mut imports_identifiers = Vec::new();
+    let mut styles_source = None;
 
     for prop in &arg.properties {
         if let ObjectPropertyKind::ObjectProperty(prop) = prop {
@@ -268,6 +257,13 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
                         standalone = b.value;
                     }
                 }
+                "styles" | "styleUrl" | "styleUrls" => {
+                    let start = prop.value.span().start as usize;
+                    let end = prop.value.span().end as usize;
+                    if start < source.len() && end <= source.len() {
+                        styles_source = Some(source[start..end].to_string());
+                    }
+                }
                 "imports" => {
                     // Capture the raw source text for the imports array
                     let start = prop.value.span().start as usize;
@@ -296,6 +292,7 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
         standalone,
         imports_source,
         imports_identifiers,
+        styles_source,
     })
 }
 
@@ -352,7 +349,7 @@ export class AppComponent {}
     }
 
     #[test]
-    fn test_extract_template_url_triggers_jit() {
+    fn test_extract_template_url() {
         let source = r#"import { Component } from '@angular/core';
 
 @Component({
@@ -364,7 +361,9 @@ export class AppComponent {}
         let result = extract_component(source, &test_path())
             .expect("should extract")
             .expect("should find component");
-        assert!(result.needs_jit_fallback());
+        assert_eq!(result.template_url.as_deref(), Some("./app.component.html"));
+        // templateUrl is now natively compiled (no JIT fallback)
+        assert!(!result.needs_jit_fallback());
     }
 
     #[test]
@@ -375,7 +374,7 @@ export class AppComponent {}
     }
 
     #[test]
-    fn test_ngif_triggers_jit() {
+    fn test_ngif_natively_compiled() {
         let source = r#"import { Component } from '@angular/core';
 
 @Component({
@@ -387,7 +386,8 @@ export class TestComponent {}
         let result = extract_component(source, &test_path())
             .expect("should extract")
             .expect("should find component");
-        assert!(result.needs_jit_fallback());
+        // *ngIf is now natively compiled (no JIT fallback)
+        assert!(!result.needs_jit_fallback());
     }
 
     #[test]

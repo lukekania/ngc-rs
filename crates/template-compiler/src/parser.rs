@@ -209,6 +209,40 @@ fn parse_attributes(
                     .unwrap_or_default();
                 attrs.push(crate::ast::TemplateAttribute::AttrBinding { name, expression });
             }
+            Rule::two_way_binding => {
+                let mut inner = pair.into_inner();
+                let name = inner
+                    .next()
+                    .map(|p| p.as_str().to_string())
+                    .unwrap_or_default();
+                let expression = inner
+                    .next()
+                    .and_then(|p| p.into_inner().next())
+                    .map(|p| p.as_str().to_string())
+                    .unwrap_or_default();
+                attrs.push(crate::ast::TemplateAttribute::TwoWayBinding { name, expression });
+            }
+            Rule::structural_directive => {
+                let mut inner = pair.into_inner();
+                let name = inner
+                    .next()
+                    .map(|p| p.as_str().to_string())
+                    .unwrap_or_default();
+                let expression = inner
+                    .next()
+                    .and_then(|p| p.into_inner().next())
+                    .map(|p| p.as_str().to_string())
+                    .unwrap_or_default();
+                attrs.push(crate::ast::TemplateAttribute::StructuralDirective { name, expression });
+            }
+            Rule::ref_variable => {
+                let mut inner = pair.into_inner();
+                let name = inner
+                    .next()
+                    .map(|p| p.as_str().to_string())
+                    .unwrap_or_default();
+                attrs.push(crate::ast::TemplateAttribute::Reference { name });
+            }
             Rule::static_attribute => {
                 let mut inner = pair.into_inner();
                 let name = inner

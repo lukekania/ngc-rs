@@ -85,16 +85,25 @@ pub fn compile_component(source: &str, file_path: &Path) -> NgcResult<CompiledFi
         });
     }
 
-    let template_source = match &extracted.template {
-        Some(t) => t.as_str(),
-        None => {
-            return Ok(CompiledFile {
-                source_path: file_path.to_path_buf(),
-                source: source.to_string(),
-                compiled: false,
-                jit_fallback: false,
-            });
-        }
+    // Resolve template source: inline template or external templateUrl
+    let resolved_template;
+    let template_source = if let Some(ref t) = extracted.template {
+        t.as_str()
+    } else if let Some(ref url) = extracted.template_url {
+        let base_dir = file_path.parent().unwrap_or(Path::new("."));
+        let html_path = base_dir.join(url);
+        resolved_template = std::fs::read_to_string(&html_path).map_err(|e| NgcError::Io {
+            path: html_path,
+            source: e,
+        })?;
+        &resolved_template
+    } else {
+        return Ok(CompiledFile {
+            source_path: file_path.to_path_buf(),
+            source: source.to_string(),
+            compiled: false,
+            jit_fallback: false,
+        });
     };
 
     // Parse the template
@@ -114,4 +123,32 @@ pub fn compile_component(source: &str, file_path: &Path) -> NgcResult<CompiledFi
         compiled: true,
         jit_fallback: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compile_and_transform_roundtrip() {
+        // Read a real component file if available, otherwise use inline source
+        let path = PathBuf::from("/Users/lukaskania/Coding/Private/treasr/treasr-frontend/src/app/components/skeleton-loader.component.ts");
+        let source = if path.exists() {
+            std::fs::read_to_string(&path).unwrap()
+        } else {
+            "import { Component, Input } from '@angular/core';\n\n@Component({\n  selector: 'app-test',\n  standalone: true,\n  template: '<div [class]=\"cls\"><span>Hi</span></div>',\n})\nexport class TestComponent {\n  @Input() cls = '';\n}\n".to_string()
+        };
+        let path = PathBuf::from("test.component.ts");
+        let result = compile_component(&source, &path).expect("should compile");
+        assert!(result.compiled, "should be compiled");
+
+        // Verify the compiled source can be parsed by oxc
+        let js = ngc_ts_transform::transform_source(&result.source, "test.component.ts");
+        assert!(
+            js.is_ok(),
+            "oxc should parse compiled source: {:?}\n\nCompiled source:\n{}",
+            js.err(),
+            result.source
+        );
+    }
 }
