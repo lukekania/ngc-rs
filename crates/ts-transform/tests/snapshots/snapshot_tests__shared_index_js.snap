@@ -1,0 +1,6 @@
+---
+source: crates/ts-transform/tests/snapshot_tests.rs
+expression: result
+---
+export { SharedUtils } from './utils';
+export { Logger } from './logger';
