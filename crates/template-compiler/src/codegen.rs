@@ -115,6 +115,9 @@ pub fn generate_ivy(
     if let Some(ref imports_src) = component.imports_source {
         dc.push_str(&format!(",\n    dependencies: {imports_src}"));
     }
+    if let Some(ref styles_src) = component.styles_source {
+        dc.push_str(&format!(",\n    styles: {styles_src}"));
+    }
     dc.push_str("\n  })");
 
     // Collect child template functions
@@ -151,8 +154,54 @@ impl IvyCodegen {
     }
 
     fn generate_element(&mut self, el: &ElementNode) {
+        // Check for structural directive — desugar to ng-template wrapper
+        let structural = el.attributes.iter().find_map(|a| match a {
+            TemplateAttribute::StructuralDirective { name, expression } => {
+                Some((name.clone(), expression.clone()))
+            }
+            _ => None,
+        });
+        if let Some((dir_name, dir_expr)) = structural {
+            self.generate_structural_directive(el, &dir_name, &dir_expr);
+            return;
+        }
+
+        // Special Angular elements
+        match el.tag.as_str() {
+            "ng-content" => {
+                let slot = self.slot_index;
+                self.slot_index += 1;
+                self.ivy_imports
+                    .insert("\u{0275}\u{0275}projection".to_string());
+                self.creation
+                    .push(format!("\u{0275}\u{0275}projection({slot});"));
+                return;
+            }
+            "ng-template" => {
+                let slot = self.slot_index;
+                self.slot_index += 1;
+                self.ivy_imports
+                    .insert("\u{0275}\u{0275}template".to_string());
+                let fn_name = format!(
+                    "{}_NgTemplate_{}_Template",
+                    self.component_name, self.child_counter
+                );
+                self.child_counter += 1;
+                let child = self.generate_child_template(&fn_name, &el.children);
+                self.creation.push(format!(
+                    "\u{0275}\u{0275}template({slot}, {fn_name}, {}, {});",
+                    child.decls, child.vars
+                ));
+                self.child_templates.push(child);
+                return;
+            }
+            _ => {}
+        }
+
         let slot = self.slot_index;
         self.slot_index += 1;
+
+        let is_ng_container = el.tag == "ng-container";
 
         // Collect event and update bindings
         let _has_events = el
@@ -166,6 +215,7 @@ impl IvyCodegen {
                     | TemplateAttribute::ClassBinding { .. }
                     | TemplateAttribute::StyleBinding { .. }
                     | TemplateAttribute::AttrBinding { .. }
+                    | TemplateAttribute::TwoWayBinding { .. }
             )
         });
 
@@ -182,54 +232,80 @@ impl IvyCodegen {
             })
             .collect();
 
-        if el.is_void {
-            self.ivy_imports
-                .insert("\u{0275}\u{0275}element".to_string());
+        if el.is_void && !is_ng_container {
+            let instr = if is_ng_container {
+                "\u{0275}\u{0275}elementContainer"
+            } else {
+                "\u{0275}\u{0275}element"
+            };
+            self.ivy_imports.insert(instr.to_string());
             if static_attrs.is_empty() {
                 self.creation
-                    .push(format!("\u{0275}\u{0275}element({slot}, '{}');", el.tag));
+                    .push(format!("{instr}({slot}, '{}');", el.tag));
             } else {
                 let attrs_str = format_static_attrs(&static_attrs);
-                self.creation.push(format!(
-                    "\u{0275}\u{0275}element({slot}, '{}', {attrs_str});",
-                    el.tag
-                ));
+                self.creation
+                    .push(format!("{instr}({slot}, '{}', {attrs_str});", el.tag));
             }
         } else {
-            self.ivy_imports
-                .insert("\u{0275}\u{0275}elementStart".to_string());
-            self.ivy_imports
-                .insert("\u{0275}\u{0275}elementEnd".to_string());
+            let (start_instr, end_instr) = if is_ng_container {
+                (
+                    "\u{0275}\u{0275}elementContainerStart",
+                    "\u{0275}\u{0275}elementContainerEnd",
+                )
+            } else {
+                ("\u{0275}\u{0275}elementStart", "\u{0275}\u{0275}elementEnd")
+            };
+            self.ivy_imports.insert(start_instr.to_string());
+            self.ivy_imports.insert(end_instr.to_string());
             if static_attrs.is_empty() {
-                self.creation.push(format!(
-                    "\u{0275}\u{0275}elementStart({slot}, '{}');",
-                    el.tag
-                ));
+                self.creation
+                    .push(format!("{start_instr}({slot}, '{}');", el.tag));
             } else {
                 let attrs_str = format_static_attrs(&static_attrs);
-                self.creation.push(format!(
-                    "\u{0275}\u{0275}elementStart({slot}, '{}', {attrs_str});",
-                    el.tag
-                ));
+                self.creation
+                    .push(format!("{start_instr}({slot}, '{}', {attrs_str});", el.tag));
             }
 
-            // Event listeners in creation block
+            // Event listeners and two-way binding listeners in creation block
             for attr in &el.attributes {
-                if let TemplateAttribute::Event { name, handler } = attr {
-                    self.ivy_imports
-                        .insert("\u{0275}\u{0275}listener".to_string());
-                    self.creation.push(format!(
-                        "\u{0275}\u{0275}listener('{}', function() {{ return ctx.{}; }});",
-                        name, handler
-                    ));
+                match attr {
+                    TemplateAttribute::Event { name, handler } => {
+                        self.ivy_imports
+                            .insert("\u{0275}\u{0275}listener".to_string());
+                        self.creation.push(format!(
+                            "\u{0275}\u{0275}listener('{}', function() {{ return ctx.{}; }});",
+                            name, handler
+                        ));
+                    }
+                    TemplateAttribute::TwoWayBinding { name, expression } => {
+                        self.ivy_imports
+                            .insert("\u{0275}\u{0275}listener".to_string());
+                        self.creation.push(format!(
+                            "\u{0275}\u{0275}listener('{}Change', function($event) {{ return {} = $event; }});",
+                            name, ctx_expr(expression)
+                        ));
+                    }
+                    _ => {}
                 }
             }
 
             // Generate children
             self.generate_nodes(&el.children);
 
-            self.creation
-                .push("\u{0275}\u{0275}elementEnd();".to_string());
+            self.creation.push(format!("{end_instr}();"));
+
+            // Template reference variables
+            for attr in &el.attributes {
+                if let TemplateAttribute::Reference { .. } = attr {
+                    self.ivy_imports
+                        .insert("\u{0275}\u{0275}reference".to_string());
+                    let ref_slot = self.slot_index;
+                    self.slot_index += 1;
+                    self.creation
+                        .push(format!("\u{0275}\u{0275}reference({ref_slot});"));
+                }
+            }
         }
 
         // Property bindings in update block
@@ -242,8 +318,19 @@ impl IvyCodegen {
                     self.ivy_imports
                         .insert("\u{0275}\u{0275}property".to_string());
                     self.update.push(format!(
-                        "\u{0275}\u{0275}property('{}', ctx.{});",
-                        name, expression
+                        "\u{0275}\u{0275}property('{}', {});",
+                        name,
+                        ctx_expr(expression)
+                    ));
+                    self.var_count += 1;
+                }
+                TemplateAttribute::TwoWayBinding { name, expression } => {
+                    self.ivy_imports
+                        .insert("\u{0275}\u{0275}property".to_string());
+                    self.update.push(format!(
+                        "\u{0275}\u{0275}property('{}', {});",
+                        name,
+                        ctx_expr(expression)
                     ));
                     self.var_count += 1;
                 }
@@ -254,8 +341,9 @@ impl IvyCodegen {
                     self.ivy_imports
                         .insert("\u{0275}\u{0275}classProp".to_string());
                     self.update.push(format!(
-                        "\u{0275}\u{0275}classProp('{}', ctx.{});",
-                        class_name, expression
+                        "\u{0275}\u{0275}classProp('{}', {});",
+                        class_name,
+                        ctx_expr(expression)
                     ));
                     self.var_count += 1;
                 }
@@ -266,8 +354,9 @@ impl IvyCodegen {
                     self.ivy_imports
                         .insert("\u{0275}\u{0275}styleProp".to_string());
                     self.update.push(format!(
-                        "\u{0275}\u{0275}styleProp('{}', ctx.{});",
-                        property, expression
+                        "\u{0275}\u{0275}styleProp('{}', {});",
+                        property,
+                        ctx_expr(expression)
                     ));
                     self.var_count += 1;
                 }
@@ -275,13 +364,137 @@ impl IvyCodegen {
                     self.ivy_imports
                         .insert("\u{0275}\u{0275}attribute".to_string());
                     self.update.push(format!(
-                        "\u{0275}\u{0275}attribute('{}', ctx.{});",
-                        name, expression
+                        "\u{0275}\u{0275}attribute('{}', {});",
+                        name,
+                        ctx_expr(expression)
                     ));
                     self.var_count += 1;
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Desugar a structural directive (*ngIf, *ngFor) to an ng-template wrapper.
+    fn generate_structural_directive(&mut self, el: &ElementNode, dir_name: &str, dir_expr: &str) {
+        let slot = self.slot_index;
+        self.slot_index += 1;
+
+        self.ivy_imports
+            .insert("\u{0275}\u{0275}template".to_string());
+        self.ivy_imports
+            .insert("\u{0275}\u{0275}advance".to_string());
+        self.ivy_imports
+            .insert("\u{0275}\u{0275}property".to_string());
+
+        // Create a child element without the structural directive
+        let filtered_attrs: Vec<TemplateAttribute> = el
+            .attributes
+            .iter()
+            .filter(|a| !matches!(a, TemplateAttribute::StructuralDirective { .. }))
+            .cloned()
+            .collect();
+        let inner_el = ElementNode {
+            tag: el.tag.clone(),
+            attributes: filtered_attrs,
+            children: el.children.clone(),
+            is_void: el.is_void,
+        };
+
+        let fn_name = format!(
+            "{}_Directive_{}_Template",
+            self.component_name, self.child_counter
+        );
+        self.child_counter += 1;
+
+        // Generate the child template containing the original element
+        let child = self.generate_child_template_with_element(&fn_name, &inner_el);
+        self.creation.push(format!(
+            "\u{0275}\u{0275}template({slot}, {fn_name}, {}, {});",
+            child.decls, child.vars
+        ));
+        self.child_templates.push(child);
+
+        // Property binding for the directive
+        self.add_advance(slot);
+
+        // Parse *ngFor micro-syntax: "let item of items" → property ngForOf
+        if dir_name == "ngFor" {
+            let binding_name = "ngForOf";
+            if let Some(of_pos) = dir_expr.find(" of ") {
+                let iterable = dir_expr[of_pos + 4..].trim();
+                self.update.push(format!(
+                    "\u{0275}\u{0275}property('{}', {});",
+                    binding_name,
+                    ctx_expr(iterable)
+                ));
+            } else {
+                self.update.push(format!(
+                    "\u{0275}\u{0275}property('{}', {});",
+                    binding_name,
+                    ctx_expr(dir_expr)
+                ));
+            }
+        } else {
+            self.update.push(format!(
+                "\u{0275}\u{0275}property('{}', {});",
+                dir_name,
+                ctx_expr(dir_expr)
+            ));
+        }
+        self.var_count += 1;
+    }
+
+    /// Generate a child template containing a single element.
+    fn generate_child_template_with_element(
+        &mut self,
+        fn_name: &str,
+        el: &ElementNode,
+    ) -> ChildTemplate {
+        let parent_slot = self.slot_index;
+        let parent_var = self.var_count;
+        let parent_creation = std::mem::take(&mut self.creation);
+        let parent_update = std::mem::take(&mut self.update);
+
+        self.slot_index = 0;
+        self.var_count = 0;
+
+        self.generate_element(el);
+
+        let decls = self.slot_index;
+        let vars = self.var_count;
+
+        let mut code = format!("function {fn_name}(rf: number, ctx: any) {{\n");
+        if !self.creation.is_empty() {
+            code.push_str("  if (rf & 1) {\n");
+            for instr in &self.creation {
+                code.push_str("    ");
+                code.push_str(instr);
+                code.push('\n');
+            }
+            code.push_str("  }\n");
+        }
+        if !self.update.is_empty() {
+            code.push_str("  if (rf & 2) {\n");
+            for instr in &self.update {
+                code.push_str("    ");
+                code.push_str(instr);
+                code.push('\n');
+            }
+            code.push_str("  }\n");
+        }
+        code.push('}');
+
+        self.slot_index = parent_slot;
+        self.var_count = parent_var;
+        self.creation = parent_creation;
+        self.update = parent_update;
+
+        ChildTemplate {
+            function_name: fn_name.to_string(),
+            decls,
+            vars,
+            code,
         }
     }
 
@@ -308,7 +521,7 @@ impl IvyCodegen {
 
         // Build the expression with pipe wrapping
         let expr = if interp.pipes.is_empty() {
-            format!("ctx.{}", interp.expression)
+            ctx_expr(&interp.expression)
         } else {
             self.wrap_with_pipes(&interp.expression, &interp.pipes)
         };
@@ -423,8 +636,10 @@ impl IvyCodegen {
         }
 
         self.add_advance(slot);
-        self.update
-            .push(format!("\u{0275}\u{0275}repeater(ctx.{});", block.iterable));
+        self.update.push(format!(
+            "\u{0275}\u{0275}repeater({});",
+            ctx_expr(&block.iterable)
+        ));
         self.var_count += 1;
     }
 
@@ -475,7 +690,12 @@ impl IvyCodegen {
             if i > 0 {
                 cond.push_str(" : ");
             }
-            cond.push_str(&format!("ctx.{} === {} ? {}", block.expression, expr, idx));
+            cond.push_str(&format!(
+                "{} === {} ? {}",
+                ctx_expr(&block.expression),
+                expr,
+                idx
+            ));
         }
         if let Some(default_idx) = default_fn {
             cond.push_str(&format!(" : {default_idx}"));
@@ -598,7 +818,7 @@ impl IvyCodegen {
     }
 
     fn wrap_with_pipes(&mut self, base_expr: &str, pipes: &[PipeCall]) -> String {
-        let mut expr = format!("ctx.{base_expr}");
+        let mut expr = ctx_expr(base_expr);
         for pipe in pipes {
             let pipe_slot = self.slot_index;
             self.slot_index += 1;
@@ -639,16 +859,39 @@ impl IvyCodegen {
     }
 }
 
+/// Wrap a template expression with `ctx.` if it's a simple property path.
+///
+/// Simple paths like `title` or `foo.bar` become `ctx.title` / `ctx.foo.bar`.
+/// Complex expressions like `'text' + prop` or `fn()` are left as-is.
+fn ctx_expr(expr: &str) -> String {
+    let trimmed = expr.trim();
+    if is_simple_property_path(trimmed) {
+        format!("ctx.{trimmed}")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Check if a string is a simple property path (e.g. `foo`, `foo.bar`, `$data`).
+fn is_simple_property_path(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .next()
+            .is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$')
+        && s.chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '$')
+}
+
 /// Build a conditional expression for @if chains.
 fn build_conditional_expr(
     condition: &str,
     else_ifs: &[(String, String)],
     else_fn: &Option<String>,
 ) -> String {
-    let mut expr = format!("ctx.{condition} ? 0 : ");
+    let mut expr = format!("{} ? 0 : ", ctx_expr(condition));
 
     for (i, (cond, _fn_name)) in else_ifs.iter().enumerate() {
-        expr.push_str(&format!("ctx.{cond} ? {} : ", i + 1));
+        expr.push_str(&format!("{} ? {} : ", ctx_expr(cond), i + 1));
     }
 
     if else_fn.is_some() {
@@ -689,6 +932,7 @@ mod tests {
             class_keyword_start: 0,
             angular_core_import_span: None,
             other_angular_core_imports: Vec::new(),
+            styles_source: None,
         }
     }
 
@@ -736,7 +980,7 @@ mod tests {
         assert!(output.define_component_code.contains("vars: 1"));
         assert!(output
             .define_component_code
-            .contains("\u{0275}\u{0275}textInterpolate(ctx.title)"));
+            .contains("\u{0275}\u{0275}textInterpolate(ctx.title);"));
     }
 
     #[test]
