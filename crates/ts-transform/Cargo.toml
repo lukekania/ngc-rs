@@ -1,0 +1,23 @@
+[package]
+name = "ngc-ts-transform"
+description = "TypeScript to JavaScript transform for ngc-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ngc-diagnostics = { path = "../diagnostics" }
+oxc_allocator = "0.122"
+oxc_parser = "0.122"
+oxc_transformer = "0.122"
+oxc_codegen = "0.122"
+oxc_span = "0.122"
+rayon = "1.11"
+tracing = "0.1"
+
+[dev-dependencies]
+ngc-project-resolver = { path = "../project-resolver" }
+insta = { version = "1.46", features = ["glob"] }
+tempfile = "3"
