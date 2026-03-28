@@ -119,9 +119,27 @@ fn run_build(project: &Path, out_dir_override: Option<&Path>) -> NgcResult<Build
         })
         .unwrap_or_else(|| config_dir.join("dist"));
 
-    // Transform all files to memory
+    // Compile templates, then transform to JS
     let files: Vec<PathBuf> = file_graph.graph.node_weights().cloned().collect();
-    let transformed = ngc_ts_transform::transform_to_memory(&files)?;
+    let compiled = ngc_template_compiler::compile_templates(&files)?;
+
+    // Report any JIT fallbacks
+    for cf in &compiled {
+        if cf.jit_fallback {
+            eprintln!(
+                "{} JIT fallback for {}",
+                "Warning:".yellow().bold(),
+                cf.source_path.display()
+            );
+        }
+    }
+
+    // Transform compiled sources (template-compiled TS → JS)
+    let sources: Vec<(PathBuf, String)> = compiled
+        .into_iter()
+        .map(|cf| (cf.source_path, cf.source))
+        .collect();
+    let transformed = ngc_ts_transform::transform_sources_to_memory(&sources)?;
 
     // Build modules map (canonical source path → JS code)
     let modules: HashMap<PathBuf, String> = transformed

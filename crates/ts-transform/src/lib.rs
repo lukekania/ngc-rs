@@ -6,5 +6,6 @@
 mod transform;
 
 pub use transform::{
-    transform_project, transform_source, transform_to_memory, TransformResult, TransformedModule,
+    transform_project, transform_source, transform_sources_to_memory, transform_to_memory,
+    TransformResult, TransformedModule,
 };
