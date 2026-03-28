@@ -14,6 +14,7 @@ oxc_parser = "0.122"
 oxc_transformer = "0.122"
 oxc_codegen = "0.122"
 oxc_span = "0.122"
+oxc_semantic = "0.122"
 rayon = "1.11"
 tracing = "0.1"
 
