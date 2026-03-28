@@ -1,7 +1,11 @@
 [package]
 name = "ngc-diagnostics"
-version = "0.1.0"
-edition = "2021"
+description = "Error types and diagnostics for ngc-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
 
 [dependencies]
 thiserror = "2.0"
