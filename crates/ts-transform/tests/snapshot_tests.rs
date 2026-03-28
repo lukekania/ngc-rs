@@ -6,8 +6,8 @@ fn fixture_root() -> PathBuf {
 
 #[test]
 fn test_transform_main() {
-    let source = std::fs::read_to_string(fixture_root().join("src/main.ts"))
-        .expect("should read fixture");
+    let source =
+        std::fs::read_to_string(fixture_root().join("src/main.ts")).expect("should read fixture");
     let result =
         ngc_ts_transform::transform_source(&source, "main.ts").expect("transform should succeed");
     insta::assert_snapshot!("main_js", result);
@@ -44,8 +44,8 @@ fn test_transform_app_routes() {
 fn test_transform_shared_index() {
     let source = std::fs::read_to_string(fixture_root().join("src/app/shared/index.ts"))
         .expect("should read fixture");
-    let result = ngc_ts_transform::transform_source(&source, "index.ts")
-        .expect("transform should succeed");
+    let result =
+        ngc_ts_transform::transform_source(&source, "index.ts").expect("transform should succeed");
     insta::assert_snapshot!("shared_index_js", result);
 }
 
@@ -53,8 +53,8 @@ fn test_transform_shared_index() {
 fn test_transform_logger() {
     let source = std::fs::read_to_string(fixture_root().join("src/app/shared/logger.ts"))
         .expect("should read fixture");
-    let result = ngc_ts_transform::transform_source(&source, "logger.ts")
-        .expect("transform should succeed");
+    let result =
+        ngc_ts_transform::transform_source(&source, "logger.ts").expect("transform should succeed");
     insta::assert_snapshot!("logger_js", result);
 }
 
@@ -62,8 +62,8 @@ fn test_transform_logger() {
 fn test_transform_utils() {
     let source = std::fs::read_to_string(fixture_root().join("src/app/shared/utils.ts"))
         .expect("should read fixture");
-    let result = ngc_ts_transform::transform_source(&source, "utils.ts")
-        .expect("transform should succeed");
+    let result =
+        ngc_ts_transform::transform_source(&source, "utils.ts").expect("transform should succeed");
     insta::assert_snapshot!("utils_js", result);
 }
 
@@ -89,8 +89,7 @@ fn test_transform_environment_prod() {
 #[test]
 fn test_transform_all_fixtures() {
     let fixture = fixture_root().join("tsconfig.app.json");
-    let graph =
-        ngc_project_resolver::resolve_project(&fixture).expect("fixture should resolve");
+    let graph = ngc_project_resolver::resolve_project(&fixture).expect("fixture should resolve");
 
     for file_path in graph.graph.node_weights() {
         let source = std::fs::read_to_string(file_path).expect("should read fixture file");
