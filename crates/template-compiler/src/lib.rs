@@ -85,16 +85,25 @@ pub fn compile_component(source: &str, file_path: &Path) -> NgcResult<CompiledFi
         });
     }
 
-    let template_source = match &extracted.template {
-        Some(t) => t.as_str(),
-        None => {
-            return Ok(CompiledFile {
-                source_path: file_path.to_path_buf(),
-                source: source.to_string(),
-                compiled: false,
-                jit_fallback: false,
-            });
-        }
+    // Resolve template source: inline template or external templateUrl
+    let resolved_template;
+    let template_source = if let Some(ref t) = extracted.template {
+        t.as_str()
+    } else if let Some(ref url) = extracted.template_url {
+        let base_dir = file_path.parent().unwrap_or(Path::new("."));
+        let html_path = base_dir.join(url);
+        resolved_template = std::fs::read_to_string(&html_path).map_err(|e| NgcError::Io {
+            path: html_path,
+            source: e,
+        })?;
+        &resolved_template
+    } else {
+        return Ok(CompiledFile {
+            source_path: file_path.to_path_buf(),
+            source: source.to_string(),
+            compiled: false,
+            jit_fallback: false,
+        });
     };
 
     // Parse the template

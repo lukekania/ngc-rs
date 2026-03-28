@@ -73,6 +73,25 @@ pub enum TemplateAttribute {
         /// Handler expression.
         handler: String,
     },
+    /// A two-way binding like `[(ngModel)]="expr"`.
+    TwoWayBinding {
+        /// Property name.
+        name: String,
+        /// JavaScript expression.
+        expression: String,
+    },
+    /// A structural directive like `*ngIf="condition"`.
+    StructuralDirective {
+        /// Directive name (e.g. `ngIf`, `ngFor`).
+        name: String,
+        /// Directive expression.
+        expression: String,
+    },
+    /// A template reference variable like `#myRef`.
+    Reference {
+        /// Reference name.
+        name: String,
+    },
 }
 
 /// A text node.
