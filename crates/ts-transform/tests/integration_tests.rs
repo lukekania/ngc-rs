@@ -93,7 +93,7 @@ fn test_output_preserves_directory_structure() {
     // Verify no .ts files in output
     let has_ts_files = walkdir(out_dir.path())
         .iter()
-        .any(|p| p.extension().map_or(false, |e| e == "ts"));
+        .any(|p| p.extension().is_some_and(|e| e == "ts"));
     assert!(!has_ts_files, "output should contain no .ts files");
 }
 
