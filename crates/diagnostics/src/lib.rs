@@ -101,6 +101,49 @@ pub enum NgcError {
         /// The error message from the compiler.
         message: String,
     },
+
+    /// An angular.json file could not be parsed.
+    #[error("failed to parse angular.json at {path}: {source}")]
+    AngularJsonParse {
+        /// The path to the invalid angular.json file.
+        path: PathBuf,
+        /// The underlying JSON parse error.
+        source: serde_json::Error,
+    },
+
+    /// A referenced project was not found in angular.json.
+    #[error("project {name:?} not found in angular.json at {path}")]
+    ProjectNotFound {
+        /// The project name that was not found.
+        name: String,
+        /// The path to the angular.json file.
+        path: PathBuf,
+    },
+
+    /// An asset path or pattern is invalid.
+    #[error("asset error for {path}: {message}")]
+    AssetError {
+        /// The problematic asset path.
+        path: PathBuf,
+        /// Description of what went wrong.
+        message: String,
+    },
+
+    /// A style file could not be processed.
+    #[error("style error for {path}: {message}")]
+    StyleError {
+        /// The path to the problematic style file.
+        path: PathBuf,
+        /// Description of what went wrong.
+        message: String,
+    },
+
+    /// JSON serialization failed.
+    #[error("JSON output error: {message}")]
+    JsonOutputError {
+        /// Description of what went wrong.
+        message: String,
+    },
 }
 
 /// A type alias for Results using NgcError.
