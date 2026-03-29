@@ -296,17 +296,24 @@ pub fn resolve_angular_project(
             .and_then(|configs| configs.get(cn))
     });
 
-    // Resolve output path
+    // Resolve output path (default to dist/{project_name} when omitted)
     let output_path = options
         .and_then(|o| o.output_path.as_ref())
         .map(|raw_op| resolve_output_path(raw_op, &base_dir))
-        .unwrap_or_else(|| base_dir.join("dist"));
+        .unwrap_or_else(|| base_dir.join("dist").join(&name));
 
-    // Resolve index
+    // Resolve index (default to {source_root}/index.html when omitted)
     let (index_html, index_output) = options
         .and_then(|o| o.index.as_ref())
         .map(|raw_idx| resolve_index(raw_idx, &base_dir))
-        .unwrap_or((None, "index.html".to_string()));
+        .unwrap_or_else(|| {
+            let default_index = source_root.join("index.html");
+            if default_index.exists() {
+                (Some(default_index), "index.html".to_string())
+            } else {
+                (None, "index.html".to_string())
+            }
+        });
 
     // Resolve tsConfig
     let ts_config = options
