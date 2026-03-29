@@ -59,14 +59,57 @@ Goal: compile Angular component templates natively.
 - [x] Structural directives (*ngIf, *ngFor), template reference variables (#ref)
 - [x] Styles extraction and emission in defineComponent
 
+### v0.5 — Build Output Completeness ✅
+
+Goal: produce browser-loadable output from ngc-rs build.
+
+- [x] angular.json parsing (styles, assets, polyfills, fileReplacements)
+- [x] Index HTML generation with script/link injection
+- [x] Global styles extraction (concatenate CSS files → dist/styles.css)
+- [x] Asset copying (src/assets/ → dist/assets/)
+- [x] Polyfills bundle (dist/polyfills.js)
+- [x] fileReplacements (environment file swapping per configuration)
+- [x] 3rdpartylicenses.txt generation
+- [x] JSON output mode (--output-json for builder integration)
+
+### v0.6 — Code Splitting & Lazy Routes
+
+Goal: support lazy-loaded Angular routes with separate chunk files.
+
+- [ ] Dynamic import() detection in bundler
+- [ ] Chunk graph construction (main + lazy chunks + shared chunks)
+- [ ] Multi-file bundle output (main.js + chunk-*.js)
+- [ ] Import rewriting for chunk filenames
+
+### v0.7 — Source Maps & Optimization
+
+Goal: source maps and production-mode optimized builds.
+
+- [ ] Source map generation through full pipeline (transform → bundle)
+- [ ] Minification (oxc_minifier or equivalent)
+- [ ] Tree shaking / dead code elimination
+- [ ] Production vs development build modes (--configuration)
+
+### v0.8 — Watch Mode & Dev Server
+
+Goal: file watching, incremental rebuilds, and ng serve support.
+
+- [ ] File watcher with incremental rebuilds (notify crate)
+- [ ] HTTP dev server with live reload
+- [ ] ngc-rs serve command
+- [ ] ng serve integration via builder adapter
+
 ### v1.0 — Angular CLI Drop-in
 
 Goal: zero-config swap for Angular developers.
 
+- [ ] npm binary distribution (platform-specific packages)
 - [ ] Angular builder adapter (speaks @angular-devkit builder protocol)
 - [ ] angular.json integration: swap builder, run ng build as normal
 - [ ] Works on Angular 17+ projects out of the box
+- [ ] GitHub Actions cross-compile release workflow
 - [ ] Published to crates.io and npm (@ngc-rs/cli wrapper)
+- [ ] Documentation: README with install guide + performance GIF
 
 ## Architecture (planned)
 
