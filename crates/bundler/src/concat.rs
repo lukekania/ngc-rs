@@ -289,7 +289,8 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<(String, Option<SourceMa
         }
     }
 
-    let merged = merge_external_imports(all_externals);
+    let mut merged = merge_external_imports(all_externals);
+    deduplicate_import_names(&mut merged);
     let mut output = String::new();
 
     // Write hoisted imports preamble
@@ -461,6 +462,40 @@ fn merge_external_imports(imports: Vec<ExternalImport>) -> Vec<MergedImport> {
         .into_iter()
         .filter_map(|source| by_source.remove(&source))
         .collect()
+}
+
+/// Deduplicate named imports across all merged imports.
+///
+/// When the same name is imported from two different sources (e.g. `catchError`
+/// from both `rxjs` and `rxjs/operators`), alias the duplicate to avoid
+/// `SyntaxError: Cannot declare an imported binding name twice`.
+fn deduplicate_import_names(imports: &mut [MergedImport]) {
+    let mut seen: HashSet<String> = HashSet::new();
+    for imp in imports.iter_mut() {
+        if imp.is_side_effect {
+            continue;
+        }
+        if let Some(ref default) = imp.default_import {
+            seen.insert(default.clone());
+        }
+        let mut replacements: Vec<(String, String)> = Vec::new();
+        for name in imp.named_imports.iter() {
+            // Skip namespace imports like "* as foo"
+            if name.starts_with("* as") {
+                seen.insert(name.clone());
+                continue;
+            }
+            if !seen.insert(name.clone()) {
+                // Duplicate — create an alias
+                let alias = format!("{}$1", name);
+                replacements.push((name.clone(), alias));
+            }
+        }
+        for (old, new) in replacements {
+            imp.named_imports.remove(&old);
+            imp.named_imports.insert(format!("{old} as {new}"));
+        }
+    }
 }
 
 /// Format a merged import as an ESM import statement.
