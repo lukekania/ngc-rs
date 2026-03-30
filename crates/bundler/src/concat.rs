@@ -37,6 +37,9 @@ pub struct BundleInput {
     pub root_dir: PathBuf,
     /// Build options controlling optimization and output behavior.
     pub options: BundleOptions,
+    /// Per-module source maps from TS transform (keyed by canonical source path).
+    /// Empty when source map generation is disabled.
+    pub per_module_maps: HashMap<PathBuf, oxc_sourcemap::SourceMap>,
 }
 
 /// Merge result for a single source: all imports grouped.
@@ -324,6 +327,7 @@ mod tests {
             local_prefixes: vec![".".to_string()],
             root_dir: make_path("/root/src"),
             options: BundleOptions::default(),
+            per_module_maps: HashMap::new(),
         };
 
         let output = bundle(&input).expect("should bundle");
@@ -368,6 +372,7 @@ mod tests {
             local_prefixes: vec![".".to_string()],
             root_dir: make_path("/root"),
             options: BundleOptions::default(),
+            per_module_maps: HashMap::new(),
         };
 
         let output = bundle(&input).expect("should bundle");
@@ -408,6 +413,7 @@ mod tests {
             local_prefixes: vec![".".to_string()],
             root_dir: make_path("/root"),
             options: BundleOptions::default(),
+            per_module_maps: HashMap::new(),
         };
 
         let output = bundle(&input).expect("should bundle");
@@ -449,6 +455,7 @@ mod tests {
             local_prefixes: vec![".".to_string()],
             root_dir: make_path("/root"),
             options: BundleOptions::default(),
+            per_module_maps: HashMap::new(),
         };
 
         let output = bundle(&input).expect("should bundle");

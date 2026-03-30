@@ -192,13 +192,18 @@ fn run_build(
     let sources = apply_file_replacements(sources, file_replacements, &config_dir)?;
 
     // Step 6: Transform TS → JS
-    let transformed = transform_with_fallback(&sources)?;
+    let bundle_options = build_options(configuration);
+    let transformed = transform_with_fallback(&sources, bundle_options.source_maps)?;
 
-    // Build modules map (canonical source path → JS code)
-    let modules: HashMap<PathBuf, String> = transformed
-        .into_iter()
-        .map(|m| (m.source_path, m.code))
-        .collect();
+    // Build modules map (canonical source path → JS code) and collect source maps
+    let mut modules: HashMap<PathBuf, String> = HashMap::new();
+    let mut per_module_maps: HashMap<PathBuf, oxc_sourcemap::SourceMap> = HashMap::new();
+    for m in transformed {
+        if let Some(map) = m.source_map {
+            per_module_maps.insert(m.source_path.clone(), map);
+        }
+        modules.insert(m.source_path, m.code);
+    }
 
     // Find the entry point (look for main.ts among graph entry points)
     let entry = find_entry_point(&file_graph.entry_points)?;
@@ -213,7 +218,6 @@ fn run_build(
         }
     }
 
-    let bundle_options = build_options(configuration);
     let bundle_input = BundleInput {
         modules,
         graph: file_graph.graph,
@@ -221,6 +225,7 @@ fn run_build(
         local_prefixes,
         root_dir,
         options: bundle_options,
+        per_module_maps,
     };
 
     let bundle_output = ngc_bundler::bundle(&bundle_input)?;
@@ -671,15 +676,21 @@ fn format_bytes(bytes: u64) -> String {
 /// re-read the original file and transform that instead.
 fn transform_with_fallback(
     sources: &[(PathBuf, String)],
+    generate_source_maps: bool,
 ) -> NgcResult<Vec<ngc_ts_transform::TransformedModule>> {
     let results: Vec<NgcResult<ngc_ts_transform::TransformedModule>> = sources
         .iter()
         .map(|(path, source)| {
             let file_name = path.to_string_lossy();
-            match ngc_ts_transform::transform_source(source, &file_name) {
-                Ok(code) => Ok(ngc_ts_transform::TransformedModule {
+            match ngc_ts_transform::transform_source_with_map(
+                source,
+                &file_name,
+                generate_source_maps,
+            ) {
+                Ok((code, source_map)) => Ok(ngc_ts_transform::TransformedModule {
                     source_path: path.clone(),
                     code,
+                    source_map,
                 }),
                 Err(e) => {
                     eprintln!(
@@ -692,10 +703,15 @@ fn transform_with_fallback(
                         path: path.clone(),
                         source: e,
                     })?;
-                    let code = ngc_ts_transform::transform_source(&original, &file_name)?;
+                    let (code, source_map) = ngc_ts_transform::transform_source_with_map(
+                        &original,
+                        &file_name,
+                        generate_source_maps,
+                    )?;
                     Ok(ngc_ts_transform::TransformedModule {
                         source_path: path.clone(),
                         code,
+                        source_map,
                     })
                 }
             }
