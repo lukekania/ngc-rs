@@ -1,3 +1,4 @@
+pub mod angular_json;
 pub mod graph;
 pub mod import_scanner;
 pub mod tsconfig;

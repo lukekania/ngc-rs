@@ -1,18 +1,18 @@
 # ngc-rs
 
-A native Rust replacement for `ng build` in Angular projects. Drop-in swap, **~34x faster**.
+A native Rust replacement for `ng build` in Angular projects. Drop-in swap, **~145x faster**.
 
 ### Benchmarks
 
-| Command | vs tsc equivalent | Ratio |
-|---------|-------------------|-------|
-| `ngc-rs info` (file graph resolution) | `tsc --listFiles --noEmit` | **~34x faster** |
-| `ngc-rs build` (full pipeline: resolve + compile + bundle) | `tsc --outDir` | **~34x faster** |
+| Command | Time | Ratio |
+|---------|------|-------|
+| `ngc-rs build` | **~27ms** | **~145x faster** |
+| `ng build --configuration production` | ~3,864ms | baseline |
 
-Measured with [hyperfine](https://github.com/sharkdp/hyperfine) on a real-world 77-module Angular project. ngc-rs completes the full build pipeline in **~15ms** vs **~500ms** for tsc.
+Measured with [hyperfine](https://github.com/sharkdp/hyperfine) on a real-world 77-module Angular v21 project.
 
-> **Status: v0.4 — Angular Template Compiler**
-> ngc-rs can resolve, transform, compile Angular templates to Ivy, and bundle into a single `dist/main.js`.
+> **Status: v0.5 — Build Output Completeness**
+> ngc-rs reads `angular.json`, compiles templates to Ivy, bundles into `dist/main.js`, and emits browser-ready output: `index.html`, `styles.css`, `polyfills.js`, copied assets, and `3rdpartylicenses.txt`.
 > See the [milestones](https://github.com/lukekania/ngc-rs/milestones) for the roadmap toward a full `ng build` replacement.
 
 ## Why is it faster?
@@ -61,13 +61,30 @@ ngc-rs project info
 
 ### `ngc-rs build`
 
-Compile templates, transform TypeScript, and bundle into a single file:
+Compile templates, transform TypeScript, and produce browser-ready output:
 
 ```sh
-ngc-rs build --project tsconfig.app.json --out-dir dist
+ngc-rs build --project tsconfig.app.json
 ```
 
-Produces `dist/main.js` — a single ESM bundle with Ivy-compiled templates, hoisted external imports, and all project-local code concatenated in dependency order.
+When an `angular.json` is found, ngc-rs reads styles, assets, polyfills, and file replacements from it automatically. Output includes:
+
+- `dist/main.js` — ESM bundle with Ivy-compiled templates
+- `dist/index.html` — with injected script/style tags
+- `dist/styles.css` — concatenated global stylesheets
+- `dist/polyfills.js` — polyfill imports
+- `dist/assets/` — copied static assets
+- `dist/3rdpartylicenses.txt` — third-party license texts
+
+Additional flags:
+
+```sh
+# Use a specific build configuration (e.g. file replacements)
+ngc-rs build --project tsconfig.app.json -c production
+
+# Machine-readable JSON output
+ngc-rs build --project tsconfig.app.json --output-json
+```
 
 ### Benchmark comparison
 
@@ -109,6 +126,10 @@ See the [GitHub milestones](https://github.com/lukekania/ngc-rs/milestones) for 
 - **v0.2** — TS Transform ✅ (strip types with oxc, emit plain JS)
 - **v0.3** — Bundling ✅ (ESM concatenation with dependency ordering)
 - **v0.4** — Angular Template Compiler ✅ (Ivy codegen, pest parser)
+- **v0.5** — Build Output Completeness ✅ (angular.json, index.html, styles, assets, polyfills, fileReplacements)
+- **v0.6** — Code Splitting & Lazy Routes
+- **v0.7** — Source Maps & Optimization
+- **v0.8** — Watch Mode & Dev Server
 - **v1.0** — Angular CLI Drop-in (swap one line in `angular.json`)
 
 ## Contributing
