@@ -6,6 +6,7 @@
 
 mod chunk;
 mod concat;
+mod minify;
 mod rewrite;
 
 pub use chunk::{build_chunk_graph, Chunk, ChunkGraph, ChunkKind};

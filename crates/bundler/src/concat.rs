@@ -8,6 +8,7 @@ use petgraph::graph::DiGraph;
 use tracing::debug;
 
 use crate::chunk::build_chunk_graph;
+use crate::minify;
 use crate::rewrite::{self, ExternalImport};
 
 /// Options controlling bundle output behavior.
@@ -99,6 +100,24 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
         if let Some(map) = chunk_map {
             chunk_source_maps.insert(chunk.filename.clone(), map);
         }
+    }
+
+    // Minification pass
+    if input.options.minify {
+        let mut minified_chunks: HashMap<String, String> = HashMap::new();
+        let mut minified_maps: HashMap<String, SourceMap> = HashMap::new();
+
+        for (filename, code) in &output_chunks {
+            let bundle_map = chunk_source_maps.get(filename);
+            let minified = minify::minify_chunk(code, filename, bundle_map)?;
+            minified_chunks.insert(filename.clone(), minified.code);
+            if let Some(map) = minified.source_map {
+                minified_maps.insert(filename.clone(), map);
+            }
+        }
+
+        output_chunks = minified_chunks;
+        chunk_source_maps = minified_maps;
     }
 
     Ok(BundleOutput {
