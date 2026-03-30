@@ -43,6 +43,9 @@ pub struct BundleInput {
     /// Per-module source maps from TS transform (keyed by canonical source path).
     /// Empty when source map generation is disabled.
     pub per_module_maps: HashMap<PathBuf, oxc_sourcemap::SourceMap>,
+    /// Bare specifiers that have been resolved and included in the graph.
+    /// The rewriter treats imports of these specifiers as local (strips them).
+    pub bundled_specifiers: HashSet<String>,
 }
 
 /// Merge result for a single source: all imports grouped.
@@ -109,6 +112,7 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
             per_module_maps: &input.per_module_maps,
             generate_source_maps: input.options.source_maps,
             unused_exports: &unused_exports,
+            bundled_specifiers: &input.bundled_specifiers,
         })?;
         output_chunks.insert(chunk.filename.clone(), chunk_code);
         if let Some(map) = chunk_map {
@@ -243,6 +247,7 @@ struct ChunkBundleParams<'a> {
     per_module_maps: &'a HashMap<PathBuf, SourceMap>,
     generate_source_maps: bool,
     unused_exports: &'a HashMap<PathBuf, HashSet<String>>,
+    bundled_specifiers: &'a HashSet<String>,
 }
 
 /// Bundle a single chunk's modules into an ESM string, optionally with a source map.
@@ -271,6 +276,7 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<(String, Option<SourceMa
             p.prefix_refs,
             p.specifier_rewrites,
             module_unused,
+            p.bundled_specifiers,
         )?;
 
         all_externals.extend(rewritten.external_imports);
@@ -561,6 +567,7 @@ mod tests {
             root_dir: make_path("/root/src"),
             options: BundleOptions::default(),
             per_module_maps: HashMap::new(),
+            bundled_specifiers: HashSet::new(),
         };
 
         let output = bundle(&input).expect("should bundle");
@@ -606,6 +613,7 @@ mod tests {
             root_dir: make_path("/root"),
             options: BundleOptions::default(),
             per_module_maps: HashMap::new(),
+            bundled_specifiers: HashSet::new(),
         };
 
         let output = bundle(&input).expect("should bundle");
@@ -647,6 +655,7 @@ mod tests {
             root_dir: make_path("/root"),
             options: BundleOptions::default(),
             per_module_maps: HashMap::new(),
+            bundled_specifiers: HashSet::new(),
         };
 
         let output = bundle(&input).expect("should bundle");
@@ -689,6 +698,7 @@ mod tests {
             root_dir: make_path("/root"),
             options: BundleOptions::default(),
             per_module_maps: HashMap::new(),
+            bundled_specifiers: HashSet::new(),
         };
 
         let output = bundle(&input).expect("should bundle");
@@ -815,6 +825,7 @@ mod tests {
                 ..BundleOptions::default()
             },
             per_module_maps,
+            bundled_specifiers: HashSet::new(),
         };
 
         let output = bundle(&input).expect("should bundle");
@@ -863,6 +874,7 @@ mod tests {
             root_dir: make_path("/root/src"),
             options: BundleOptions::default(),
             per_module_maps: HashMap::new(),
+            bundled_specifiers: HashSet::new(),
         };
 
         let output = bundle(&input).expect("should bundle");
@@ -919,6 +931,7 @@ mod tests {
                 ..BundleOptions::default()
             },
             per_module_maps: HashMap::new(),
+            bundled_specifiers: HashSet::new(),
         };
 
         let output = bundle(&input).expect("should bundle");
