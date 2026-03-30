@@ -9,3 +9,4 @@ CLAUDE.md
 MILESTONES.md
 .env
 .env.*
+/scripts/bench_local.sh
