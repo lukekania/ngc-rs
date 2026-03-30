@@ -98,8 +98,11 @@ fn compose_source_maps(outer: &SourceMap, inner: &SourceMap) -> SourceMap {
         let src_col = token.get_src_col();
 
         if let Some(resolved) = inner.lookup_token(&lookup, src_line, src_col) {
-            let out_source_id = resolved.get_source_id().map(|sid| {
-                *source_id_map.entry(sid).or_insert_with(|| {
+            let out_source_id = resolved.get_source_id().and_then(|sid| {
+                if (sid as usize) >= inner_sources.len() {
+                    return None;
+                }
+                Some(*source_id_map.entry(sid).or_insert_with(|| {
                     let id = sources.len() as u32;
                     sources.push(inner_sources[sid as usize].clone());
                     if (sid as usize) < inner_source_contents.len() {
@@ -108,15 +111,18 @@ fn compose_source_maps(outer: &SourceMap, inner: &SourceMap) -> SourceMap {
                         source_contents.push(None);
                     }
                     id
-                })
+                }))
             });
 
-            let out_name_id = resolved.get_name_id().map(|nid| {
-                *name_id_map.entry(nid).or_insert_with(|| {
+            let out_name_id = resolved.get_name_id().and_then(|nid| {
+                if (nid as usize) >= inner_names.len() {
+                    return None;
+                }
+                Some(*name_id_map.entry(nid).or_insert_with(|| {
                     let id = names.len() as u32;
                     names.push(inner_names[nid as usize].clone());
                     id
-                })
+                }))
             });
 
             tokens.push(oxc_sourcemap::Token::new(
