@@ -58,7 +58,14 @@ pub fn minify_chunk(
 
     // Compose: minified->bundle + bundle->original = minified->original
     let final_map = match (codegen_ret.map, bundle_map) {
-        (Some(minify_map), Some(bmap)) => Some(compose_source_maps(&minify_map, bmap)),
+        (Some(minify_map), Some(bmap)) => {
+            // The compose step can panic inside oxc_sourcemap's generate_lookup_table
+            // if token indices are inconsistent (e.g., with very large npm bundles).
+            // Catch and fall back to the uncomposed minification map.
+            std::panic::catch_unwind(|| compose_source_maps(&minify_map, bmap))
+                .ok()
+                .or(Some(minify_map))
+        }
         _ => None,
     };
 
