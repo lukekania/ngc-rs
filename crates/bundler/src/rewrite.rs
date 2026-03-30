@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use ngc_diagnostics::{NgcError, NgcResult};
 use oxc_allocator::Allocator;
@@ -51,11 +51,32 @@ struct TextEdit {
 /// `local_prefixes`, strips local imports and export keywords, collects
 /// external imports for hoisting, and rewrites dynamic `import()` specifiers
 /// according to `dynamic_import_rewrites`.
+#[cfg(test)]
 pub fn rewrite_module(
     js_code: &str,
     file_name: &str,
     local_prefixes: &[&str],
     dynamic_import_rewrites: &HashMap<String, String>,
+) -> NgcResult<RewrittenModule> {
+    rewrite_module_with_shaking(
+        js_code,
+        file_name,
+        local_prefixes,
+        dynamic_import_rewrites,
+        None,
+    )
+}
+
+/// Rewrite a module with optional tree shaking of unused exports.
+///
+/// When `unused_exports` is provided, declarations of exports in that set
+/// are fully removed (not just the `export` keyword stripped).
+pub fn rewrite_module_with_shaking(
+    js_code: &str,
+    file_name: &str,
+    local_prefixes: &[&str],
+    dynamic_import_rewrites: &HashMap<String, String>,
+    unused_exports: Option<&HashSet<String>>,
 ) -> NgcResult<RewrittenModule> {
     let allocator = Allocator::new();
     let source_type = SourceType::mjs();
@@ -79,6 +100,7 @@ pub fn rewrite_module(
                 local_prefixes,
                 &mut edits,
                 &mut external_imports,
+                unused_exports,
             );
         }
 
@@ -106,6 +128,7 @@ fn collect_module_decl_edits(
     local_prefixes: &[&str],
     edits: &mut Vec<TextEdit>,
     external_imports: &mut Vec<ExternalImport>,
+    unused_exports: Option<&HashSet<String>>,
 ) {
     match module_decl {
         ModuleDeclaration::ImportDeclaration(import) => {
@@ -160,12 +183,28 @@ fn collect_module_decl_edits(
                     end: export.span.end,
                     replacement: None,
                 });
-            } else if export.declaration.is_some() {
-                edits.push(TextEdit {
-                    start: export.span.start,
-                    end: export.span.start + 7, // "export "
-                    replacement: None,
-                });
+            } else if let Some(decl) = &export.declaration {
+                // Check if this export's declaration name is in the unused set
+                let decl_name = get_declaration_name(decl);
+                let is_unused = decl_name
+                    .as_ref()
+                    .is_some_and(|name| unused_exports.is_some_and(|unused| unused.contains(name)));
+
+                if is_unused {
+                    // Remove the entire declaration, not just the export keyword
+                    edits.push(TextEdit {
+                        start: export.span.start,
+                        end: export.span.end,
+                        replacement: None,
+                    });
+                } else {
+                    // Just strip the "export " keyword
+                    edits.push(TextEdit {
+                        start: export.span.start,
+                        end: export.span.start + 7, // "export "
+                        replacement: None,
+                    });
+                }
             } else {
                 edits.push(TextEdit {
                     start: export.span.start,
@@ -395,6 +434,27 @@ fn walk_expr_for_dynamic_imports(
         }
         // For other expression types, we don't recurse (no nested import() possible)
         _ => {}
+    }
+}
+
+/// Extract the declared name from a declaration, if it has a single clear name.
+fn get_declaration_name(decl: &oxc_ast::ast::Declaration) -> Option<String> {
+    match decl {
+        oxc_ast::ast::Declaration::VariableDeclaration(var) => {
+            if let Some(declarator) = var.declarations.first() {
+                if let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &declarator.id {
+                    return Some(id.name.to_string());
+                }
+            }
+            None
+        }
+        oxc_ast::ast::Declaration::FunctionDeclaration(f) => {
+            f.id.as_ref().map(|id| id.name.to_string())
+        }
+        oxc_ast::ast::Declaration::ClassDeclaration(c) => {
+            c.id.as_ref().map(|id| id.name.to_string())
+        }
+        _ => None,
     }
 }
 

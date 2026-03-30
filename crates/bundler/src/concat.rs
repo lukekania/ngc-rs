@@ -1,5 +1,5 @@
-use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use ngc_diagnostics::{NgcError, NgcResult};
 use ngc_project_resolver::ImportKind;
@@ -10,6 +10,7 @@ use tracing::debug;
 use crate::chunk::build_chunk_graph;
 use crate::minify;
 use crate::rewrite::{self, ExternalImport};
+use crate::shake;
 
 /// Options controlling bundle output behavior.
 #[derive(Debug, Clone, Copy, Default)]
@@ -87,15 +88,28 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
     let mut chunk_source_maps: HashMap<String, SourceMap> = HashMap::new();
 
     for chunk in &chunk_graph.chunks {
-        let (chunk_code, chunk_map) = bundle_chunk(
-            &chunk.modules,
-            &input.modules,
-            &input.root_dir,
-            &prefix_refs,
-            &specifier_rewrites,
-            &input.per_module_maps,
-            input.options.source_maps,
-        )?;
+        // Run tree shaking analysis for this chunk if enabled
+        let unused_exports = if input.options.tree_shake {
+            shake::analyze_unused_exports(
+                &chunk.modules,
+                &input.modules,
+                &chunk.entry,
+                &prefix_refs,
+            )?
+        } else {
+            HashMap::new()
+        };
+
+        let (chunk_code, chunk_map) = bundle_chunk(&ChunkBundleParams {
+            module_paths: &chunk.modules,
+            all_modules: &input.modules,
+            root_dir: &input.root_dir,
+            prefix_refs: &prefix_refs,
+            specifier_rewrites: &specifier_rewrites,
+            per_module_maps: &input.per_module_maps,
+            generate_source_maps: input.options.source_maps,
+            unused_exports: &unused_exports,
+        })?;
         output_chunks.insert(chunk.filename.clone(), chunk_code);
         if let Some(map) = chunk_map {
             chunk_source_maps.insert(chunk.filename.clone(), map);
@@ -212,21 +226,26 @@ struct ModuleSection {
     source_path: PathBuf,
 }
 
-/// Bundle a single chunk's modules into an ESM string, optionally with a source map.
-fn bundle_chunk(
-    module_paths: &[PathBuf],
-    all_modules: &HashMap<PathBuf, String>,
-    root_dir: &PathBuf,
-    prefix_refs: &[&str],
-    specifier_rewrites: &HashMap<String, String>,
-    per_module_maps: &HashMap<PathBuf, SourceMap>,
+/// Parameters for bundling a single chunk.
+struct ChunkBundleParams<'a> {
+    module_paths: &'a [PathBuf],
+    all_modules: &'a HashMap<PathBuf, String>,
+    root_dir: &'a Path,
+    prefix_refs: &'a [&'a str],
+    specifier_rewrites: &'a HashMap<String, String>,
+    per_module_maps: &'a HashMap<PathBuf, SourceMap>,
     generate_source_maps: bool,
-) -> NgcResult<(String, Option<SourceMap>)> {
+    unused_exports: &'a HashMap<PathBuf, HashSet<String>>,
+}
+
+/// Bundle a single chunk's modules into an ESM string, optionally with a source map.
+fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<(String, Option<SourceMap>)> {
     let mut all_externals: Vec<ExternalImport> = Vec::new();
     let mut sections: Vec<ModuleSection> = Vec::new();
 
-    for module_path in module_paths {
-        let js_code = all_modules
+    for module_path in p.module_paths {
+        let js_code = p
+            .all_modules
             .get(module_path)
             .ok_or_else(|| NgcError::BundleError {
                 message: format!(
@@ -236,14 +255,22 @@ fn bundle_chunk(
             })?;
 
         let file_name = module_path.to_string_lossy();
-        let rewritten =
-            rewrite::rewrite_module(js_code, &file_name, prefix_refs, specifier_rewrites)?;
+        let module_unused = p.unused_exports.get(module_path);
+
+        // If ALL exports are unused and the module is in the unused map, skip it entirely
+        let rewritten = rewrite::rewrite_module_with_shaking(
+            js_code,
+            &file_name,
+            p.prefix_refs,
+            p.specifier_rewrites,
+            module_unused,
+        )?;
 
         all_externals.extend(rewritten.external_imports);
 
         let trimmed = rewritten.code.trim();
         if !trimmed.is_empty() {
-            let relative = module_path.strip_prefix(root_dir).unwrap_or(module_path);
+            let relative = module_path.strip_prefix(p.root_dir).unwrap_or(module_path);
             let display_path = relative.with_extension("js");
             let section_code = format!("// {}\n{}", display_path.display(), trimmed);
             let line_count = section_code.chars().filter(|&c| c == '\n').count() as u32 + 1;
@@ -285,8 +312,8 @@ fn bundle_chunk(
         // Module code starts at current_line + 1.
         let module_code_start = current_line + 1;
 
-        if generate_source_maps {
-            if let Some(transform_map) = per_module_maps.get(&section.source_path) {
+        if p.generate_source_maps {
+            if let Some(transform_map) = p.per_module_maps.get(&section.source_path) {
                 sourcemap_entries.push((transform_map.clone(), module_code_start));
             }
         }
@@ -302,7 +329,7 @@ fn bundle_chunk(
     }
 
     // Build combined source map
-    let combined_map = if generate_source_maps && !sourcemap_entries.is_empty() {
+    let combined_map = if p.generate_source_maps && !sourcemap_entries.is_empty() {
         let refs: Vec<(&SourceMap, u32)> = sourcemap_entries
             .iter()
             .map(|(map, offset)| (map, *offset))
