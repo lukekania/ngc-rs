@@ -1,13 +1,29 @@
-use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use ngc_diagnostics::{NgcError, NgcResult};
 use ngc_project_resolver::ImportKind;
+use oxc_sourcemap::{ConcatSourceMapBuilder, SourceMap};
 use petgraph::graph::DiGraph;
 use tracing::debug;
 
 use crate::chunk::build_chunk_graph;
+use crate::minify;
 use crate::rewrite::{self, ExternalImport};
+use crate::shake;
+
+/// Options controlling bundle output behavior.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BundleOptions {
+    /// Generate source maps for bundled chunks.
+    pub source_maps: bool,
+    /// Minify the final output (whitespace removal).
+    pub minify: bool,
+    /// Use content-hash filenames for cache busting.
+    pub content_hash: bool,
+    /// Perform tree shaking (unused export elimination).
+    pub tree_shake: bool,
+}
 
 /// Input to the bundler.
 #[derive(Debug)]
@@ -22,6 +38,11 @@ pub struct BundleInput {
     pub local_prefixes: Vec<String>,
     /// Root directory for computing relative display paths in comments.
     pub root_dir: PathBuf,
+    /// Build options controlling optimization and output behavior.
+    pub options: BundleOptions,
+    /// Per-module source maps from TS transform (keyed by canonical source path).
+    /// Empty when source map generation is disabled.
+    pub per_module_maps: HashMap<PathBuf, oxc_sourcemap::SourceMap>,
 }
 
 /// Merge result for a single source: all imports grouped.
@@ -37,8 +58,11 @@ struct MergedImport {
 pub struct BundleOutput {
     /// Map from output filename to generated code.
     pub chunks: HashMap<String, String>,
-    /// The main chunk filename (always `"main.js"`).
+    /// The main chunk filename (always `"main.js"` unless content-hashed).
     pub main_filename: String,
+    /// Source maps for each chunk, keyed by the same filename as `chunks`.
+    /// Empty when source map generation is disabled.
+    pub chunk_source_maps: HashMap<String, SourceMap>,
 }
 
 /// Bundle all modules into one or more ESM chunk files.
@@ -61,21 +85,66 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
 
     let prefix_refs: Vec<&str> = input.local_prefixes.iter().map(|s| s.as_str()).collect();
     let mut output_chunks: HashMap<String, String> = HashMap::new();
+    let mut chunk_source_maps: HashMap<String, SourceMap> = HashMap::new();
 
     for chunk in &chunk_graph.chunks {
-        let chunk_code = bundle_chunk(
-            &chunk.modules,
-            &input.modules,
-            &input.root_dir,
-            &prefix_refs,
-            &specifier_rewrites,
-        )?;
+        // Run tree shaking analysis for this chunk if enabled
+        let unused_exports = if input.options.tree_shake {
+            shake::analyze_unused_exports(
+                &chunk.modules,
+                &input.modules,
+                &chunk.entry,
+                &prefix_refs,
+            )?
+        } else {
+            HashMap::new()
+        };
+
+        let (chunk_code, chunk_map) = bundle_chunk(&ChunkBundleParams {
+            module_paths: &chunk.modules,
+            all_modules: &input.modules,
+            root_dir: &input.root_dir,
+            prefix_refs: &prefix_refs,
+            specifier_rewrites: &specifier_rewrites,
+            per_module_maps: &input.per_module_maps,
+            generate_source_maps: input.options.source_maps,
+            unused_exports: &unused_exports,
+        })?;
         output_chunks.insert(chunk.filename.clone(), chunk_code);
+        if let Some(map) = chunk_map {
+            chunk_source_maps.insert(chunk.filename.clone(), map);
+        }
     }
+
+    // Minification pass
+    if input.options.minify {
+        let mut minified_chunks: HashMap<String, String> = HashMap::new();
+        let mut minified_maps: HashMap<String, SourceMap> = HashMap::new();
+
+        for (filename, code) in &output_chunks {
+            let bundle_map = chunk_source_maps.get(filename);
+            let minified = minify::minify_chunk(code, filename, bundle_map)?;
+            minified_chunks.insert(filename.clone(), minified.code);
+            if let Some(map) = minified.source_map {
+                minified_maps.insert(filename.clone(), map);
+            }
+        }
+
+        output_chunks = minified_chunks;
+        chunk_source_maps = minified_maps;
+    }
+
+    // Content-hash filenames
+    let main_filename = if input.options.content_hash {
+        apply_content_hashes(&mut output_chunks, &mut chunk_source_maps)?
+    } else {
+        "main.js".to_string()
+    };
 
     Ok(BundleOutput {
         chunks: output_chunks,
-        main_filename: "main.js".to_string(),
+        main_filename,
+        chunk_source_maps,
     })
 }
 
@@ -154,19 +223,36 @@ fn pathdiff(target: &std::path::Path, base: &std::path::Path) -> Result<PathBuf,
     Ok(result)
 }
 
-/// Bundle a single chunk's modules into an ESM string.
-fn bundle_chunk(
-    module_paths: &[PathBuf],
-    all_modules: &HashMap<PathBuf, String>,
-    root_dir: &PathBuf,
-    prefix_refs: &[&str],
-    specifier_rewrites: &HashMap<String, String>,
-) -> NgcResult<String> {
-    let mut all_externals: Vec<ExternalImport> = Vec::new();
-    let mut code_sections: Vec<String> = Vec::new();
+/// A module section ready for concatenation, with its source map and line count.
+struct ModuleSection {
+    /// The code section including the `// path` comment line.
+    code: String,
+    /// Number of lines in this section.
+    line_count: u32,
+    /// The canonical source path, for looking up the transform source map.
+    source_path: PathBuf,
+}
 
-    for module_path in module_paths {
-        let js_code = all_modules
+/// Parameters for bundling a single chunk.
+struct ChunkBundleParams<'a> {
+    module_paths: &'a [PathBuf],
+    all_modules: &'a HashMap<PathBuf, String>,
+    root_dir: &'a Path,
+    prefix_refs: &'a [&'a str],
+    specifier_rewrites: &'a HashMap<String, String>,
+    per_module_maps: &'a HashMap<PathBuf, SourceMap>,
+    generate_source_maps: bool,
+    unused_exports: &'a HashMap<PathBuf, HashSet<String>>,
+}
+
+/// Bundle a single chunk's modules into an ESM string, optionally with a source map.
+fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<(String, Option<SourceMap>)> {
+    let mut all_externals: Vec<ExternalImport> = Vec::new();
+    let mut sections: Vec<ModuleSection> = Vec::new();
+
+    for module_path in p.module_paths {
+        let js_code = p
+            .all_modules
             .get(module_path)
             .ok_or_else(|| NgcError::BundleError {
                 message: format!(
@@ -176,41 +262,172 @@ fn bundle_chunk(
             })?;
 
         let file_name = module_path.to_string_lossy();
-        let rewritten =
-            rewrite::rewrite_module(js_code, &file_name, prefix_refs, specifier_rewrites)?;
+        let module_unused = p.unused_exports.get(module_path);
+
+        // If ALL exports are unused and the module is in the unused map, skip it entirely
+        let rewritten = rewrite::rewrite_module_with_shaking(
+            js_code,
+            &file_name,
+            p.prefix_refs,
+            p.specifier_rewrites,
+            module_unused,
+        )?;
 
         all_externals.extend(rewritten.external_imports);
 
         let trimmed = rewritten.code.trim();
         if !trimmed.is_empty() {
-            let relative = module_path.strip_prefix(root_dir).unwrap_or(module_path);
+            let relative = module_path.strip_prefix(p.root_dir).unwrap_or(module_path);
             let display_path = relative.with_extension("js");
-            code_sections.push(format!("// {}\n{}", display_path.display(), trimmed));
+            let section_code = format!("// {}\n{}", display_path.display(), trimmed);
+            let line_count = section_code.chars().filter(|&c| c == '\n').count() as u32 + 1;
+            sections.push(ModuleSection {
+                code: section_code,
+                line_count,
+                source_path: module_path.clone(),
+            });
         }
     }
 
-    let merged = merge_external_imports(all_externals);
+    let mut merged = merge_external_imports(all_externals);
+    deduplicate_import_names(&mut merged);
     let mut output = String::new();
 
+    // Write hoisted imports preamble
     for imp in &merged {
         output.push_str(&format_import(imp));
         output.push('\n');
     }
 
-    if !merged.is_empty() && !code_sections.is_empty() {
+    // Track how many lines the preamble occupies
+    let preamble_lines = if merged.is_empty() {
+        0u32
+    } else {
+        // One line per import + one blank separator line
+        merged.len() as u32 + 1
+    };
+
+    if !merged.is_empty() && !sections.is_empty() {
         output.push('\n');
     }
 
-    for (i, section) in code_sections.iter().enumerate() {
-        output.push_str(section);
-        if i < code_sections.len() - 1 {
+    // Build source map inputs: collect (source_map_ref, line_offset) pairs
+    let mut sourcemap_entries: Vec<(SourceMap, u32)> = Vec::new();
+    let mut current_line = preamble_lines;
+
+    for (i, section) in sections.iter().enumerate() {
+        // The comment line ("// src/path.js") is at current_line.
+        // Module code starts at current_line + 1.
+        let module_code_start = current_line + 1;
+
+        if p.generate_source_maps {
+            if let Some(transform_map) = p.per_module_maps.get(&section.source_path) {
+                sourcemap_entries.push((transform_map.clone(), module_code_start));
+            }
+        }
+
+        output.push_str(&section.code);
+        if i < sections.len() - 1 {
             output.push_str("\n\n");
+            current_line += section.line_count + 1; // section lines + blank separator
         } else {
             output.push('\n');
+            current_line += section.line_count;
         }
     }
 
-    Ok(output)
+    // Build combined source map
+    let combined_map = if p.generate_source_maps && !sourcemap_entries.is_empty() {
+        let refs: Vec<(&SourceMap, u32)> = sourcemap_entries
+            .iter()
+            .map(|(map, offset)| (map, *offset))
+            .collect();
+        let builder = ConcatSourceMapBuilder::from_sourcemaps(&refs);
+        Some(builder.into_sourcemap())
+    } else {
+        None
+    };
+
+    Ok((output, combined_map))
+}
+
+/// Compute a truncated SHA-256 content hash (8 hex characters).
+fn content_hash(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let result = Sha256::digest(content.as_bytes());
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}",
+        result[0], result[1], result[2], result[3]
+    )
+}
+
+/// Apply content hashes to all chunk filenames.
+///
+/// Processes chunks in dependency order (leaf chunks first) so that when a chunk
+/// references another via dynamic import, the referenced chunk's hashed name is
+/// already known. Returns the hashed main filename.
+fn apply_content_hashes(
+    chunks: &mut HashMap<String, String>,
+    source_maps: &mut HashMap<String, SourceMap>,
+) -> NgcResult<String> {
+    // Build rename map: process all chunks, computing hashes
+    // First do non-main chunks (lazy/shared), then main
+    let filenames: Vec<String> = chunks.keys().cloned().collect();
+    let mut rename_map: HashMap<String, String> = HashMap::new();
+
+    // Process non-main chunks first (they might be referenced by main)
+    for filename in &filenames {
+        if filename == "main.js" {
+            continue;
+        }
+        let code = chunks.get(filename).ok_or_else(|| NgcError::BundleError {
+            message: format!("chunk {filename} disappeared during hashing"),
+        })?;
+        let hash = content_hash(code);
+        let hashed_name = insert_hash_in_filename(filename, &hash);
+        rename_map.insert(filename.clone(), hashed_name);
+    }
+
+    // Replace chunk filename references in all chunks
+    for code in chunks.values_mut() {
+        for (old_name, new_name) in &rename_map {
+            *code = code.replace(old_name, new_name);
+        }
+    }
+
+    // Now hash main.js (after references have been updated)
+    if let Some(main_code) = chunks.get("main.js") {
+        let hash = content_hash(main_code);
+        let hashed_main = insert_hash_in_filename("main.js", &hash);
+        rename_map.insert("main.js".to_string(), hashed_main);
+    }
+
+    // Apply renames to the chunks and source_maps HashMaps
+    for (old_name, new_name) in &rename_map {
+        if let Some(code) = chunks.remove(old_name) {
+            chunks.insert(new_name.clone(), code);
+        }
+        if let Some(map) = source_maps.remove(old_name) {
+            source_maps.insert(new_name.clone(), map);
+        }
+    }
+
+    let main_filename = rename_map
+        .get("main.js")
+        .cloned()
+        .unwrap_or_else(|| "main.js".to_string());
+
+    debug!(main = %main_filename, "applied content hashes");
+    Ok(main_filename)
+}
+
+/// Insert a content hash into a filename: `chunk-foo.js` → `chunk-foo.a1b2c3d4.js`.
+fn insert_hash_in_filename(filename: &str, hash: &str) -> String {
+    if let Some(stem) = filename.strip_suffix(".js") {
+        format!("{stem}.{hash}.js")
+    } else {
+        format!("{filename}.{hash}")
+    }
 }
 
 /// Merge external imports by source, combining named imports and deduplicating.
@@ -245,6 +462,40 @@ fn merge_external_imports(imports: Vec<ExternalImport>) -> Vec<MergedImport> {
         .into_iter()
         .filter_map(|source| by_source.remove(&source))
         .collect()
+}
+
+/// Deduplicate named imports across all merged imports.
+///
+/// When the same name is imported from two different sources (e.g. `catchError`
+/// from both `rxjs` and `rxjs/operators`), alias the duplicate to avoid
+/// `SyntaxError: Cannot declare an imported binding name twice`.
+fn deduplicate_import_names(imports: &mut [MergedImport]) {
+    let mut seen: HashSet<String> = HashSet::new();
+    for imp in imports.iter_mut() {
+        if imp.is_side_effect {
+            continue;
+        }
+        if let Some(ref default) = imp.default_import {
+            seen.insert(default.clone());
+        }
+        let mut replacements: Vec<(String, String)> = Vec::new();
+        for name in imp.named_imports.iter() {
+            // Skip namespace imports like "* as foo"
+            if name.starts_with("* as") {
+                seen.insert(name.clone());
+                continue;
+            }
+            if !seen.insert(name.clone()) {
+                // Duplicate — create an alias
+                let alias = format!("{}$1", name);
+                replacements.push((name.clone(), alias));
+            }
+        }
+        for (old, new) in replacements {
+            imp.named_imports.remove(&old);
+            imp.named_imports.insert(format!("{old} as {new}"));
+        }
+    }
 }
 
 /// Format a merged import as an ESM import statement.
@@ -308,6 +559,8 @@ mod tests {
             entry: make_path("/root/src/main.ts"),
             local_prefixes: vec![".".to_string()],
             root_dir: make_path("/root/src"),
+            options: BundleOptions::default(),
+            per_module_maps: HashMap::new(),
         };
 
         let output = bundle(&input).expect("should bundle");
@@ -351,6 +604,8 @@ mod tests {
             entry: make_path("/root/main.ts"),
             local_prefixes: vec![".".to_string()],
             root_dir: make_path("/root"),
+            options: BundleOptions::default(),
+            per_module_maps: HashMap::new(),
         };
 
         let output = bundle(&input).expect("should bundle");
@@ -390,6 +645,8 @@ mod tests {
             entry: make_path("/root/main.ts"),
             local_prefixes: vec![".".to_string()],
             root_dir: make_path("/root"),
+            options: BundleOptions::default(),
+            per_module_maps: HashMap::new(),
         };
 
         let output = bundle(&input).expect("should bundle");
@@ -430,6 +687,8 @@ mod tests {
             entry: make_path("/root/main.ts"),
             local_prefixes: vec![".".to_string()],
             root_dir: make_path("/root"),
+            options: BundleOptions::default(),
+            per_module_maps: HashMap::new(),
         };
 
         let output = bundle(&input).expect("should bundle");
@@ -500,5 +759,174 @@ mod tests {
             is_side_effect: true,
         };
         assert_eq!(format_import(&imp), "import 'zone.js';");
+    }
+
+    #[test]
+    fn test_bundle_with_source_maps() {
+        let mut graph = DiGraph::new();
+        let leaf = graph.add_node(make_path("/root/src/leaf.ts"));
+        let entry = graph.add_node(make_path("/root/src/main.ts"));
+        graph.add_edge(entry, leaf, ImportKind::Static);
+
+        let mut modules = HashMap::new();
+        modules.insert(
+            make_path("/root/src/leaf.ts"),
+            "export const x = 42;\n".to_string(),
+        );
+        modules.insert(
+            make_path("/root/src/main.ts"),
+            "import { x } from './leaf';\nconsole.log(x);\n".to_string(),
+        );
+
+        // Create simple source maps for each module
+        let leaf_map = SourceMap::new(
+            None,
+            vec![],
+            None,
+            vec!["leaf.ts".into()],
+            vec![Some("export const x = 42;\n".into())],
+            vec![oxc_sourcemap::Token::new(0, 0, 0, 0, Some(0), None)].into_boxed_slice(),
+            None,
+        );
+        let main_map = SourceMap::new(
+            None,
+            vec![],
+            None,
+            vec!["main.ts".into()],
+            vec![Some(
+                "import { x } from './leaf';\nconsole.log(x);\n".into(),
+            )],
+            vec![oxc_sourcemap::Token::new(0, 0, 0, 0, Some(0), None)].into_boxed_slice(),
+            None,
+        );
+
+        let mut per_module_maps = HashMap::new();
+        per_module_maps.insert(make_path("/root/src/leaf.ts"), leaf_map);
+        per_module_maps.insert(make_path("/root/src/main.ts"), main_map);
+
+        let input = BundleInput {
+            modules,
+            graph,
+            entry: make_path("/root/src/main.ts"),
+            local_prefixes: vec![".".to_string()],
+            root_dir: make_path("/root/src"),
+            options: BundleOptions {
+                source_maps: true,
+                ..BundleOptions::default()
+            },
+            per_module_maps,
+        };
+
+        let output = bundle(&input).expect("should bundle");
+        assert!(
+            !output.chunk_source_maps.is_empty(),
+            "should have source maps"
+        );
+
+        let main_map = output
+            .chunk_source_maps
+            .get("main.js")
+            .expect("main chunk should have a source map");
+        let sources: Vec<_> = main_map.get_sources().collect();
+        assert!(
+            sources.len() >= 2,
+            "source map should reference both original files"
+        );
+        // Verify it serializes to valid JSON
+        let json = main_map.to_json_string();
+        assert!(json.contains("\"sources\""), "should have sources field");
+        assert!(json.contains("\"mappings\""), "should have mappings field");
+    }
+
+    #[test]
+    fn test_bundle_without_source_maps() {
+        let mut graph = DiGraph::new();
+        let leaf = graph.add_node(make_path("/root/src/leaf.ts"));
+        let entry = graph.add_node(make_path("/root/src/main.ts"));
+        graph.add_edge(entry, leaf, ImportKind::Static);
+
+        let mut modules = HashMap::new();
+        modules.insert(
+            make_path("/root/src/leaf.ts"),
+            "export const x = 42;\n".to_string(),
+        );
+        modules.insert(
+            make_path("/root/src/main.ts"),
+            "import { x } from './leaf';\nconsole.log(x);\n".to_string(),
+        );
+
+        let input = BundleInput {
+            modules,
+            graph,
+            entry: make_path("/root/src/main.ts"),
+            local_prefixes: vec![".".to_string()],
+            root_dir: make_path("/root/src"),
+            options: BundleOptions::default(),
+            per_module_maps: HashMap::new(),
+        };
+
+        let output = bundle(&input).expect("should bundle");
+        assert!(
+            output.chunk_source_maps.is_empty(),
+            "should not have source maps when disabled"
+        );
+    }
+
+    #[test]
+    fn test_content_hash_deterministic() {
+        assert_eq!(content_hash("hello"), content_hash("hello"));
+        assert_ne!(content_hash("hello"), content_hash("world"));
+        assert_eq!(content_hash("hello").len(), 8);
+    }
+
+    #[test]
+    fn test_insert_hash_in_filename() {
+        assert_eq!(
+            insert_hash_in_filename("main.js", "abcd1234"),
+            "main.abcd1234.js"
+        );
+        assert_eq!(
+            insert_hash_in_filename("chunk-admin.js", "deadbeef"),
+            "chunk-admin.deadbeef.js"
+        );
+    }
+
+    #[test]
+    fn test_content_hash_bundle() {
+        let mut graph = DiGraph::new();
+        let leaf = graph.add_node(make_path("/root/src/leaf.ts"));
+        let entry = graph.add_node(make_path("/root/src/main.ts"));
+        graph.add_edge(entry, leaf, ImportKind::Static);
+
+        let mut modules = HashMap::new();
+        modules.insert(
+            make_path("/root/src/leaf.ts"),
+            "export const x = 42;\n".to_string(),
+        );
+        modules.insert(
+            make_path("/root/src/main.ts"),
+            "import { x } from './leaf';\nconsole.log(x);\n".to_string(),
+        );
+
+        let input = BundleInput {
+            modules,
+            graph,
+            entry: make_path("/root/src/main.ts"),
+            local_prefixes: vec![".".to_string()],
+            root_dir: make_path("/root/src"),
+            options: BundleOptions {
+                content_hash: true,
+                ..BundleOptions::default()
+            },
+            per_module_maps: HashMap::new(),
+        };
+
+        let output = bundle(&input).expect("should bundle");
+        // Main filename should contain a hash
+        assert_ne!(output.main_filename, "main.js");
+        assert!(output.main_filename.starts_with("main."));
+        assert!(output.main_filename.ends_with(".js"));
+        // Chunk should exist with the hashed name
+        assert!(output.chunks.contains_key(&output.main_filename));
     }
 }

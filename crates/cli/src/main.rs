@@ -4,7 +4,7 @@ use std::process;
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use ngc_bundler::BundleInput;
+use ngc_bundler::{BundleInput, BundleOptions};
 use ngc_diagnostics::{NgcError, NgcResult};
 use ngc_project_resolver::angular_json::{
     FileReplacement, ResolvedAngularProject, ResolvedAsset, ResolvedStyle,
@@ -192,13 +192,18 @@ fn run_build(
     let sources = apply_file_replacements(sources, file_replacements, &config_dir)?;
 
     // Step 6: Transform TS → JS
-    let transformed = transform_with_fallback(&sources)?;
+    let bundle_options = build_options(configuration);
+    let transformed = transform_with_fallback(&sources, bundle_options.source_maps)?;
 
-    // Build modules map (canonical source path → JS code)
-    let modules: HashMap<PathBuf, String> = transformed
-        .into_iter()
-        .map(|m| (m.source_path, m.code))
-        .collect();
+    // Build modules map (canonical source path → JS code) and collect source maps
+    let mut modules: HashMap<PathBuf, String> = HashMap::new();
+    let mut per_module_maps: HashMap<PathBuf, oxc_sourcemap::SourceMap> = HashMap::new();
+    for m in transformed {
+        if let Some(map) = m.source_map {
+            per_module_maps.insert(m.source_path.clone(), map);
+        }
+        modules.insert(m.source_path, m.code);
+    }
 
     // Find the entry point (look for main.ts among graph entry points)
     let entry = find_entry_point(&file_graph.entry_points)?;
@@ -219,6 +224,8 @@ fn run_build(
         entry,
         local_prefixes,
         root_dir,
+        options: bundle_options,
+        per_module_maps,
     };
 
     let bundle_output = ngc_bundler::bundle(&bundle_input)?;
@@ -236,10 +243,37 @@ fn run_build(
 
     let mut output_files: Vec<PathBuf> = Vec::new();
 
-    // Write all chunk files (main.js + chunk-*.js)
+    // Write all chunk files (main.js + chunk-*.js) with optional source maps
     for (filename, code) in &bundle_output.chunks {
+        let mut final_code = code.clone();
+
+        // Append source map reference if we have a map for this chunk
+        if let Some(source_map) = bundle_output.chunk_source_maps.get(filename) {
+            if bundle_options.source_maps {
+                if configuration == Some("production") {
+                    // External source map file
+                    let map_filename = format!("{filename}.map");
+                    final_code.push_str(&format!("//# sourceMappingURL={map_filename}\n"));
+                    let map_path = out_dir.join(&map_filename);
+                    std::fs::write(&map_path, source_map.to_json_string()).map_err(|e| {
+                        NgcError::Io {
+                            path: map_path.clone(),
+                            source: e,
+                        }
+                    })?;
+                    output_files.push(map_path);
+                } else {
+                    // Inline source map (data URL)
+                    final_code.push_str(&format!(
+                        "//# sourceMappingURL={}\n",
+                        source_map.to_data_url()
+                    ));
+                }
+            }
+        }
+
         let path = out_dir.join(filename);
-        std::fs::write(&path, code).map_err(|e| NgcError::Io {
+        std::fs::write(&path, &final_code).map_err(|e| NgcError::Io {
             path: path.clone(),
             source: e,
         })?;
@@ -257,7 +291,7 @@ fn run_build(
     // Step 9: Extract global styles
     if let Some(ref ap) = angular_project {
         if !ap.styles.is_empty() {
-            let path = extract_global_styles(&ap.styles, &out_dir)?;
+            let path = extract_global_styles(&ap.styles, &out_dir, &config_dir)?;
             output_files.push(path);
         }
     }
@@ -279,6 +313,7 @@ fn run_build(
                 !ap.styles.is_empty(),
                 !ap.polyfills.is_empty(),
                 &out_dir,
+                &bundle_output.main_filename,
             )?;
             output_files.push(path);
         }
@@ -309,19 +344,38 @@ fn run_build(
     })
 }
 
+/// Derive bundle options from the build configuration name.
+///
+/// Production enables all optimizations (source maps, minification, tree shaking,
+/// content hashing). Development and unspecified configurations use defaults
+/// (all optimizations disabled).
+fn build_options(configuration: Option<&str>) -> BundleOptions {
+    match configuration {
+        Some("production") => BundleOptions {
+            source_maps: true,
+            minify: true,
+            content_hash: true,
+            tree_shake: true,
+        },
+        _ => BundleOptions::default(),
+    }
+}
+
 /// Try to find angular.json by searching upward from the project file's directory.
 fn find_and_resolve_angular_json(
     project: &Path,
     configuration: Option<&str>,
 ) -> NgcResult<Option<ResolvedAngularProject>> {
-    let start_dir = project
-        .parent()
-        .unwrap_or(Path::new("."))
-        .canonicalize()
-        .map_err(|e| NgcError::Io {
-            path: project.to_path_buf(),
-            source: e,
-        })?;
+    let parent = project.parent().unwrap_or(Path::new("."));
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let start_dir = parent.canonicalize().map_err(|e| NgcError::Io {
+        path: project.to_path_buf(),
+        source: e,
+    })?;
 
     let mut dir = start_dir.as_path();
     loop {
@@ -399,7 +453,14 @@ fn generate_polyfills(polyfills: &[String], out_dir: &Path) -> NgcResult<PathBuf
 }
 
 /// Read and concatenate global CSS style files, writing dist/styles.css.
-fn extract_global_styles(styles: &[ResolvedStyle], out_dir: &Path) -> NgcResult<PathBuf> {
+///
+/// Resolves CSS `@import` directives that reference npm packages (e.g.
+/// `@import "tailwindcss"`) by looking up the package in `node_modules`.
+fn extract_global_styles(
+    styles: &[ResolvedStyle],
+    out_dir: &Path,
+    project_root: &Path,
+) -> NgcResult<PathBuf> {
     let mut css = String::new();
     for style in styles {
         if !style.inject {
@@ -423,7 +484,8 @@ fn extract_global_styles(styles: &[ResolvedStyle], out_dir: &Path) -> NgcResult<
         if !css.is_empty() {
             css.push('\n');
         }
-        css.push_str(&content);
+        let resolved = resolve_css_imports(&content, project_root);
+        css.push_str(&resolved);
     }
     let path = out_dir.join("styles.css");
     std::fs::write(&path, &css).map_err(|e| NgcError::Io {
@@ -431,6 +493,165 @@ fn extract_global_styles(styles: &[ResolvedStyle], out_dir: &Path) -> NgcResult<
         source: e,
     })?;
     Ok(path)
+}
+
+/// Resolve CSS `@import` directives that reference npm packages.
+///
+/// Replaces `@import "package"` and `@import "package/file"` with the inlined
+/// contents of the resolved CSS file from `node_modules`. Lines that reference
+/// local files or URLs are left unchanged. Non-CSS `@import` directives
+/// (e.g. `@import "tailwindcss"`) that resolve to a CSS file are also inlined.
+fn resolve_css_imports(css: &str, project_root: &Path) -> String {
+    let node_modules = project_root.join("node_modules");
+    let mut result = String::new();
+
+    for line in css.lines() {
+        let trimmed = line.trim();
+        if let Some(specifier) = extract_css_import_specifier(trimmed) {
+            // Skip URLs and relative paths
+            if specifier.starts_with("http")
+                || specifier.starts_with("//")
+                || specifier.starts_with('.')
+            {
+                result.push_str(line);
+                result.push('\n');
+                continue;
+            }
+
+            // Try to resolve from node_modules
+            if let Some(resolved_content) = resolve_npm_css(&node_modules, &specifier, project_root)
+            {
+                result.push_str(&format!("/* @import \"{specifier}\" (resolved) */\n"));
+                result.push_str(&resolved_content);
+                result.push('\n');
+                continue;
+            }
+        }
+
+        // Lines starting with @config or other directives we can't resolve: skip them
+        if trimmed.starts_with("@config") {
+            result.push_str(&format!("/* {trimmed} (skipped) */\n"));
+            continue;
+        }
+
+        result.push_str(line);
+        result.push('\n');
+    }
+
+    result
+}
+
+/// Extract the specifier from a CSS `@import` directive.
+fn extract_css_import_specifier(line: &str) -> Option<String> {
+    if !line.starts_with("@import") {
+        return None;
+    }
+    // @import "specifier"; or @import 'specifier'; or @import url("specifier");
+    let rest = line.strip_prefix("@import")?.trim();
+    let rest = rest.strip_suffix(';').unwrap_or(rest).trim();
+
+    if let Some(inner) = rest.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        return Some(inner.to_string());
+    }
+    if let Some(inner) = rest.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+        return Some(inner.to_string());
+    }
+    // Bare specifier without quotes (e.g. @import tailwindcss;)
+    if !rest.is_empty() && !rest.starts_with("url(") && !rest.contains(' ') && !rest.contains('(') {
+        return Some(rest.to_string());
+    }
+
+    None
+}
+
+/// Try to resolve a CSS file from node_modules.
+fn resolve_npm_css(node_modules: &Path, specifier: &str, project_root: &Path) -> Option<String> {
+    // Try direct path: node_modules/{specifier}
+    let direct = node_modules.join(specifier);
+
+    // Try with .css extension
+    let candidates = [
+        direct.clone(),
+        direct.with_extension("css"),
+        direct.join("index.css"),
+    ];
+
+    for candidate in &candidates {
+        if candidate.is_file() {
+            return std::fs::read_to_string(candidate).ok();
+        }
+    }
+
+    // Try resolving via the package's package.json "style" or "main" field
+    let pkg_name = if specifier.starts_with('@') {
+        // Scoped package: @scope/pkg or @scope/pkg/file
+        specifier
+            .splitn(3, '/')
+            .take(2)
+            .collect::<Vec<_>>()
+            .join("/")
+    } else {
+        specifier.split('/').next().unwrap_or(specifier).to_string()
+    };
+
+    let pkg_json_path = node_modules.join(&pkg_name).join("package.json");
+    if let Ok(pkg_json) = std::fs::read_to_string(&pkg_json_path) {
+        if let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&pkg_json) {
+            // Check "style" field first, then "exports" for CSS
+            if let Some(style) = pkg.get("style").and_then(|v| v.as_str()) {
+                let style_path = node_modules.join(&pkg_name).join(style);
+                if style_path.is_file() {
+                    return std::fs::read_to_string(&style_path).ok();
+                }
+            }
+
+            // Check exports for CSS
+            if let Some(exports) = pkg.get("exports") {
+                if let Some(css_path) = find_css_in_exports(exports, specifier, &pkg_name) {
+                    let full_path = node_modules.join(&pkg_name).join(css_path);
+                    if full_path.is_file() {
+                        return std::fs::read_to_string(&full_path).ok();
+                    }
+                }
+            }
+        }
+    }
+
+    // Last resort for bare package names: check if the package itself is a CSS framework
+    // (e.g. "tailwindcss" ships a preflight/base CSS)
+    let base_css = node_modules.join(&pkg_name).join("theme.css");
+    if base_css.is_file() {
+        return std::fs::read_to_string(&base_css).ok();
+    }
+
+    // For packages like tailwindcss that are build-time only, return an empty comment
+    let pkg_dir = node_modules.join(&pkg_name);
+    if pkg_dir.is_dir() {
+        // Package exists but has no resolvable CSS — it's likely a build-time tool
+        eprintln!(
+            "{} CSS @import \"{specifier}\" skipped (no CSS entry point found in package)",
+            "Warning:".yellow().bold()
+        );
+        return Some(format!(
+            "/* @import \"{specifier}\" — build-time only, skipped */"
+        ));
+    }
+
+    // Check if it's a subpath like "ngx-toastr/toastr" → node_modules/ngx-toastr/toastr.css
+    let subpath = node_modules.join(specifier.replace('/', std::path::MAIN_SEPARATOR_STR));
+    let subpath_css = subpath.with_extension("css");
+    if subpath_css.is_file() {
+        return std::fs::read_to_string(&subpath_css).ok();
+    }
+
+    // Also try node_modules relative from project root
+    let alt = project_root.join("node_modules").join(specifier);
+    let alt_css = alt.with_extension("css");
+    if alt_css.is_file() {
+        return std::fs::read_to_string(&alt_css).ok();
+    }
+
+    None
 }
 
 /// Copy asset files and directories to the output directory.
@@ -533,6 +754,7 @@ fn generate_index_html(
     has_styles: bool,
     has_polyfills: bool,
     out_dir: &Path,
+    main_filename: &str,
 ) -> NgcResult<PathBuf> {
     let mut html = std::fs::read_to_string(index_source).map_err(|e| NgcError::Io {
         path: index_source.to_path_buf(),
@@ -552,7 +774,9 @@ fn generate_index_html(
     if has_polyfills {
         scripts.push_str("  <script src=\"polyfills.js\" type=\"module\"></script>\n");
     }
-    scripts.push_str("  <script src=\"main.js\" type=\"module\"></script>\n");
+    scripts.push_str(&format!(
+        "  <script src=\"{main_filename}\" type=\"module\"></script>\n"
+    ));
     html = html.replace("</body>", &format!("{scripts}</body>"));
 
     let path = out_dir.join(output_filename);
@@ -637,6 +861,35 @@ fn generate_third_party_licenses(
     Ok(Some(path))
 }
 
+/// Search package.json "exports" for a CSS file path.
+fn find_css_in_exports(
+    exports: &serde_json::Value,
+    _specifier: &str,
+    _pkg_name: &str,
+) -> Option<String> {
+    // Handle simple string export
+    if let Some(s) = exports.as_str() {
+        if s.ends_with(".css") {
+            return Some(s.to_string());
+        }
+    }
+
+    // Handle object exports with "style" or "default" keys
+    if let Some(obj) = exports.as_object() {
+        if let Some(style) = obj.get("style").and_then(|v| v.as_str()) {
+            if style.ends_with(".css") {
+                return Some(style.to_string());
+            }
+        }
+        // Recurse into "." entry
+        if let Some(dot) = obj.get(".") {
+            return find_css_in_exports(dot, _specifier, _pkg_name);
+        }
+    }
+
+    None
+}
+
 /// Format byte count as human-readable string.
 fn format_bytes(bytes: u64) -> String {
     if bytes < 1024 {
@@ -652,15 +905,21 @@ fn format_bytes(bytes: u64) -> String {
 /// re-read the original file and transform that instead.
 fn transform_with_fallback(
     sources: &[(PathBuf, String)],
+    generate_source_maps: bool,
 ) -> NgcResult<Vec<ngc_ts_transform::TransformedModule>> {
     let results: Vec<NgcResult<ngc_ts_transform::TransformedModule>> = sources
         .iter()
         .map(|(path, source)| {
             let file_name = path.to_string_lossy();
-            match ngc_ts_transform::transform_source(source, &file_name) {
-                Ok(code) => Ok(ngc_ts_transform::TransformedModule {
+            match ngc_ts_transform::transform_source_with_map(
+                source,
+                &file_name,
+                generate_source_maps,
+            ) {
+                Ok((code, source_map)) => Ok(ngc_ts_transform::TransformedModule {
                     source_path: path.clone(),
                     code,
+                    source_map,
                 }),
                 Err(e) => {
                     eprintln!(
@@ -673,10 +932,15 @@ fn transform_with_fallback(
                         path: path.clone(),
                         source: e,
                     })?;
-                    let code = ngc_ts_transform::transform_source(&original, &file_name)?;
+                    let (code, source_map) = ngc_ts_transform::transform_source_with_map(
+                        &original,
+                        &file_name,
+                        generate_source_maps,
+                    )?;
                     Ok(ngc_ts_transform::TransformedModule {
                         source_path: path.clone(),
                         code,
+                        source_map,
                     })
                 }
             }
@@ -748,7 +1012,8 @@ mod tests {
             "<!doctype html>\n<html>\n<head>\n</head>\n<body>\n  <app-root></app-root>\n</body>\n</html>\n",
         )
         .unwrap();
-        let out = generate_index_html(&index_src, "index.html", true, true, dir.path()).unwrap();
+        let out = generate_index_html(&index_src, "index.html", true, true, dir.path(), "main.js")
+            .unwrap();
         let content = std::fs::read_to_string(out).unwrap();
         assert!(content.contains(r#"<link rel="stylesheet" href="styles.css">"#));
         assert!(content.contains(r#"<script src="polyfills.js" type="module"></script>"#));
@@ -760,11 +1025,46 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         let index_src = dir.path().join("index.html");
         std::fs::write(&index_src, "<html><head></head><body></body></html>").unwrap();
-        let out = generate_index_html(&index_src, "index.html", false, false, dir.path()).unwrap();
+        let out = generate_index_html(
+            &index_src,
+            "index.html",
+            false,
+            false,
+            dir.path(),
+            "main.js",
+        )
+        .unwrap();
         let content = std::fs::read_to_string(out).unwrap();
         assert!(!content.contains("styles.css"));
         assert!(!content.contains("polyfills.js"));
         assert!(content.contains(r#"<script src="main.js" type="module"></script>"#));
+    }
+
+    #[test]
+    fn test_build_options_production() {
+        let opts = build_options(Some("production"));
+        assert!(opts.source_maps);
+        assert!(opts.minify);
+        assert!(opts.content_hash);
+        assert!(opts.tree_shake);
+    }
+
+    #[test]
+    fn test_build_options_development() {
+        let opts = build_options(Some("development"));
+        assert!(!opts.source_maps);
+        assert!(!opts.minify);
+        assert!(!opts.content_hash);
+        assert!(!opts.tree_shake);
+    }
+
+    #[test]
+    fn test_build_options_none() {
+        let opts = build_options(None);
+        assert!(!opts.source_maps);
+        assert!(!opts.minify);
+        assert!(!opts.content_hash);
+        assert!(!opts.tree_shake);
     }
 
     #[test]
