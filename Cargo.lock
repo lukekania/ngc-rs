@@ -708,6 +708,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ngc-npm-resolver"
+version = "0.7.0"
+dependencies = [
+ "ngc-diagnostics",
+ "ngc-project-resolver",
+ "rayon",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "ngc-project-resolver"
 version = "0.7.0"
 dependencies = [
@@ -733,6 +747,7 @@ dependencies = [
  "glob",
  "ngc-bundler",
  "ngc-diagnostics",
+ "ngc-npm-resolver",
  "ngc-project-resolver",
  "ngc-template-compiler",
  "ngc-ts-transform",
