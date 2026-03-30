@@ -144,6 +144,13 @@ pub enum NgcError {
         /// Description of what went wrong.
         message: String,
     },
+
+    /// A code splitting / chunk graph error occurred.
+    #[error("chunk error: {message}")]
+    ChunkError {
+        /// Description of what went wrong during chunk graph construction.
+        message: String,
+    },
 }
 
 /// A type alias for Results using NgcError.

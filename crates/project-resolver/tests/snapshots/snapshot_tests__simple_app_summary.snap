@@ -3,8 +3,8 @@ source: crates/project-resolver/tests/snapshot_tests.rs
 expression: "format!(\"{summary:#?}\")"
 ---
 GraphSummary {
-    file_count: 9,
+    file_count: 13,
     entry_point_count: 2,
-    edge_count: 8,
+    edge_count: 13,
     unresolved_count: 0,
 }
