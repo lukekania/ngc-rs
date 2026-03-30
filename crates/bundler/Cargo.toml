@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 ngc-diagnostics = { path = "../diagnostics" }
+ngc-project-resolver = { path = "../project-resolver" }
 oxc_allocator = "0.122"
 oxc_parser = "0.122"
 oxc_span = "0.122"
@@ -17,7 +18,6 @@ petgraph = "0.8"
 tracing = "0.1"
 
 [dev-dependencies]
-ngc-project-resolver = { path = "../project-resolver" }
 ngc-ts-transform = { path = "../ts-transform" }
 ngc-template-compiler = { path = "../template-compiler" }
 insta = { version = "1.46", features = ["glob"] }

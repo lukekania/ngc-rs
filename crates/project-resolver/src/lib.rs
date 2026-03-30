@@ -5,7 +5,8 @@ pub mod tsconfig;
 
 use std::path::Path;
 
-use graph::{FileGraph, GraphSummary};
+pub use graph::{FileGraph, GraphSummary};
+pub use import_scanner::ImportKind;
 use ngc_diagnostics::NgcResult;
 
 /// Resolve the complete file dependency graph for an Angular project.
