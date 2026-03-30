@@ -83,6 +83,7 @@ pub fn resolve_package_entry(pkg_dir: &Path, subpath: &str) -> NgcResult<PathBuf
 /// - String exports: `"exports": "./dist/index.js"`
 /// - Object exports with conditions: `"exports": { ".": { "default": "./dist/index.js" } }`
 /// - Nested conditions: `"exports": { ".": { "import": { "default": "./dist/index.mjs" } } }`
+/// - Glob patterns: `"./locales/*": { "default": "./locales/*.js" }`
 fn resolve_exports(exports: &serde_json::Value, subpath: &str) -> Option<String> {
     match exports {
         // "exports": "./dist/index.js" — only matches root subpath
@@ -94,9 +95,24 @@ fn resolve_exports(exports: &serde_json::Value, subpath: &str) -> Option<String>
             let has_subpath_keys = map.keys().any(|k| k.starts_with('.'));
 
             if has_subpath_keys {
-                // Look up the subpath
-                let entry = map.get(subpath)?;
-                resolve_condition(entry)
+                // Direct lookup first
+                if let Some(entry) = map.get(subpath) {
+                    return resolve_condition(entry);
+                }
+
+                // Try glob pattern matching: "./locales/*" matches "./locales/de"
+                for (pattern, value) in map {
+                    if let Some(prefix) = pattern.strip_suffix('*') {
+                        if let Some(rest) = subpath.strip_prefix(prefix) {
+                            if let Some(resolved) = resolve_condition(value) {
+                                // Replace * in the resolved path with the matched rest
+                                return Some(resolved.replace('*', rest));
+                            }
+                        }
+                    }
+                }
+
+                None
             } else {
                 // Keys are conditions (e.g., "import", "default", "types")
                 // This is the root entry
@@ -336,6 +352,25 @@ mod tests {
         let pkg_dir = dir.path().join("node_modules/bare-pkg");
         let result = resolve_package_entry(&pkg_dir, ".").unwrap();
         assert!(result.ends_with("index.js"));
+    }
+
+    #[test]
+    fn test_resolve_exports_glob_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        create_mock_package(
+            dir.path(),
+            "glob-pkg",
+            r#"{ "exports": { ".": { "default": "./dist/index.js" }, "./locales/*": { "default": "./locales/*.js" } } }"#,
+            &[
+                ("dist/index.js", "export const x = 1;"),
+                ("locales/de.js", "export default {};"),
+                ("locales/en.js", "export default {};"),
+            ],
+        );
+
+        let pkg_dir = dir.path().join("node_modules/glob-pkg");
+        let result = resolve_package_entry(&pkg_dir, "./locales/de").unwrap();
+        assert!(result.ends_with("locales/de.js"));
     }
 
     #[test]
