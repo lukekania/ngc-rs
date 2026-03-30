@@ -63,6 +63,7 @@ fn build_bundle() -> BundleOutput {
         entry,
         local_prefixes,
         root_dir,
+        options: ngc_bundler::BundleOptions::default(),
     };
 
     ngc_bundler::bundle(&input).expect("should bundle")
