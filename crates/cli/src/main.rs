@@ -218,15 +218,59 @@ fn run_build(
         }
     }
 
+    // Step 6.5: Resolve npm dependencies
+    let bare_specifiers: Vec<String> = file_graph.npm_import_sites.keys().cloned().collect();
+    let npm_resolution = ngc_npm_resolver::resolve_npm_dependencies(&bare_specifiers, &config_dir)?;
+
+    // Merge npm modules into the modules map (they're already JS — no transform needed)
+    for (path, source) in &npm_resolution.modules {
+        modules.insert(path.clone(), source.clone());
+    }
+
+    // Add npm file nodes to the graph
+    let mut graph = file_graph.graph;
+    let mut path_index = file_graph.path_index;
+    for path in npm_resolution.modules.keys() {
+        if !path_index.contains_key(path) {
+            let idx = graph.add_node(path.clone());
+            path_index.insert(path.clone(), idx);
+        }
+    }
+
+    // Add edges from project files to npm entry files
+    for (specifier, import_sites) in &file_graph.npm_import_sites {
+        if let Some(entry_path) = npm_resolution
+            .resolved_specifiers
+            .contains(specifier)
+            .then(|| ngc_npm_resolver::resolve::resolve_bare_specifier(specifier, &config_dir).ok())
+            .flatten()
+        {
+            if let Some(&to_idx) = path_index.get(&entry_path) {
+                for (from_file, kind) in import_sites {
+                    if let Some(&from_idx) = path_index.get(from_file) {
+                        graph.add_edge(from_idx, to_idx, *kind);
+                    }
+                }
+            }
+        }
+    }
+
+    // Add internal npm edges
+    for (from, to, kind) in &npm_resolution.edges {
+        if let (Some(&from_idx), Some(&to_idx)) = (path_index.get(from), path_index.get(to)) {
+            graph.add_edge(from_idx, to_idx, *kind);
+        }
+    }
+
     let bundle_input = BundleInput {
         modules,
-        graph: file_graph.graph,
+        graph,
         entry,
         local_prefixes,
         root_dir,
         options: bundle_options,
         per_module_maps,
-        bundled_specifiers: std::collections::HashSet::new(),
+        bundled_specifiers: npm_resolution.resolved_specifiers,
     };
 
     let bundle_output = ngc_bundler::bundle(&bundle_input)?;
