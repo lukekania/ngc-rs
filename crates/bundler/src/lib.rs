@@ -1,11 +1,13 @@
 //! ESM concatenation bundler for ngc-rs.
 //!
 //! Takes transformed JavaScript modules and a dependency graph, then produces
-//! a single bundled ESM file with external imports hoisted and project-local
-//! imports inlined.
+//! bundled ESM files with external imports hoisted and project-local imports
+//! inlined. Supports code splitting via dynamic `import()` detection.
 
+mod chunk;
 mod concat;
 mod rewrite;
 
-pub use concat::{bundle, BundleInput};
+pub use chunk::{build_chunk_graph, Chunk, ChunkGraph, ChunkKind};
+pub use concat::{bundle, BundleInput, BundleOutput};
 pub use rewrite::{ExternalImport, RewrittenModule};

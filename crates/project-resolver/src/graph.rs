@@ -6,14 +6,15 @@ use petgraph::graph::{DiGraph, NodeIndex};
 use rayon::prelude::*;
 use tracing::debug;
 
-use crate::import_scanner::scan_imports;
+use crate::import_scanner::{scan_imports_with_kind, ImportKind};
 use crate::tsconfig::ResolvedTsConfig;
 
 /// The file dependency graph for an Angular project.
 #[derive(Debug)]
 pub struct FileGraph {
-    /// The directed graph where nodes are file paths and edges represent imports.
-    pub graph: DiGraph<PathBuf, ()>,
+    /// The directed graph where nodes are file paths and edges are import relationships.
+    /// Edge weight indicates whether the import is static or dynamic.
+    pub graph: DiGraph<PathBuf, ImportKind>,
     /// Map from canonical file path to its node index, for O(1) lookup.
     pub path_index: HashMap<PathBuf, NodeIndex>,
     /// Files with in-degree 0 (no other project file imports them).
@@ -103,12 +104,12 @@ pub fn build_file_graph(config: &ResolvedTsConfig) -> NgcResult<FileGraph> {
         path_index.insert(file.clone(), idx);
     }
 
-    // Parallel scan: read each file and extract imports
-    let scan_results: Vec<(PathBuf, Vec<String>)> = discovered_files
+    // Parallel scan: read each file and extract imports with kind
+    let scan_results: Vec<(PathBuf, Vec<crate::import_scanner::ScannedImport>)> = discovered_files
         .par_iter()
         .filter_map(|file_path| {
             let contents = std::fs::read_to_string(file_path).ok()?;
-            let imports = scan_imports(&contents);
+            let imports = scan_imports_with_kind(&contents);
             Some((file_path.clone(), imports))
         })
         .collect();
@@ -116,22 +117,22 @@ pub fn build_file_graph(config: &ResolvedTsConfig) -> NgcResult<FileGraph> {
     let mut unresolved = Vec::new();
 
     // Resolve imports and add edges (single-threaded for graph mutation)
-    for (from_file, specifiers) in &scan_results {
+    for (from_file, scanned_imports) in &scan_results {
         let from_idx = path_index[from_file];
-        for specifier in specifiers {
-            match resolve_specifier(specifier, from_file, &resolver_config) {
+        for scanned in scanned_imports {
+            match resolve_specifier(&scanned.specifier, from_file, &resolver_config) {
                 Some(resolved_path) => {
                     if let Some(&to_idx) = path_index.get(&resolved_path) {
-                        graph.add_edge(from_idx, to_idx, ());
+                        graph.add_edge(from_idx, to_idx, scanned.kind);
                     }
                     // If resolved but not in our file set, it's an external file — skip
                 }
                 None => {
                     // Only record as unresolved if it looks like a project-local import
-                    if is_project_local(specifier, &resolver_config) {
+                    if is_project_local(&scanned.specifier, &resolver_config) {
                         unresolved.push(UnresolvedImport {
                             from_file: from_file.clone(),
-                            specifier: specifier.clone(),
+                            specifier: scanned.specifier.clone(),
                         });
                     }
                 }

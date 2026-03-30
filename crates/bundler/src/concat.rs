@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 use ngc_diagnostics::{NgcError, NgcResult};
+use ngc_project_resolver::ImportKind;
 use petgraph::graph::DiGraph;
 use petgraph::visit::Dfs;
 use tracing::debug;
@@ -13,8 +14,8 @@ use crate::rewrite::{self, ExternalImport};
 pub struct BundleInput {
     /// Map from canonical source path to transformed JS code.
     pub modules: HashMap<PathBuf, String>,
-    /// The file dependency graph (nodes are canonical paths, edges are imports).
-    pub graph: DiGraph<PathBuf, ()>,
+    /// The file dependency graph (nodes are canonical paths, edges carry import kind).
+    pub graph: DiGraph<PathBuf, ImportKind>,
     /// The entry point canonical path.
     pub entry: PathBuf,
     /// Prefixes that identify local imports (e.g. `["."]`, `[".", "@app/", "@env/"]`).
@@ -31,6 +32,15 @@ struct MergedImport {
     is_side_effect: bool,
 }
 
+/// The output of the bundler: one or more chunks.
+#[derive(Debug)]
+pub struct BundleOutput {
+    /// Map from output filename to generated code.
+    pub chunks: HashMap<String, String>,
+    /// The main chunk filename (always `"main.js"`).
+    pub main_filename: String,
+}
+
 /// Bundle all modules reachable from the entry point into a single ESM string.
 ///
 /// Topologically sorts the reachable subgraph so that dependencies appear before
@@ -44,6 +54,7 @@ pub fn bundle(input: &BundleInput) -> NgcResult<String> {
     let prefix_refs: Vec<&str> = input.local_prefixes.iter().map(|s| s.as_str()).collect();
     let mut all_externals: Vec<ExternalImport> = Vec::new();
     let mut chunks: Vec<String> = Vec::new();
+    let empty_rewrites = HashMap::new();
 
     for module_path in &ordered {
         let js_code = input
@@ -57,7 +68,8 @@ pub fn bundle(input: &BundleInput) -> NgcResult<String> {
             })?;
 
         let file_name = module_path.to_string_lossy();
-        let rewritten = rewrite::rewrite_module(js_code, &file_name, &prefix_refs)?;
+        let rewritten =
+            rewrite::rewrite_module(js_code, &file_name, &prefix_refs, &empty_rewrites)?;
 
         all_externals.extend(rewritten.external_imports);
 
@@ -202,6 +214,7 @@ fn format_import(imp: &MergedImport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ngc_project_resolver::ImportKind;
     use petgraph::graph::DiGraph;
 
     fn make_path(s: &str) -> PathBuf {
@@ -213,7 +226,7 @@ mod tests {
         let mut graph = DiGraph::new();
         let leaf = graph.add_node(make_path("/root/src/leaf.ts"));
         let entry = graph.add_node(make_path("/root/src/main.ts"));
-        graph.add_edge(entry, leaf, ());
+        graph.add_edge(entry, leaf, ImportKind::Static);
 
         let mut modules = HashMap::new();
         modules.insert(
@@ -248,8 +261,8 @@ mod tests {
         let a = graph.add_node(make_path("/root/a.ts"));
         let b = graph.add_node(make_path("/root/b.ts"));
         let entry = graph.add_node(make_path("/root/main.ts"));
-        graph.add_edge(entry, a, ());
-        graph.add_edge(entry, b, ());
+        graph.add_edge(entry, a, ImportKind::Static);
+        graph.add_edge(entry, b, ImportKind::Static);
 
         let mut modules = HashMap::new();
         modules.insert(
@@ -288,7 +301,7 @@ mod tests {
         let leaf = graph.add_node(make_path("/root/leaf.ts"));
         let entry = graph.add_node(make_path("/root/main.ts"));
         let _orphan = graph.add_node(make_path("/root/orphan.ts"));
-        graph.add_edge(entry, leaf, ());
+        graph.add_edge(entry, leaf, ImportKind::Static);
 
         let mut modules = HashMap::new();
         modules.insert(
