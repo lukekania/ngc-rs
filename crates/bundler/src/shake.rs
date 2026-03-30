@@ -344,7 +344,7 @@ mod tests {
                 .expect("should analyze");
 
         assert!(
-            result.get(&PathBuf::from("/root/main.ts")).is_none(),
+            !result.contains_key(&PathBuf::from("/root/main.ts")),
             "entry module exports should never be marked unused"
         );
     }
@@ -371,7 +371,7 @@ mod tests {
                 .expect("should analyze");
 
         assert!(
-            result.get(&PathBuf::from("/root/side.ts")).is_none(),
+            !result.contains_key(&PathBuf::from("/root/side.ts")),
             "side-effect module should not have unused exports listed"
         );
     }
