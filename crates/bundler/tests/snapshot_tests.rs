@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use ngc_bundler::BundleInput;
+use ngc_bundler::{BundleInput, BundleOutput};
 
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/simple-app")
 }
 
-fn build_bundle() -> String {
+fn build_bundle() -> BundleOutput {
     let tsconfig_path = fixture_path().join("tsconfig.app.json");
     let config = ngc_project_resolver::tsconfig::resolve_tsconfig(&tsconfig_path)
         .expect("should resolve tsconfig");
@@ -68,15 +68,25 @@ fn build_bundle() -> String {
     ngc_bundler::bundle(&input).expect("should bundle")
 }
 
+/// Helper to get the main chunk code from a BundleOutput.
+fn main_chunk(output: &BundleOutput) -> &str {
+    output
+        .chunks
+        .get(&output.main_filename)
+        .expect("main chunk should exist")
+}
+
 #[test]
 fn test_bundle_snapshot() {
-    let bundle = build_bundle();
+    let output = build_bundle();
+    let bundle = main_chunk(&output);
     insta::assert_snapshot!("bundle_output", bundle);
 }
 
 #[test]
 fn test_bundle_has_no_local_imports() {
-    let bundle = build_bundle();
+    let output = build_bundle();
+    let bundle = main_chunk(&output);
     for line in bundle.lines() {
         if line.starts_with("import") && line.contains("from") {
             let from_part = line.split("from").last().unwrap_or("");
@@ -98,7 +108,8 @@ fn test_bundle_has_no_local_imports() {
 
 #[test]
 fn test_bundle_preserves_external_imports() {
-    let bundle = build_bundle();
+    let output = build_bundle();
+    let bundle = main_chunk(&output);
     assert!(
         bundle.contains("@angular/core"),
         "should preserve @angular/core import"
@@ -115,7 +126,8 @@ fn test_bundle_preserves_external_imports() {
 
 #[test]
 fn test_bundle_excludes_unreachable_modules() {
-    let bundle = build_bundle();
+    let output = build_bundle();
+    let bundle = main_chunk(&output);
     // environment.prod.ts exports `production: true` and is not reachable from main.ts
     assert!(
         !bundle.contains("environment.prod"),
@@ -130,7 +142,8 @@ fn test_bundle_excludes_unreachable_modules() {
 
 #[test]
 fn test_bundle_entry_point_last() {
-    let bundle = build_bundle();
+    let output = build_bundle();
+    let bundle = main_chunk(&output);
     let main_comment_pos = bundle
         .rfind("// src/main.js")
         .expect("main.js comment should exist");
