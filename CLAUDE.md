@@ -72,14 +72,14 @@ Goal: produce browser-loadable output from ngc-rs build.
 - [x] 3rdpartylicenses.txt generation
 - [x] JSON output mode (--output-json for builder integration)
 
-### v0.6 — Code Splitting & Lazy Routes
+### v0.6 — Code Splitting & Lazy Routes ✅
 
 Goal: support lazy-loaded Angular routes with separate chunk files.
 
-- [ ] Dynamic import() detection in bundler
-- [ ] Chunk graph construction (main + lazy chunks + shared chunks)
-- [ ] Multi-file bundle output (main.js + chunk-*.js)
-- [ ] Import rewriting for chunk filenames
+- [x] Dynamic import() detection in bundler
+- [x] Chunk graph construction (main + lazy chunks + shared chunks)
+- [x] Multi-file bundle output (main.js + chunk-*.js)
+- [x] Import rewriting for chunk filenames
 
 ### v0.7 — Source Maps & Optimization
 

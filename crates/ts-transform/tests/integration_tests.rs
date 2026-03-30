@@ -17,7 +17,7 @@ fn test_transform_project_produces_js_files() {
     let result = ngc_ts_transform::transform_project(&files, &root_dir, out_dir.path())
         .expect("transform should succeed");
 
-    assert_eq!(result.files_transformed, 9);
+    assert_eq!(result.files_transformed, 13);
     assert!(out_dir.path().join("app/app.component.js").exists());
     assert!(out_dir.path().join("main.js").exists());
     assert!(out_dir.path().join("app/shared/logger.js").exists());

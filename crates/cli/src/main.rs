@@ -222,7 +222,11 @@ fn run_build(
     };
 
     let bundle_output = ngc_bundler::bundle(&bundle_input)?;
-    let modules_bundled = bundle_output.matches("\n// ").count() + 1;
+    let modules_bundled: usize = bundle_output
+        .chunks
+        .values()
+        .map(|code| code.matches("\n// ").count() + 1)
+        .sum();
 
     // Step 7: Write outputs
     std::fs::create_dir_all(&out_dir).map_err(|e| NgcError::Io {
@@ -232,13 +236,15 @@ fn run_build(
 
     let mut output_files: Vec<PathBuf> = Vec::new();
 
-    // Write main.js
-    let main_js_path = out_dir.join("main.js");
-    std::fs::write(&main_js_path, &bundle_output).map_err(|e| NgcError::Io {
-        path: main_js_path.clone(),
-        source: e,
-    })?;
-    output_files.push(main_js_path);
+    // Write all chunk files (main.js + chunk-*.js)
+    for (filename, code) in &bundle_output.chunks {
+        let path = out_dir.join(filename);
+        std::fs::write(&path, code).map_err(|e| NgcError::Io {
+            path: path.clone(),
+            source: e,
+        })?;
+        output_files.push(path);
+    }
 
     // Step 8: Generate polyfills.js
     if let Some(ref ap) = angular_project {
@@ -279,7 +285,13 @@ fn run_build(
     }
 
     // Step 12: Generate 3rdpartylicenses.txt
-    if let Some(lp) = generate_third_party_licenses(&bundle_output, &config_dir, &out_dir)? {
+    let all_bundle_code: String = bundle_output
+        .chunks
+        .values()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    if let Some(lp) = generate_third_party_licenses(&all_bundle_code, &config_dir, &out_dir)? {
         output_files.push(lp);
     }
 
