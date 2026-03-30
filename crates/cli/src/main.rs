@@ -226,6 +226,7 @@ fn run_build(
         root_dir,
         options: bundle_options,
         per_module_maps,
+        bundled_specifiers: std::collections::HashSet::new(),
     };
 
     let bundle_output = ngc_bundler::bundle(&bundle_input)?;

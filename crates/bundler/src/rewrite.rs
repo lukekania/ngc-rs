@@ -64,6 +64,7 @@ pub fn rewrite_module(
         local_prefixes,
         dynamic_import_rewrites,
         None,
+        &HashSet::new(),
     )
 }
 
@@ -77,6 +78,7 @@ pub fn rewrite_module_with_shaking(
     local_prefixes: &[&str],
     dynamic_import_rewrites: &HashMap<String, String>,
     unused_exports: Option<&HashSet<String>>,
+    bundled_specifiers: &HashSet<String>,
 ) -> NgcResult<RewrittenModule> {
     let allocator = Allocator::new();
     let source_type = SourceType::mjs();
@@ -101,6 +103,7 @@ pub fn rewrite_module_with_shaking(
                 &mut edits,
                 &mut external_imports,
                 unused_exports,
+                bundled_specifiers,
             );
         }
 
@@ -129,11 +132,12 @@ fn collect_module_decl_edits(
     edits: &mut Vec<TextEdit>,
     external_imports: &mut Vec<ExternalImport>,
     unused_exports: Option<&HashSet<String>>,
+    bundled_specifiers: &HashSet<String>,
 ) {
     match module_decl {
         ModuleDeclaration::ImportDeclaration(import) => {
             let source = import.source.value.as_str();
-            if is_local(source, local_prefixes) {
+            if is_local(source, local_prefixes, bundled_specifiers) {
                 edits.push(TextEdit {
                     start: import.span.start,
                     end: import.span.end,
@@ -233,7 +237,11 @@ fn collect_module_decl_edits(
             }
         }
         ModuleDeclaration::ExportAllDeclaration(export) => {
-            if is_local(export.source.value.as_str(), local_prefixes) {
+            if is_local(
+                export.source.value.as_str(),
+                local_prefixes,
+                bundled_specifiers,
+            ) {
                 edits.push(TextEdit {
                     start: export.span.start,
                     end: export.span.end,
@@ -458,11 +466,16 @@ fn get_declaration_name(decl: &oxc_ast::ast::Declaration) -> Option<String> {
     }
 }
 
-/// Check if an import specifier is local based on known prefixes.
-fn is_local(specifier: &str, local_prefixes: &[&str]) -> bool {
+/// Check if an import specifier is local based on known prefixes or bundled specifiers.
+fn is_local(
+    specifier: &str,
+    local_prefixes: &[&str],
+    bundled_specifiers: &HashSet<String>,
+) -> bool {
     local_prefixes
         .iter()
         .any(|prefix| specifier.starts_with(prefix))
+        || bundled_specifiers.contains(specifier)
 }
 
 /// Apply text edits to the source, producing the rewritten code.
