@@ -64,6 +64,7 @@ fn build_bundle() -> BundleOutput {
         local_prefixes,
         root_dir,
         options: ngc_bundler::BundleOptions::default(),
+        per_module_maps: std::collections::HashMap::new(),
     };
 
     ngc_bundler::bundle(&input).expect("should bundle")

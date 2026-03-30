@@ -26,6 +26,9 @@ pub struct TransformedModule {
     pub source_path: PathBuf,
     /// The generated JavaScript code.
     pub code: String,
+    /// Source map from original TypeScript to generated JavaScript.
+    /// `None` when source map generation is disabled.
+    pub source_map: Option<oxc_sourcemap::SourceMap>,
 }
 
 /// Transform a single TypeScript source string into JavaScript.
@@ -33,6 +36,28 @@ pub struct TransformedModule {
 /// Parses the input as TypeScript, strips type annotations, interfaces,
 /// type aliases, and decorators, then returns the generated JavaScript.
 pub fn transform_source(source: &str, file_name: &str) -> NgcResult<String> {
+    let (code, _map) = transform_source_impl(source, file_name, false)?;
+    Ok(code)
+}
+
+/// Transform a single TypeScript source string into JavaScript with an optional source map.
+///
+/// When `generate_source_map` is true, returns a source map mapping the generated
+/// JavaScript back to the original TypeScript source.
+pub fn transform_source_with_map(
+    source: &str,
+    file_name: &str,
+    generate_source_map: bool,
+) -> NgcResult<(String, Option<oxc_sourcemap::SourceMap>)> {
+    transform_source_impl(source, file_name, generate_source_map)
+}
+
+/// Internal implementation shared by `transform_source` and `transform_source_with_map`.
+fn transform_source_impl(
+    source: &str,
+    file_name: &str,
+    generate_source_map: bool,
+) -> NgcResult<(String, Option<oxc_sourcemap::SourceMap>)> {
     let allocator = Allocator::new();
     let path = Path::new(file_name);
 
@@ -78,6 +103,11 @@ pub fn transform_source(source: &str, file_name: &str) -> NgcResult<String> {
 
     let codegen_options = CodegenOptions {
         single_quote: true,
+        source_map_path: if generate_source_map {
+            Some(PathBuf::from(file_name))
+        } else {
+            None
+        },
         ..CodegenOptions::default()
     };
 
@@ -87,7 +117,7 @@ pub fn transform_source(source: &str, file_name: &str) -> NgcResult<String> {
         .with_scoping(Some(transform_ret.scoping))
         .build(&parsed.program);
 
-    Ok(codegen_ret.code)
+    Ok((codegen_ret.code, codegen_ret.map))
 }
 
 /// Transform all TypeScript files and write JavaScript output to `out_dir`.
@@ -158,6 +188,17 @@ pub fn transform_project(
 /// decorators). Results are returned as in-memory `TransformedModule` values
 /// instead of being written to disk. Files are processed in parallel using rayon.
 pub fn transform_to_memory(files: &[PathBuf]) -> NgcResult<Vec<TransformedModule>> {
+    transform_to_memory_with_maps(files, false)
+}
+
+/// Transform all TypeScript files and return JavaScript in memory, optionally with source maps.
+///
+/// When `generate_source_maps` is true, each `TransformedModule` includes a source
+/// map from the original TypeScript to the generated JavaScript.
+pub fn transform_to_memory_with_maps(
+    files: &[PathBuf],
+    generate_source_maps: bool,
+) -> NgcResult<Vec<TransformedModule>> {
     let results: Vec<NgcResult<TransformedModule>> = files
         .par_iter()
         .map(|file_path| {
@@ -167,12 +208,14 @@ pub fn transform_to_memory(files: &[PathBuf]) -> NgcResult<Vec<TransformedModule
             })?;
 
             let file_name = file_path.to_string_lossy();
-            let code = transform_source(&source, &file_name)?;
+            let (code, source_map) =
+                transform_source_with_map(&source, &file_name, generate_source_maps)?;
 
             debug!(?file_path, "transformed to memory");
             Ok(TransformedModule {
                 source_path: file_path.clone(),
                 code,
+                source_map,
             })
         })
         .collect();
@@ -188,16 +231,29 @@ pub fn transform_to_memory(files: &[PathBuf]) -> NgcResult<Vec<TransformedModule
 pub fn transform_sources_to_memory(
     sources: &[(PathBuf, String)],
 ) -> NgcResult<Vec<TransformedModule>> {
+    transform_sources_to_memory_with_maps(sources, false)
+}
+
+/// Transform pre-compiled TypeScript sources to JavaScript in memory, optionally with source maps.
+///
+/// When `generate_source_maps` is true, each `TransformedModule` includes a source
+/// map from the original TypeScript to the generated JavaScript.
+pub fn transform_sources_to_memory_with_maps(
+    sources: &[(PathBuf, String)],
+    generate_source_maps: bool,
+) -> NgcResult<Vec<TransformedModule>> {
     let results: Vec<NgcResult<TransformedModule>> = sources
         .par_iter()
         .map(|(file_path, source)| {
             let file_name = file_path.to_string_lossy();
-            let code = transform_source(source, &file_name)?;
+            let (code, source_map) =
+                transform_source_with_map(source, &file_name, generate_source_maps)?;
 
             debug!(?file_path, "transformed source to memory");
             Ok(TransformedModule {
                 source_path: file_path.clone(),
                 code,
+                source_map,
             })
         })
         .collect();
@@ -319,6 +375,28 @@ export class AppComponent {
             result.contains("class AppComponent"),
             "class should be preserved"
         );
+    }
+
+    #[test]
+    fn test_source_map_generation() {
+        let source = "export const x: number = 42;\nexport function greet(name: string): string { return name; }\n";
+        let (code, map) =
+            transform_source_with_map(source, "test.ts", true).expect("should transform");
+        assert!(!code.contains(": number"));
+        let map = map.expect("source map should be present");
+        // Source map should reference our file
+        let sources: Vec<_> = map.get_sources().collect();
+        assert!(!sources.is_empty(), "should have at least one source");
+        // Should have tokens mapping output positions to input positions
+        assert!(map.get_tokens().count() > 0, "should have mapping tokens");
+    }
+
+    #[test]
+    fn test_source_map_disabled() {
+        let source = "export const x = 42;\n";
+        let (_code, map) =
+            transform_source_with_map(source, "test.ts", false).expect("should transform");
+        assert!(map.is_none(), "source map should be None when disabled");
     }
 
     #[test]
