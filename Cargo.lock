@@ -680,7 +680,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-bundler"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "insta",
  "ngc-diagnostics",
@@ -689,15 +689,19 @@ dependencies = [
  "ngc-ts-transform",
  "oxc_allocator",
  "oxc_ast",
+ "oxc_codegen",
  "oxc_parser",
+ "oxc_semantic",
+ "oxc_sourcemap",
  "oxc_span",
  "petgraph",
+ "sha2",
  "tracing",
 ]
 
 [[package]]
 name = "ngc-diagnostics"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "serde_json",
  "thiserror",
@@ -705,7 +709,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-project-resolver"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "criterion",
  "glob",
@@ -722,7 +726,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-rs"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "clap",
  "colored",
@@ -732,6 +736,7 @@ dependencies = [
  "ngc-project-resolver",
  "ngc-template-compiler",
  "ngc-ts-transform",
+ "oxc_sourcemap",
  "regex",
  "serde",
  "serde_json",
@@ -742,7 +747,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-template-compiler"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "insta",
  "ngc-diagnostics",
@@ -760,7 +765,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-ts-transform"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "insta",
  "ngc-diagnostics",
@@ -769,6 +774,7 @@ dependencies = [
  "oxc_codegen",
  "oxc_parser",
  "oxc_semantic",
+ "oxc_sourcemap",
  "oxc_span",
  "oxc_transformer",
  "rayon",

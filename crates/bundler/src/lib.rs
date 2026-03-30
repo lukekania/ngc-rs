@@ -6,8 +6,10 @@
 
 mod chunk;
 mod concat;
+mod minify;
 mod rewrite;
+mod shake;
 
 pub use chunk::{build_chunk_graph, Chunk, ChunkGraph, ChunkKind};
-pub use concat::{bundle, BundleInput, BundleOutput};
+pub use concat::{bundle, BundleInput, BundleOptions, BundleOutput};
 pub use rewrite::{ExternalImport, RewrittenModule};
