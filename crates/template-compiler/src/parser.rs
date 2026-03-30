@@ -241,7 +241,11 @@ fn parse_attributes(
                     .next()
                     .map(|p| p.as_str().to_string())
                     .unwrap_or_default();
-                attrs.push(crate::ast::TemplateAttribute::Reference { name });
+                let export_as = inner
+                    .next()
+                    .and_then(|p| p.into_inner().next())
+                    .map(|p| p.as_str().to_string());
+                attrs.push(crate::ast::TemplateAttribute::Reference { name, export_as });
             }
             Rule::static_attribute => {
                 let mut inner = pair.into_inner();

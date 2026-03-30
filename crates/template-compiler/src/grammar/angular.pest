@@ -37,7 +37,7 @@ attribute = _{ class_binding | style_binding | attr_binding | two_way_binding | 
 
 two_way_binding = { "[(" ~ prop_name ~ ")]" ~ "=" ~ quoted_value }
 structural_directive = { "*" ~ attr_name ~ "=" ~ quoted_value }
-ref_variable = { "#" ~ identifier }
+ref_variable = { "#" ~ identifier ~ ("=" ~ quoted_value)? }
 
 event_binding = { "(" ~ event_name ~ ")" ~ "=" ~ quoted_value }
 property_binding = { "[" ~ prop_name ~ "]" ~ "=" ~ quoted_value }

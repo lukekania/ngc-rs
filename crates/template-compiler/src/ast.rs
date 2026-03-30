@@ -87,10 +87,12 @@ pub enum TemplateAttribute {
         /// Directive expression.
         expression: String,
     },
-    /// A template reference variable like `#myRef`.
+    /// A template reference variable like `#myRef` or `#myRef="exportAs"`.
     Reference {
         /// Reference name.
         name: String,
+        /// Optional export-as value (e.g. `"ngForm"`).
+        export_as: Option<String>,
     },
 }
 
