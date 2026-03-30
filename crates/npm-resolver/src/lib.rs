@@ -5,3 +5,4 @@
 //! transitive imports to discover every file that needs to be bundled.
 
 pub mod package_json;
+pub mod resolve;
