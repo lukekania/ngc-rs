@@ -151,6 +151,24 @@ pub enum NgcError {
         /// Description of what went wrong during chunk graph construction.
         message: String,
     },
+
+    /// Source map generation failed.
+    #[error("source map error for {path}: {message}")]
+    SourceMapError {
+        /// The path to the file that caused the source map error.
+        path: PathBuf,
+        /// Description of what went wrong.
+        message: String,
+    },
+
+    /// Minification failed.
+    #[error("minification error for {path}: {message}")]
+    MinifyError {
+        /// The path to the file that failed to minify.
+        path: PathBuf,
+        /// Description of what went wrong.
+        message: String,
+    },
 }
 
 /// A type alias for Results using NgcError.

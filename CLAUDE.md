@@ -81,14 +81,15 @@ Goal: support lazy-loaded Angular routes with separate chunk files.
 - [x] Multi-file bundle output (main.js + chunk-*.js)
 - [x] Import rewriting for chunk filenames
 
-### v0.7 — Source Maps & Optimization
+### v0.7 — Source Maps & Optimization ✅
 
 Goal: source maps and production-mode optimized builds.
 
-- [ ] Source map generation through full pipeline (transform → bundle)
-- [ ] Minification (oxc_minifier or equivalent)
-- [ ] Tree shaking / dead code elimination
-- [ ] Production vs development build modes (--configuration)
+- [x] Source map generation through full pipeline (transform → bundle)
+- [x] Minification (oxc_codegen whitespace minification)
+- [x] Tree shaking / dead code elimination (export-level)
+- [x] Production vs development build modes (--configuration)
+- [x] Content-hash chunk filenames for cache busting
 
 ### v0.8 — Watch Mode & Dev Server
 
