@@ -243,10 +243,37 @@ fn run_build(
 
     let mut output_files: Vec<PathBuf> = Vec::new();
 
-    // Write all chunk files (main.js + chunk-*.js)
+    // Write all chunk files (main.js + chunk-*.js) with optional source maps
     for (filename, code) in &bundle_output.chunks {
+        let mut final_code = code.clone();
+
+        // Append source map reference if we have a map for this chunk
+        if let Some(source_map) = bundle_output.chunk_source_maps.get(filename) {
+            if bundle_options.source_maps {
+                if configuration == Some("production") {
+                    // External source map file
+                    let map_filename = format!("{filename}.map");
+                    final_code.push_str(&format!("//# sourceMappingURL={map_filename}\n"));
+                    let map_path = out_dir.join(&map_filename);
+                    std::fs::write(&map_path, source_map.to_json_string()).map_err(|e| {
+                        NgcError::Io {
+                            path: map_path.clone(),
+                            source: e,
+                        }
+                    })?;
+                    output_files.push(map_path);
+                } else {
+                    // Inline source map (data URL)
+                    final_code.push_str(&format!(
+                        "//# sourceMappingURL={}\n",
+                        source_map.to_data_url()
+                    ));
+                }
+            }
+        }
+
         let path = out_dir.join(filename);
-        std::fs::write(&path, code).map_err(|e| NgcError::Io {
+        std::fs::write(&path, &final_code).map_err(|e| NgcError::Io {
             path: path.clone(),
             source: e,
         })?;

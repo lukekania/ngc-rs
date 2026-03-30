@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use ngc_diagnostics::{NgcError, NgcResult};
 use ngc_project_resolver::ImportKind;
+use oxc_sourcemap::{ConcatSourceMapBuilder, SourceMap};
 use petgraph::graph::DiGraph;
 use tracing::debug;
 
@@ -10,7 +11,7 @@ use crate::chunk::build_chunk_graph;
 use crate::rewrite::{self, ExternalImport};
 
 /// Options controlling bundle output behavior.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct BundleOptions {
     /// Generate source maps for bundled chunks.
     pub source_maps: bool,
@@ -55,8 +56,11 @@ struct MergedImport {
 pub struct BundleOutput {
     /// Map from output filename to generated code.
     pub chunks: HashMap<String, String>,
-    /// The main chunk filename (always `"main.js"`).
+    /// The main chunk filename (always `"main.js"` unless content-hashed).
     pub main_filename: String,
+    /// Source maps for each chunk, keyed by the same filename as `chunks`.
+    /// Empty when source map generation is disabled.
+    pub chunk_source_maps: HashMap<String, SourceMap>,
 }
 
 /// Bundle all modules into one or more ESM chunk files.
@@ -79,21 +83,28 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
 
     let prefix_refs: Vec<&str> = input.local_prefixes.iter().map(|s| s.as_str()).collect();
     let mut output_chunks: HashMap<String, String> = HashMap::new();
+    let mut chunk_source_maps: HashMap<String, SourceMap> = HashMap::new();
 
     for chunk in &chunk_graph.chunks {
-        let chunk_code = bundle_chunk(
+        let (chunk_code, chunk_map) = bundle_chunk(
             &chunk.modules,
             &input.modules,
             &input.root_dir,
             &prefix_refs,
             &specifier_rewrites,
+            &input.per_module_maps,
+            input.options.source_maps,
         )?;
         output_chunks.insert(chunk.filename.clone(), chunk_code);
+        if let Some(map) = chunk_map {
+            chunk_source_maps.insert(chunk.filename.clone(), map);
+        }
     }
 
     Ok(BundleOutput {
         chunks: output_chunks,
         main_filename: "main.js".to_string(),
+        chunk_source_maps,
     })
 }
 
@@ -172,16 +183,28 @@ fn pathdiff(target: &std::path::Path, base: &std::path::Path) -> Result<PathBuf,
     Ok(result)
 }
 
-/// Bundle a single chunk's modules into an ESM string.
+/// A module section ready for concatenation, with its source map and line count.
+struct ModuleSection {
+    /// The code section including the `// path` comment line.
+    code: String,
+    /// Number of lines in this section.
+    line_count: u32,
+    /// The canonical source path, for looking up the transform source map.
+    source_path: PathBuf,
+}
+
+/// Bundle a single chunk's modules into an ESM string, optionally with a source map.
 fn bundle_chunk(
     module_paths: &[PathBuf],
     all_modules: &HashMap<PathBuf, String>,
     root_dir: &PathBuf,
     prefix_refs: &[&str],
     specifier_rewrites: &HashMap<String, String>,
-) -> NgcResult<String> {
+    per_module_maps: &HashMap<PathBuf, SourceMap>,
+    generate_source_maps: bool,
+) -> NgcResult<(String, Option<SourceMap>)> {
     let mut all_externals: Vec<ExternalImport> = Vec::new();
-    let mut code_sections: Vec<String> = Vec::new();
+    let mut sections: Vec<ModuleSection> = Vec::new();
 
     for module_path in module_paths {
         let js_code = all_modules
@@ -203,32 +226,75 @@ fn bundle_chunk(
         if !trimmed.is_empty() {
             let relative = module_path.strip_prefix(root_dir).unwrap_or(module_path);
             let display_path = relative.with_extension("js");
-            code_sections.push(format!("// {}\n{}", display_path.display(), trimmed));
+            let section_code = format!("// {}\n{}", display_path.display(), trimmed);
+            let line_count = section_code.chars().filter(|&c| c == '\n').count() as u32 + 1;
+            sections.push(ModuleSection {
+                code: section_code,
+                line_count,
+                source_path: module_path.clone(),
+            });
         }
     }
 
     let merged = merge_external_imports(all_externals);
     let mut output = String::new();
 
+    // Write hoisted imports preamble
     for imp in &merged {
         output.push_str(&format_import(imp));
         output.push('\n');
     }
 
-    if !merged.is_empty() && !code_sections.is_empty() {
+    // Track how many lines the preamble occupies
+    let preamble_lines = if merged.is_empty() {
+        0u32
+    } else {
+        // One line per import + one blank separator line
+        merged.len() as u32 + 1
+    };
+
+    if !merged.is_empty() && !sections.is_empty() {
         output.push('\n');
     }
 
-    for (i, section) in code_sections.iter().enumerate() {
-        output.push_str(section);
-        if i < code_sections.len() - 1 {
+    // Build source map inputs: collect (source_map_ref, line_offset) pairs
+    let mut sourcemap_entries: Vec<(SourceMap, u32)> = Vec::new();
+    let mut current_line = preamble_lines;
+
+    for (i, section) in sections.iter().enumerate() {
+        // The comment line ("// src/path.js") is at current_line.
+        // Module code starts at current_line + 1.
+        let module_code_start = current_line + 1;
+
+        if generate_source_maps {
+            if let Some(transform_map) = per_module_maps.get(&section.source_path) {
+                sourcemap_entries.push((transform_map.clone(), module_code_start));
+            }
+        }
+
+        output.push_str(&section.code);
+        if i < sections.len() - 1 {
             output.push_str("\n\n");
+            current_line += section.line_count + 1; // section lines + blank separator
         } else {
             output.push('\n');
+            current_line += section.line_count;
         }
     }
 
-    Ok(output)
+    // Build combined source map
+    let combined_map = if generate_source_maps && !sourcemap_entries.is_empty() {
+        let refs: Vec<(&SourceMap, u32)> = sourcemap_entries
+            .iter()
+            .map(|(map, offset)| (map, *offset))
+            .collect();
+        let builder = ConcatSourceMapBuilder::from_sourcemaps(&refs);
+        Some(builder.into_sourcemap())
+    } else {
+        None
+    };
+
+    Ok((output, combined_map))
 }
 
 /// Merge external imports by source, combining named imports and deduplicating.
@@ -526,5 +592,116 @@ mod tests {
             is_side_effect: true,
         };
         assert_eq!(format_import(&imp), "import 'zone.js';");
+    }
+
+    #[test]
+    fn test_bundle_with_source_maps() {
+        let mut graph = DiGraph::new();
+        let leaf = graph.add_node(make_path("/root/src/leaf.ts"));
+        let entry = graph.add_node(make_path("/root/src/main.ts"));
+        graph.add_edge(entry, leaf, ImportKind::Static);
+
+        let mut modules = HashMap::new();
+        modules.insert(
+            make_path("/root/src/leaf.ts"),
+            "export const x = 42;\n".to_string(),
+        );
+        modules.insert(
+            make_path("/root/src/main.ts"),
+            "import { x } from './leaf';\nconsole.log(x);\n".to_string(),
+        );
+
+        // Create simple source maps for each module
+        let leaf_map = SourceMap::new(
+            None,
+            vec![],
+            None,
+            vec!["leaf.ts".into()],
+            vec![Some("export const x = 42;\n".into())],
+            vec![oxc_sourcemap::Token::new(0, 0, 0, 0, Some(0), None)].into_boxed_slice(),
+            None,
+        );
+        let main_map = SourceMap::new(
+            None,
+            vec![],
+            None,
+            vec!["main.ts".into()],
+            vec![Some(
+                "import { x } from './leaf';\nconsole.log(x);\n".into(),
+            )],
+            vec![oxc_sourcemap::Token::new(0, 0, 0, 0, Some(0), None)].into_boxed_slice(),
+            None,
+        );
+
+        let mut per_module_maps = HashMap::new();
+        per_module_maps.insert(make_path("/root/src/leaf.ts"), leaf_map);
+        per_module_maps.insert(make_path("/root/src/main.ts"), main_map);
+
+        let input = BundleInput {
+            modules,
+            graph,
+            entry: make_path("/root/src/main.ts"),
+            local_prefixes: vec![".".to_string()],
+            root_dir: make_path("/root/src"),
+            options: BundleOptions {
+                source_maps: true,
+                ..BundleOptions::default()
+            },
+            per_module_maps,
+        };
+
+        let output = bundle(&input).expect("should bundle");
+        assert!(
+            !output.chunk_source_maps.is_empty(),
+            "should have source maps"
+        );
+
+        let main_map = output
+            .chunk_source_maps
+            .get("main.js")
+            .expect("main chunk should have a source map");
+        let sources: Vec<_> = main_map.get_sources().collect();
+        assert!(
+            sources.len() >= 2,
+            "source map should reference both original files"
+        );
+        // Verify it serializes to valid JSON
+        let json = main_map.to_json_string();
+        assert!(json.contains("\"sources\""), "should have sources field");
+        assert!(json.contains("\"mappings\""), "should have mappings field");
+    }
+
+    #[test]
+    fn test_bundle_without_source_maps() {
+        let mut graph = DiGraph::new();
+        let leaf = graph.add_node(make_path("/root/src/leaf.ts"));
+        let entry = graph.add_node(make_path("/root/src/main.ts"));
+        graph.add_edge(entry, leaf, ImportKind::Static);
+
+        let mut modules = HashMap::new();
+        modules.insert(
+            make_path("/root/src/leaf.ts"),
+            "export const x = 42;\n".to_string(),
+        );
+        modules.insert(
+            make_path("/root/src/main.ts"),
+            "import { x } from './leaf';\nconsole.log(x);\n".to_string(),
+        );
+
+        let input = BundleInput {
+            modules,
+            graph,
+            entry: make_path("/root/src/main.ts"),
+            local_prefixes: vec![".".to_string()],
+            root_dir: make_path("/root/src"),
+            options: BundleOptions::default(),
+            per_module_maps: HashMap::new(),
+        };
+
+        let output = bundle(&input).expect("should bundle");
+        assert!(
+            output.chunk_source_maps.is_empty(),
+            "should not have source maps when disabled"
+        );
     }
 }
