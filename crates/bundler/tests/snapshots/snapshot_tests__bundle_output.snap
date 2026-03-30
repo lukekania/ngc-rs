@@ -57,7 +57,13 @@ class AppComponent {
 }
 
 // src/app/app.routes.js
-const routes = [];
+const routes = [{
+	path: 'admin',
+	loadComponent: () => import('./chunk-admin-component.js').then((m) => m.AdminComponent)
+}, {
+	path: 'dashboard',
+	loadChildren: () => import('./chunk-dashboard-routes.js').then((m) => m.dashboardRoutes)
+}];
 
 // src/app/app.config.js
 const appConfig = { providers: [provideRouter(routes)] };

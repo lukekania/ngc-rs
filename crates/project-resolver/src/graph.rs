@@ -431,7 +431,7 @@ mod tests {
     fn test_discover_files_from_include() {
         let config = crate::tsconfig::resolve_tsconfig(&fixture_path("tsconfig.app.json")).unwrap();
         let files = discover_files(&config).unwrap();
-        assert_eq!(files.len(), 9);
+        assert_eq!(files.len(), 13);
 
         // Verify all expected files are present
         let file_names: Vec<String> = files
@@ -450,8 +450,8 @@ mod tests {
         let file_graph = build_file_graph(&config).unwrap();
         let summary = summarize(&file_graph);
 
-        assert_eq!(summary.file_count, 9);
-        assert_eq!(summary.edge_count, 8);
+        assert_eq!(summary.file_count, 13);
+        assert_eq!(summary.edge_count, 13);
         assert_eq!(summary.unresolved_count, 0);
         assert_eq!(summary.entry_point_count, 2);
     }
