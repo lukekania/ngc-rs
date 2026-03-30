@@ -134,9 +134,16 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
         chunk_source_maps = minified_maps;
     }
 
+    // Content-hash filenames
+    let main_filename = if input.options.content_hash {
+        apply_content_hashes(&mut output_chunks, &mut chunk_source_maps)?
+    } else {
+        "main.js".to_string()
+    };
+
     Ok(BundleOutput {
         chunks: output_chunks,
-        main_filename: "main.js".to_string(),
+        main_filename,
         chunk_source_maps,
     })
 }
@@ -341,6 +348,85 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<(String, Option<SourceMa
     };
 
     Ok((output, combined_map))
+}
+
+/// Compute a truncated SHA-256 content hash (8 hex characters).
+fn content_hash(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let result = Sha256::digest(content.as_bytes());
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}",
+        result[0], result[1], result[2], result[3]
+    )
+}
+
+/// Apply content hashes to all chunk filenames.
+///
+/// Processes chunks in dependency order (leaf chunks first) so that when a chunk
+/// references another via dynamic import, the referenced chunk's hashed name is
+/// already known. Returns the hashed main filename.
+fn apply_content_hashes(
+    chunks: &mut HashMap<String, String>,
+    source_maps: &mut HashMap<String, SourceMap>,
+) -> NgcResult<String> {
+    // Build rename map: process all chunks, computing hashes
+    // First do non-main chunks (lazy/shared), then main
+    let filenames: Vec<String> = chunks.keys().cloned().collect();
+    let mut rename_map: HashMap<String, String> = HashMap::new();
+
+    // Process non-main chunks first (they might be referenced by main)
+    for filename in &filenames {
+        if filename == "main.js" {
+            continue;
+        }
+        let code = chunks.get(filename).ok_or_else(|| NgcError::BundleError {
+            message: format!("chunk {filename} disappeared during hashing"),
+        })?;
+        let hash = content_hash(code);
+        let hashed_name = insert_hash_in_filename(filename, &hash);
+        rename_map.insert(filename.clone(), hashed_name);
+    }
+
+    // Replace chunk filename references in all chunks
+    for code in chunks.values_mut() {
+        for (old_name, new_name) in &rename_map {
+            *code = code.replace(old_name, new_name);
+        }
+    }
+
+    // Now hash main.js (after references have been updated)
+    if let Some(main_code) = chunks.get("main.js") {
+        let hash = content_hash(main_code);
+        let hashed_main = insert_hash_in_filename("main.js", &hash);
+        rename_map.insert("main.js".to_string(), hashed_main);
+    }
+
+    // Apply renames to the chunks and source_maps HashMaps
+    for (old_name, new_name) in &rename_map {
+        if let Some(code) = chunks.remove(old_name) {
+            chunks.insert(new_name.clone(), code);
+        }
+        if let Some(map) = source_maps.remove(old_name) {
+            source_maps.insert(new_name.clone(), map);
+        }
+    }
+
+    let main_filename = rename_map
+        .get("main.js")
+        .cloned()
+        .unwrap_or_else(|| "main.js".to_string());
+
+    debug!(main = %main_filename, "applied content hashes");
+    Ok(main_filename)
+}
+
+/// Insert a content hash into a filename: `chunk-foo.js` → `chunk-foo.a1b2c3d4.js`.
+fn insert_hash_in_filename(filename: &str, hash: &str) -> String {
+    if let Some(stem) = filename.strip_suffix(".js") {
+        format!("{stem}.{hash}.js")
+    } else {
+        format!("{filename}.{hash}")
+    }
 }
 
 /// Merge external imports by source, combining named imports and deduplicating.
@@ -749,5 +835,63 @@ mod tests {
             output.chunk_source_maps.is_empty(),
             "should not have source maps when disabled"
         );
+    }
+
+    #[test]
+    fn test_content_hash_deterministic() {
+        assert_eq!(content_hash("hello"), content_hash("hello"));
+        assert_ne!(content_hash("hello"), content_hash("world"));
+        assert_eq!(content_hash("hello").len(), 8);
+    }
+
+    #[test]
+    fn test_insert_hash_in_filename() {
+        assert_eq!(
+            insert_hash_in_filename("main.js", "abcd1234"),
+            "main.abcd1234.js"
+        );
+        assert_eq!(
+            insert_hash_in_filename("chunk-admin.js", "deadbeef"),
+            "chunk-admin.deadbeef.js"
+        );
+    }
+
+    #[test]
+    fn test_content_hash_bundle() {
+        let mut graph = DiGraph::new();
+        let leaf = graph.add_node(make_path("/root/src/leaf.ts"));
+        let entry = graph.add_node(make_path("/root/src/main.ts"));
+        graph.add_edge(entry, leaf, ImportKind::Static);
+
+        let mut modules = HashMap::new();
+        modules.insert(
+            make_path("/root/src/leaf.ts"),
+            "export const x = 42;\n".to_string(),
+        );
+        modules.insert(
+            make_path("/root/src/main.ts"),
+            "import { x } from './leaf';\nconsole.log(x);\n".to_string(),
+        );
+
+        let input = BundleInput {
+            modules,
+            graph,
+            entry: make_path("/root/src/main.ts"),
+            local_prefixes: vec![".".to_string()],
+            root_dir: make_path("/root/src"),
+            options: BundleOptions {
+                content_hash: true,
+                ..BundleOptions::default()
+            },
+            per_module_maps: HashMap::new(),
+        };
+
+        let output = bundle(&input).expect("should bundle");
+        // Main filename should contain a hash
+        assert_ne!(output.main_filename, "main.js");
+        assert!(output.main_filename.starts_with("main."));
+        assert!(output.main_filename.ends_with(".js"));
+        // Chunk should exist with the hashed name
+        assert!(output.chunks.contains_key(&output.main_filename));
     }
 }

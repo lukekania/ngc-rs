@@ -313,6 +313,7 @@ fn run_build(
                 !ap.styles.is_empty(),
                 !ap.polyfills.is_empty(),
                 &out_dir,
+                &bundle_output.main_filename,
             )?;
             output_files.push(path);
         }
@@ -584,6 +585,7 @@ fn generate_index_html(
     has_styles: bool,
     has_polyfills: bool,
     out_dir: &Path,
+    main_filename: &str,
 ) -> NgcResult<PathBuf> {
     let mut html = std::fs::read_to_string(index_source).map_err(|e| NgcError::Io {
         path: index_source.to_path_buf(),
@@ -603,7 +605,9 @@ fn generate_index_html(
     if has_polyfills {
         scripts.push_str("  <script src=\"polyfills.js\" type=\"module\"></script>\n");
     }
-    scripts.push_str("  <script src=\"main.js\" type=\"module\"></script>\n");
+    scripts.push_str(&format!(
+        "  <script src=\"{main_filename}\" type=\"module\"></script>\n"
+    ));
     html = html.replace("</body>", &format!("{scripts}</body>"));
 
     let path = out_dir.join(output_filename);
@@ -810,7 +814,8 @@ mod tests {
             "<!doctype html>\n<html>\n<head>\n</head>\n<body>\n  <app-root></app-root>\n</body>\n</html>\n",
         )
         .unwrap();
-        let out = generate_index_html(&index_src, "index.html", true, true, dir.path()).unwrap();
+        let out = generate_index_html(&index_src, "index.html", true, true, dir.path(), "main.js")
+            .unwrap();
         let content = std::fs::read_to_string(out).unwrap();
         assert!(content.contains(r#"<link rel="stylesheet" href="styles.css">"#));
         assert!(content.contains(r#"<script src="polyfills.js" type="module"></script>"#));
@@ -822,7 +827,15 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         let index_src = dir.path().join("index.html");
         std::fs::write(&index_src, "<html><head></head><body></body></html>").unwrap();
-        let out = generate_index_html(&index_src, "index.html", false, false, dir.path()).unwrap();
+        let out = generate_index_html(
+            &index_src,
+            "index.html",
+            false,
+            false,
+            dir.path(),
+            "main.js",
+        )
+        .unwrap();
         let content = std::fs::read_to_string(out).unwrap();
         assert!(!content.contains("styles.css"));
         assert!(!content.contains("polyfills.js"));
