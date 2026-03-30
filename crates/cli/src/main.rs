@@ -4,7 +4,7 @@ use std::process;
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use ngc_bundler::BundleInput;
+use ngc_bundler::{BundleInput, BundleOptions};
 use ngc_diagnostics::{NgcError, NgcResult};
 use ngc_project_resolver::angular_json::{
     FileReplacement, ResolvedAngularProject, ResolvedAsset, ResolvedStyle,
@@ -213,12 +213,14 @@ fn run_build(
         }
     }
 
+    let bundle_options = build_options(configuration);
     let bundle_input = BundleInput {
         modules,
         graph: file_graph.graph,
         entry,
         local_prefixes,
         root_dir,
+        options: bundle_options,
     };
 
     let bundle_output = ngc_bundler::bundle(&bundle_input)?;
@@ -307,6 +309,23 @@ fn run_build(
         output_files,
         total_size_bytes,
     })
+}
+
+/// Derive bundle options from the build configuration name.
+///
+/// Production enables all optimizations (source maps, minification, tree shaking,
+/// content hashing). Development and unspecified configurations use defaults
+/// (all optimizations disabled).
+fn build_options(configuration: Option<&str>) -> BundleOptions {
+    match configuration {
+        Some("production") => BundleOptions {
+            source_maps: true,
+            minify: true,
+            content_hash: true,
+            tree_shake: true,
+        },
+        _ => BundleOptions::default(),
+    }
 }
 
 /// Try to find angular.json by searching upward from the project file's directory.
@@ -765,6 +784,33 @@ mod tests {
         assert!(!content.contains("styles.css"));
         assert!(!content.contains("polyfills.js"));
         assert!(content.contains(r#"<script src="main.js" type="module"></script>"#));
+    }
+
+    #[test]
+    fn test_build_options_production() {
+        let opts = build_options(Some("production"));
+        assert!(opts.source_maps);
+        assert!(opts.minify);
+        assert!(opts.content_hash);
+        assert!(opts.tree_shake);
+    }
+
+    #[test]
+    fn test_build_options_development() {
+        let opts = build_options(Some("development"));
+        assert!(!opts.source_maps);
+        assert!(!opts.minify);
+        assert!(!opts.content_hash);
+        assert!(!opts.tree_shake);
+    }
+
+    #[test]
+    fn test_build_options_none() {
+        let opts = build_options(None);
+        assert!(!opts.source_maps);
+        assert!(!opts.minify);
+        assert!(!opts.content_hash);
+        assert!(!opts.tree_shake);
     }
 
     #[test]

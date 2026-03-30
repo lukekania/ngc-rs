@@ -9,6 +9,19 @@ use tracing::debug;
 use crate::chunk::build_chunk_graph;
 use crate::rewrite::{self, ExternalImport};
 
+/// Options controlling bundle output behavior.
+#[derive(Debug, Clone, Default)]
+pub struct BundleOptions {
+    /// Generate source maps for bundled chunks.
+    pub source_maps: bool,
+    /// Minify the final output (whitespace removal).
+    pub minify: bool,
+    /// Use content-hash filenames for cache busting.
+    pub content_hash: bool,
+    /// Perform tree shaking (unused export elimination).
+    pub tree_shake: bool,
+}
+
 /// Input to the bundler.
 #[derive(Debug)]
 pub struct BundleInput {
@@ -22,6 +35,8 @@ pub struct BundleInput {
     pub local_prefixes: Vec<String>,
     /// Root directory for computing relative display paths in comments.
     pub root_dir: PathBuf,
+    /// Build options controlling optimization and output behavior.
+    pub options: BundleOptions,
 }
 
 /// Merge result for a single source: all imports grouped.
@@ -308,6 +323,7 @@ mod tests {
             entry: make_path("/root/src/main.ts"),
             local_prefixes: vec![".".to_string()],
             root_dir: make_path("/root/src"),
+            options: BundleOptions::default(),
         };
 
         let output = bundle(&input).expect("should bundle");
@@ -351,6 +367,7 @@ mod tests {
             entry: make_path("/root/main.ts"),
             local_prefixes: vec![".".to_string()],
             root_dir: make_path("/root"),
+            options: BundleOptions::default(),
         };
 
         let output = bundle(&input).expect("should bundle");
@@ -390,6 +407,7 @@ mod tests {
             entry: make_path("/root/main.ts"),
             local_prefixes: vec![".".to_string()],
             root_dir: make_path("/root"),
+            options: BundleOptions::default(),
         };
 
         let output = bundle(&input).expect("should bundle");
@@ -430,6 +448,7 @@ mod tests {
             entry: make_path("/root/main.ts"),
             local_prefixes: vec![".".to_string()],
             root_dir: make_path("/root"),
+            options: BundleOptions::default(),
         };
 
         let output = bundle(&input).expect("should bundle");
