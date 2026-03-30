@@ -366,14 +366,16 @@ fn find_and_resolve_angular_json(
     project: &Path,
     configuration: Option<&str>,
 ) -> NgcResult<Option<ResolvedAngularProject>> {
-    let start_dir = project
-        .parent()
-        .unwrap_or(Path::new("."))
-        .canonicalize()
-        .map_err(|e| NgcError::Io {
-            path: project.to_path_buf(),
-            source: e,
-        })?;
+    let parent = project.parent().unwrap_or(Path::new("."));
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let start_dir = parent.canonicalize().map_err(|e| NgcError::Io {
+        path: project.to_path_buf(),
+        source: e,
+    })?;
 
     let mut dir = start_dir.as_path();
     loop {
