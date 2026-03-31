@@ -2,7 +2,7 @@
 source: crates/bundler/tests/snapshot_tests.rs
 expression: bundle
 ---
-import { ɵɵStandaloneFeature, ɵɵadvance, ɵɵdefineComponent, ɵɵelement, ɵɵelementEnd, ɵɵelementStart, ɵɵtext, ɵɵtextInterpolate } from '@angular/core';
+import { ɵɵadvance, ɵɵdefineComponent, ɵɵelement, ɵɵelementEnd, ɵɵelementStart, ɵɵtext, ɵɵtextInterpolate } from '@angular/core';
 import { RouterOutlet, provideRouter } from '@angular/router';
 import { bootstrapApplication } from '@angular/platform-browser';
 
@@ -36,7 +36,6 @@ class AppComponent {
 		type: AppComponent,
 		selectors: [['app-root']],
 		standalone: true,
-		features: [ɵɵStandaloneFeature],
 		decls: 3,
 		vars: 1,
 		template: function AppComponent_Template(rf, ctx) {

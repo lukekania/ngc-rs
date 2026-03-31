@@ -1,0 +1,20 @@
+[package]
+name = "ngc-linker"
+description = "Angular linker for partially compiled npm packages"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ngc-diagnostics = { path = "../diagnostics" }
+ngc-template-compiler = { path = "../template-compiler" }
+oxc_allocator = "0.122"
+oxc_parser = "0.122"
+oxc_ast = "0.122"
+oxc_span = "0.122"
+tracing = "0.1"
+
+[dev-dependencies]
+insta = { version = "1.46", features = ["glob"] }

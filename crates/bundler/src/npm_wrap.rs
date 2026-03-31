@@ -235,10 +235,12 @@ where
     let mut export_lines = String::new();
     let unique_exports: BTreeSet<String> = exported_names.iter().cloned().collect();
     for name in &unique_exports {
-        // Skip "default" — it's a reserved word and can't be used as an identifier.
-        // Default exports are handled inline (expression → __exports.default = expr)
-        // or via the named function/class assignment below.
         if name == "default" {
+            // `export { X as default }` → use the local name for the assignment
+            if let Some(local_name) = renamed_exports.get(name) {
+                export_lines.push_str(&format!("  __exports.default = {local_name};\n"));
+            }
+            // Skip bare "default" without a rename — handled by has_default_export below
             continue;
         }
         // Use local name for renamed exports: export { getDefaulted as getActionCache }

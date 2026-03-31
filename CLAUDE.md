@@ -104,6 +104,7 @@ Goal: file watching, incremental rebuilds, and ng serve support.
 
 Goal: zero-config swap for Angular developers.
 
+- [x] Angular linker for partially compiled npm packages (ɵɵngDeclare* → ɵɵdefine*)
 - [ ] npm binary distribution (platform-specific packages)
 - [ ] Angular builder adapter (speaks @angular-devkit builder protocol)
 - [ ] angular.json integration: swap builder, run ng build as normal
@@ -124,6 +125,9 @@ TsParser (oxc) ← crates/ts-parser [v0.2]
 │
 ▼
 TemplateCompiler ← crates/template-compiler [v0.4]
+│
+▼
+Linker ← crates/linker [v0.7.2]
 │
 ▼
 Bundler ← crates/bundler [v0.3]
