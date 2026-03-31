@@ -235,6 +235,15 @@ fn run_build(
         modules.insert(path.clone(), source.clone());
     }
 
+    // Step 6.6: Link partially compiled Angular npm packages
+    let linker_stats = ngc_linker::link_npm_modules(&mut modules, &config_dir)?;
+    if linker_stats.files_linked > 0 {
+        tracing::info!(
+            "linked {} Angular package file(s)",
+            linker_stats.files_linked
+        );
+    }
+
     // Inject vendored helpers for oxc runtime (not an npm dependency of the project)
     let injected_helpers = inject_oxc_runtime_helpers(&mut modules, &bare_specifiers, &config_dir);
 
