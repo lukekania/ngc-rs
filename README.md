@@ -81,7 +81,7 @@ When an `angular.json` is found, ngc-rs reads styles, assets, polyfills, and fil
 Additional flags:
 
 ```sh
-# Production build (minification, tree shaking, source maps, content hashes)
+# Production build (minification, source maps, content hashes, npm bundling)
 ngc-rs build --project tsconfig.app.json -c production
 
 # Development build (no optimizations, fast iteration)
@@ -120,7 +120,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 
 # All checks (CI runs this)
-cargo test --workspace && cargo clippy -- -D warnings && cargo fmt --check
+cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --check
 ```
 
 ## Roadmap
@@ -133,7 +133,7 @@ See the [GitHub milestones](https://github.com/lukekania/ngc-rs/milestones) for 
 - **v0.4** — Angular Template Compiler ✅ (Ivy codegen, pest parser)
 - **v0.5** — Build Output Completeness ✅ (angular.json, index.html, styles, assets, polyfills, fileReplacements)
 - **v0.6** — Code Splitting & Lazy Routes ✅ (dynamic import detection, chunk graph, multi-file output)
-- **v0.7** — Source Maps & Optimization ✅ (source maps, minification, tree shaking, content hashing)
+- **v0.7** — Source Maps & Optimization ✅ (source maps, minification, content hashing, npm bundling)
 - **v0.8** — Watch Mode & Dev Server
 - **v1.0** — Angular CLI Drop-in (swap one line in `angular.json`)
 

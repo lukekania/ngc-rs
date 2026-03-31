@@ -169,6 +169,15 @@ pub enum NgcError {
         /// Description of what went wrong.
         message: String,
     },
+
+    /// An npm package could not be resolved.
+    #[error("npm resolution error for {specifier}: {message}")]
+    NpmResolutionError {
+        /// The bare module specifier that failed to resolve.
+        specifier: String,
+        /// Description of what went wrong.
+        message: String,
+    },
 }
 
 /// A type alias for Results using NgcError.

@@ -1,0 +1,20 @@
+[package]
+name = "ngc-npm-resolver"
+description = "Node modules resolution for ngc-rs bundler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ngc-diagnostics = { path = "../diagnostics" }
+ngc-project-resolver = { path = "../project-resolver" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+regex = "1.12"
+tracing = "0.1"
+rayon = "1.11"
+
+[dev-dependencies]
+tempfile = "3"
