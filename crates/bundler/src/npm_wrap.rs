@@ -15,7 +15,7 @@
 //! })(__ns_abc123);
 //! ```
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use ngc_diagnostics::{NgcError, NgcResult};
@@ -59,6 +59,8 @@ where
 
     let mut edits: Vec<TextEdit> = Vec::new();
     let mut exported_names: Vec<String> = Vec::new();
+    // Renamed exports: maps exported name → local name for `export { X as Y }` patterns.
+    let mut renamed_exports: HashMap<String, String> = HashMap::new();
     let mut has_default_export = false;
 
     for stmt in &parsed.program.body {
@@ -149,9 +151,14 @@ where
                             replacement: None,
                         });
                     } else {
-                        // export { X, Y }; → collect names and remove
+                        // export { X, Y }; or export { X as Y }; → collect names and remove
                         for spec in &export.specifiers {
-                            exported_names.push(spec.exported.name().to_string());
+                            let exported = spec.exported.name().to_string();
+                            let local = spec.local.name().to_string();
+                            if exported != local {
+                                renamed_exports.insert(exported.clone(), local);
+                            }
+                            exported_names.push(exported);
                         }
                         edits.push(TextEdit {
                             start: export.span.start,
@@ -229,7 +236,9 @@ where
         if name == "default" {
             continue;
         }
-        export_lines.push_str(&format!("  __exports.{name} = {name};\n"));
+        // Use local name for renamed exports: export { getDefaulted as getActionCache }
+        let local_name = renamed_exports.get(name).unwrap_or(name);
+        export_lines.push_str(&format!("  __exports.{name} = {local_name};\n"));
     }
     if has_default_export {
         // For named default exports (export default function X / class X),
@@ -269,9 +278,10 @@ where
             if name == "default" {
                 continue;
             }
+            let local_name = renamed_exports.get(name).unwrap_or(name);
             // Use typeof check to avoid ReferenceError for names that might not exist
             ns_assignments.push_str(&format!(
-                "if (typeof {name} !== 'undefined') {namespace}.{name} = {name};\n"
+                "if (typeof {local_name} !== 'undefined') {namespace}.{name} = {local_name};\n"
             ));
         }
         return Ok(NpmModuleInfo {
