@@ -1150,33 +1150,59 @@ fn ctx_expr(expr: &str) -> String {
     let mut remove_ranges: Vec<(u32, u32)> = Vec::new();
     collect_ctx_rewrites(init_expr, &mut ctx_inserts, &mut remove_ranges, false);
 
-    // Map wrapper offsets back to expression offsets
+    // Map wrapper byte offsets back to expression byte offsets
     let expr_offset = "var __expr = ".len() as u32;
-    let mut result = trimmed.to_string();
 
-    // Apply removals first (sorted reverse)
-    let mut sorted_removes: Vec<(usize, usize)> = remove_ranges
-        .iter()
-        .map(|(s, e)| ((s - expr_offset) as usize, (e - expr_offset) as usize))
-        .collect();
-    sorted_removes.sort_by(|a, b| b.0.cmp(&a.0));
-    for (s, e) in &sorted_removes {
-        if *s <= result.len() && *e <= result.len() {
-            result.replace_range(*s..*e, "");
-        }
+    // Build a unified list of edits (all with byte offsets into `trimmed`)
+    // sorted by position descending so we can apply them back-to-front
+    // without invalidating earlier positions.
+    enum Edit {
+        Insert(usize),        // insert "ctx." at this byte offset
+        Remove(usize, usize), // remove bytes [start..end)
     }
 
-    // Apply ctx. insertions (sorted reverse)
-    let mut sorted_inserts: Vec<usize> = ctx_inserts
-        .iter()
-        .map(|off| (off - expr_offset) as usize)
-        .collect();
-    sorted_inserts.sort_unstable();
-    sorted_inserts.dedup();
-    sorted_inserts.reverse();
-    for off in &sorted_inserts {
-        if *off <= result.len() {
-            result.insert_str(*off, "ctx.");
+    let mut edits: Vec<(usize, Edit)> = Vec::new();
+
+    for off in &ctx_inserts {
+        let pos = (*off - expr_offset) as usize;
+        edits.push((pos, Edit::Insert(pos)));
+    }
+    for (s, e) in &remove_ranges {
+        let start = (*s - expr_offset) as usize;
+        let end = (*e - expr_offset) as usize;
+        edits.push((start, Edit::Remove(start, end)));
+    }
+
+    // Sort by position descending; removals before insertions at same position
+    edits.sort_by(|a, b| {
+        b.0.cmp(&a.0).then_with(|| {
+            // Removals first at same position
+            let a_is_remove = matches!(a.1, Edit::Remove(..));
+            let b_is_remove = matches!(b.1, Edit::Remove(..));
+            b_is_remove.cmp(&a_is_remove)
+        })
+    });
+
+    // Deduplicate insertions at the same position
+    edits.dedup_by(|a, b| matches!((&a.1, &b.1), (Edit::Insert(_), Edit::Insert(_))) && a.0 == b.0);
+
+    let mut result = trimmed.to_string();
+    for (_pos, edit) in &edits {
+        match edit {
+            Edit::Insert(off) => {
+                if *off <= result.len() && result.is_char_boundary(*off) {
+                    result.insert_str(*off, "ctx.");
+                }
+            }
+            Edit::Remove(s, e) => {
+                if *s <= result.len()
+                    && *e <= result.len()
+                    && result.is_char_boundary(*s)
+                    && result.is_char_boundary(*e)
+                {
+                    result.replace_range(*s..*e, "");
+                }
+            }
         }
     }
 
@@ -1530,6 +1556,17 @@ mod tests {
         assert_eq!(split_top_level_pipe("foo || bar"), None,);
         // Pipe inside parens is not top-level
         assert_eq!(split_top_level_pipe("x ? ('A' | translate) : 'B'"), None,);
+    }
+
+    #[test]
+    fn test_ctx_expr_multiple_non_null_assertions() {
+        // Reproduces the pattern that caused the char boundary panic:
+        // removing `!` shifts byte offsets for subsequent insertions
+        let result = ctx_expr("getBadgeClass(subscription()!.tier, subscription()!.status)");
+        assert!(result.contains("ctx.getBadgeClass"));
+        assert!(result.contains("ctx.subscription().tier"));
+        assert!(result.contains("ctx.subscription().status"));
+        assert!(!result.contains('!'));
     }
 
     #[test]
