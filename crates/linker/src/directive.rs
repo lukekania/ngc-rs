@@ -90,7 +90,9 @@ pub fn build_define_call(
         props.push("standalone: true".to_string());
     }
 
-    // Features
+    // Features — only emit features that exist in the Angular runtime.
+    // Note: ɵɵStandaloneFeature was removed in Angular 19+; standalone is now
+    // handled via the `standalone: true` property on the definition (emitted above).
     let mut features = Vec::new();
     if metadata::get_bool_prop(obj, "usesInheritance") == Some(true) {
         let feat = if ng_import.is_empty() {
@@ -105,16 +107,6 @@ pub fn build_define_call(
             "\u{0275}\u{0275}NgOnChangesFeature".to_string()
         } else {
             format!("{ng_import}.\u{0275}\u{0275}NgOnChangesFeature")
-        };
-        features.push(feat);
-    }
-    if metadata::get_bool_prop(obj, "isStandalone") == Some(true)
-        || metadata::get_bool_prop(obj, "standalone") == Some(true)
-    {
-        let feat = if ng_import.is_empty() {
-            "\u{0275}\u{0275}StandaloneFeature".to_string()
-        } else {
-            format!("{ng_import}.\u{0275}\u{0275}StandaloneFeature")
         };
         features.push(feat);
     }
