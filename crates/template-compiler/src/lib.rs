@@ -1,14 +1,21 @@
-//! Angular template compiler for ngc-rs.
+//! Angular Ivy compiler for ngc-rs.
 //!
-//! Compiles `@Component` templates to Angular Ivy instructions. Parses template
-//! HTML with pest, generates Ivy codegen (ɵɵdefineComponent, template function),
-//! and rewrites TypeScript source to replace the decorator with static Ivy metadata.
+//! AOT-compiles Angular decorators (`@Component`, `@Injectable`, `@Directive`,
+//! `@Pipe`, `@NgModule`) to Ivy static fields. Parses template HTML with pest,
+//! generates Ivy codegen, and rewrites TypeScript source to replace decorators
+//! with static Ivy metadata.
 
 mod ast;
 mod codegen;
+mod directive_codegen;
 mod extract;
+mod factory_codegen;
+mod injectable_codegen;
+mod ng_module_codegen;
 mod parser;
+mod pipe_codegen;
 mod rewrite;
+mod selector;
 
 use std::path::{Path, PathBuf};
 
@@ -180,15 +187,15 @@ pub struct CompiledFile {
     pub jit_fallback: bool,
 }
 
-/// Compile Angular component templates in the given TypeScript source files.
+/// Compile all Angular decorators in the given TypeScript source files.
 ///
-/// For each file that contains an `@Component` decorator with an inline `template`,
-/// parses the template, generates Ivy instructions, and rewrites the source to
-/// replace the decorator with static Ivy metadata. Files without `@Component`
-/// decorators are returned unchanged.
+/// Handles `@Component`, `@Injectable`, `@Directive`, `@Pipe`, and `@NgModule`.
+/// For each file, extracts Angular decorators, generates Ivy instructions, and
+/// rewrites the source to replace decorators with static Ivy metadata.
+/// Files without Angular decorators are returned unchanged.
 ///
 /// Files are processed in parallel using rayon.
-pub fn compile_templates(files: &[PathBuf]) -> NgcResult<Vec<CompiledFile>> {
+pub fn compile_all_decorators(files: &[PathBuf]) -> NgcResult<Vec<CompiledFile>> {
     let results: Vec<NgcResult<CompiledFile>> = files
         .par_iter()
         .map(|file_path| {
@@ -197,11 +204,89 @@ pub fn compile_templates(files: &[PathBuf]) -> NgcResult<Vec<CompiledFile>> {
                 source: e,
             })?;
 
-            compile_component(&source, file_path)
+            compile_file(&source, file_path)
         })
         .collect();
 
     results.into_iter().collect()
+}
+
+/// Backward-compatible alias for `compile_all_decorators`.
+pub fn compile_templates(files: &[PathBuf]) -> NgcResult<Vec<CompiledFile>> {
+    compile_all_decorators(files)
+}
+
+/// Compile a single TypeScript source file, handling all Angular decorator types.
+///
+/// Tries `@Component` first, then falls through to `@Injectable`, `@Directive`,
+/// `@Pipe`, and `@NgModule`. Returns the source unchanged if no Angular decorator
+/// is found.
+fn compile_file(source: &str, file_path: &Path) -> NgcResult<CompiledFile> {
+    // Try @Component first (most complex, has template compilation)
+    let component_result = compile_component(source, file_path)?;
+    if component_result.compiled || component_result.jit_fallback {
+        return Ok(component_result);
+    }
+
+    // Try @Injectable
+    if let Some(extracted) = extract::extract_injectable(source, file_path)? {
+        let ivy_output = injectable_codegen::generate_injectable_ivy(&extracted)?;
+        let rewritten = rewrite::rewrite_source_generic(source, &extracted.common, &ivy_output)?;
+        debug!(path = %file_path.display(), "compiled @Injectable to Ivy");
+        return Ok(CompiledFile {
+            source_path: file_path.to_path_buf(),
+            source: rewritten,
+            compiled: true,
+            jit_fallback: false,
+        });
+    }
+
+    // Try @Directive
+    if let Some(extracted) = extract::extract_directive(source, file_path)? {
+        let ivy_output = directive_codegen::generate_directive_ivy(&extracted)?;
+        let rewritten = rewrite::rewrite_source_generic(source, &extracted.common, &ivy_output)?;
+        debug!(path = %file_path.display(), "compiled @Directive to Ivy");
+        return Ok(CompiledFile {
+            source_path: file_path.to_path_buf(),
+            source: rewritten,
+            compiled: true,
+            jit_fallback: false,
+        });
+    }
+
+    // Try @Pipe
+    if let Some(extracted) = extract::extract_pipe(source, file_path)? {
+        let ivy_output = pipe_codegen::generate_pipe_ivy(&extracted)?;
+        let rewritten = rewrite::rewrite_source_generic(source, &extracted.common, &ivy_output)?;
+        debug!(path = %file_path.display(), "compiled @Pipe to Ivy");
+        return Ok(CompiledFile {
+            source_path: file_path.to_path_buf(),
+            source: rewritten,
+            compiled: true,
+            jit_fallback: false,
+        });
+    }
+
+    // Try @NgModule
+    if let Some(extracted) = extract::extract_ng_module(source, file_path)? {
+        let ivy_output = ng_module_codegen::generate_ng_module_ivy(&extracted)?;
+        let rewritten = rewrite::rewrite_source_generic(source, &extracted.common, &ivy_output)?;
+        debug!(path = %file_path.display(), "compiled @NgModule to Ivy");
+        return Ok(CompiledFile {
+            source_path: file_path.to_path_buf(),
+            source: rewritten,
+            compiled: true,
+            jit_fallback: false,
+        });
+    }
+
+    // No Angular decorator found
+    Ok(CompiledFile {
+        source_path: file_path.to_path_buf(),
+        source: source.to_string(),
+        compiled: false,
+        jit_fallback: false,
+    })
 }
 
 /// Compile a single TypeScript source string containing an Angular component.
@@ -301,5 +386,152 @@ mod tests {
             js.err(),
             result.source
         );
+    }
+
+    #[test]
+    fn test_injectable_roundtrip() {
+        let source = r#"import { Injectable } from '@angular/core';
+
+@Injectable({ providedIn: 'root' })
+export class AuthService {
+  isLoggedIn = false;
+}
+"#;
+        let path = PathBuf::from("auth.service.ts");
+        let result = compile_file(source, &path).expect("should compile");
+        assert!(result.compiled, "should be compiled");
+        assert!(result.source.contains("\u{0275}prov"));
+        assert!(result.source.contains("\u{0275}\u{0275}defineInjectable"));
+        assert!(!result.source.contains("@Injectable"));
+
+        let js = ngc_ts_transform::transform_source(&result.source, "auth.service.ts");
+        assert!(
+            js.is_ok(),
+            "oxc should parse compiled source: {:?}\n\nCompiled source:\n{}",
+            js.err(),
+            result.source
+        );
+    }
+
+    #[test]
+    fn test_injectable_with_deps_roundtrip() {
+        let source = r#"import { Injectable } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
+import { Router } from '@angular/router';
+
+@Injectable({ providedIn: 'root' })
+export class DataService {
+  constructor(private http: HttpClient, private router: Router) {}
+}
+"#;
+        let path = PathBuf::from("data.service.ts");
+        let result = compile_file(source, &path).expect("should compile");
+        assert!(result.compiled);
+        assert!(result.source.contains("\u{0275}\u{0275}inject(HttpClient)"));
+        assert!(result.source.contains("\u{0275}\u{0275}inject(Router)"));
+
+        let js = ngc_ts_transform::transform_source(&result.source, "data.service.ts");
+        assert!(
+            js.is_ok(),
+            "oxc should parse compiled source: {:?}\n\nCompiled source:\n{}",
+            js.err(),
+            result.source
+        );
+    }
+
+    #[test]
+    fn test_directive_roundtrip() {
+        let source = r#"import { Directive, ElementRef } from '@angular/core';
+
+@Directive({
+  selector: '[appHighlight]',
+  standalone: true
+})
+export class HighlightDirective {
+  constructor(private el: ElementRef) {}
+}
+"#;
+        let path = PathBuf::from("highlight.directive.ts");
+        let result = compile_file(source, &path).expect("should compile");
+        assert!(result.compiled);
+        assert!(result.source.contains("\u{0275}dir"));
+        assert!(result.source.contains("\u{0275}\u{0275}defineDirective"));
+        assert!(result.source.contains("\u{0275}\u{0275}inject(ElementRef)"));
+        assert!(!result.source.contains("@Directive"));
+
+        let js = ngc_ts_transform::transform_source(&result.source, "highlight.directive.ts");
+        assert!(
+            js.is_ok(),
+            "oxc should parse compiled source: {:?}\n\nCompiled source:\n{}",
+            js.err(),
+            result.source
+        );
+    }
+
+    #[test]
+    fn test_pipe_roundtrip() {
+        let source = r#"import { Pipe, PipeTransform } from '@angular/core';
+
+@Pipe({
+  name: 'dateFormat',
+  standalone: true
+})
+export class DateFormatPipe implements PipeTransform {
+  transform(value: any): string { return ''; }
+}
+"#;
+        let path = PathBuf::from("date-format.pipe.ts");
+        let result = compile_file(source, &path).expect("should compile");
+        assert!(result.compiled);
+        assert!(result.source.contains("\u{0275}pipe"));
+        assert!(result.source.contains("\u{0275}\u{0275}definePipe"));
+        assert!(result.source.contains("name: 'dateFormat'"));
+        assert!(!result.source.contains("@Pipe"));
+
+        let js = ngc_ts_transform::transform_source(&result.source, "date-format.pipe.ts");
+        assert!(
+            js.is_ok(),
+            "oxc should parse compiled source: {:?}\n\nCompiled source:\n{}",
+            js.err(),
+            result.source
+        );
+    }
+
+    #[test]
+    fn test_ng_module_roundtrip() {
+        let source = r#"import { NgModule } from '@angular/core';
+
+@NgModule({
+  declarations: [AppComponent],
+  imports: [CommonModule],
+  bootstrap: [AppComponent]
+})
+export class AppModule {}
+"#;
+        let path = PathBuf::from("app.module.ts");
+        let result = compile_file(source, &path).expect("should compile");
+        assert!(result.compiled);
+        assert!(result.source.contains("\u{0275}mod"));
+        assert!(result.source.contains("\u{0275}inj"));
+        assert!(result.source.contains("\u{0275}\u{0275}defineNgModule"));
+        assert!(result.source.contains("\u{0275}\u{0275}defineInjector"));
+        assert!(!result.source.contains("@NgModule"));
+
+        let js = ngc_ts_transform::transform_source(&result.source, "app.module.ts");
+        assert!(
+            js.is_ok(),
+            "oxc should parse compiled source: {:?}\n\nCompiled source:\n{}",
+            js.err(),
+            result.source
+        );
+    }
+
+    #[test]
+    fn test_plain_class_unchanged() {
+        let source = "export class PlainClass { x = 1; }\n";
+        let path = PathBuf::from("plain.ts");
+        let result = compile_file(source, &path).expect("should compile");
+        assert!(!result.compiled);
+        assert_eq!(result.source, source);
     }
 }

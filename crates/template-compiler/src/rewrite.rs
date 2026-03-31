@@ -1,7 +1,7 @@
 use ngc_diagnostics::{NgcError, NgcResult};
 
 use crate::codegen::IvyOutput;
-use crate::extract::ExtractedComponent;
+use crate::extract::{DecoratorCommon, ExtractedComponent};
 
 /// Rewrite a TypeScript source string to replace the `@Component` decorator
 /// with Ivy static metadata.
@@ -14,9 +14,28 @@ pub fn rewrite_source(
     component: &ExtractedComponent,
     ivy_output: &IvyOutput,
 ) -> NgcResult<String> {
-    let decorator_start = component.decorator_span.0 as usize;
-    let decorator_end = component.decorator_span.1 as usize;
-    let class_body_start = component.class_body_start as usize;
+    let common = DecoratorCommon {
+        decorator_span: component.decorator_span,
+        class_body_start: component.class_body_start,
+        angular_core_import_span: component.angular_core_import_span,
+        other_angular_core_imports: component.other_angular_core_imports.clone(),
+    };
+    rewrite_source_generic(source, &common, ivy_output)
+}
+
+/// Rewrite a TypeScript source string to replace any Angular decorator with
+/// Ivy static metadata.
+///
+/// Generic version that accepts `DecoratorCommon` fields, usable for all
+/// Angular decorator types (`@Component`, `@Injectable`, `@Directive`, etc.).
+pub fn rewrite_source_generic(
+    source: &str,
+    common: &DecoratorCommon,
+    ivy_output: &IvyOutput,
+) -> NgcResult<String> {
+    let decorator_start = common.decorator_span.0 as usize;
+    let decorator_end = common.decorator_span.1 as usize;
+    let class_body_start = common.class_body_start as usize;
 
     // Validate spans
     if decorator_end > source.len() || class_body_start >= source.len() {
@@ -39,7 +58,7 @@ pub fn rewrite_source(
 
     // Build the new @angular/core import line
     let mut ivy_symbols: Vec<&str> = ivy_output.ivy_imports.iter().map(|s| s.as_str()).collect();
-    for imp in &component.other_angular_core_imports {
+    for imp in &common.other_angular_core_imports {
         if !ivy_symbols.contains(&imp.as_str()) {
             ivy_symbols.push(imp);
         }
@@ -59,7 +78,7 @@ pub fn rewrite_source(
     }
 
     // Segment A+B: everything before the decorator, with import rewriting
-    if let Some((import_start, import_end)) = component.angular_core_import_span {
+    if let Some((import_start, import_end)) = common.angular_core_import_span {
         let import_start = import_start as usize;
         let import_end = import_end as usize;
         result.push_str(&source[..import_start]);
