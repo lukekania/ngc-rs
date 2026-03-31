@@ -81,14 +81,23 @@ pub fn transform(
 
     // Template compilation
     if let Some(template_str) = metadata::get_string_prop(obj, "template") {
-        match compile_template(&template_str, &type_name, file_path) {
-            Ok((template_fn, decls, vars, child_fns)) => {
-                props.push(format!("decls: {decls}"));
-                props.push(format!("vars: {vars}"));
-                props.push(format!("template: {template_fn}"));
-                // Child template functions are prepended before the defineComponent call
-                // For now, we embed them in the template function directly
-                let _ = child_fns; // handled within template_fn already
+        let template_ok = match compile_template(&template_str, &type_name, file_path) {
+            Ok((template_fn, decls, vars, _child_fns)) => {
+                // Validate that the compiled template is valid JavaScript
+                // (the template parser may "succeed" on unsupported syntax like @let
+                // but produce output with literal newlines inside string literals)
+                if is_valid_js_function(&template_fn) {
+                    props.push(format!("decls: {decls}"));
+                    props.push(format!("vars: {vars}"));
+                    props.push(format!("template: {template_fn}"));
+                    true
+                } else {
+                    tracing::warn!(
+                        path = %file_path.display(),
+                        "compiled template produced invalid JS, using empty template"
+                    );
+                    false
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -96,13 +105,15 @@ pub fn transform(
                     error = %e,
                     "template compilation failed for npm component, using empty template"
                 );
-                // Fallback: empty template
-                props.push("decls: 0".to_string());
-                props.push("vars: 0".to_string());
-                props.push(format!(
-                    "template: function {type_name}_Template(rf, ctx) {{}}"
-                ));
+                false
             }
+        };
+        if !template_ok {
+            props.push("decls: 0".to_string());
+            props.push("vars: 0".to_string());
+            props.push(format!(
+                "template: function {type_name}_Template(rf, ctx) {{}}"
+            ));
         }
     } else {
         // No template — empty
@@ -149,6 +160,18 @@ pub fn transform(
     }
 
     Ok(format!("{define_fn}({{ {} }})", props.join(", ")))
+}
+
+/// Validate that a generated template function is valid JavaScript.
+///
+/// The template parser may produce output with unsupported Angular syntax
+/// (like `@let`) treated as raw text, resulting in multi-line string literals
+/// which are invalid JS.
+fn is_valid_js_function(code: &str) -> bool {
+    let wrapped = format!("var x = {code};");
+    let alloc = oxc_allocator::Allocator::default();
+    let parsed = oxc_parser::Parser::new(&alloc, &wrapped, oxc_span::SourceType::mjs()).parse();
+    parsed.errors.is_empty()
 }
 
 /// Compile a template string into a template function using the template compiler.
