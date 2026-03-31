@@ -65,6 +65,7 @@ pub fn rewrite_module(
         dynamic_import_rewrites,
         None,
         &HashSet::new(),
+        &HashMap::new(),
     )
 }
 
@@ -79,6 +80,7 @@ pub fn rewrite_module_with_shaking(
     dynamic_import_rewrites: &HashMap<String, String>,
     unused_exports: Option<&HashSet<String>>,
     bundled_specifiers: &HashSet<String>,
+    namespace_map: &HashMap<String, String>,
 ) -> NgcResult<RewrittenModule> {
     let allocator = Allocator::new();
     let source_type = SourceType::mjs();
@@ -104,6 +106,7 @@ pub fn rewrite_module_with_shaking(
                 &mut external_imports,
                 unused_exports,
                 bundled_specifiers,
+                namespace_map,
             );
         }
 
@@ -133,16 +136,59 @@ fn collect_module_decl_edits(
     external_imports: &mut Vec<ExternalImport>,
     unused_exports: Option<&HashSet<String>>,
     bundled_specifiers: &HashSet<String>,
+    namespace_map: &HashMap<String, String>,
 ) {
     match module_decl {
         ModuleDeclaration::ImportDeclaration(import) => {
             let source = import.source.value.as_str();
             if is_local(source, local_prefixes, bundled_specifiers) {
-                edits.push(TextEdit {
-                    start: import.span.start,
-                    end: import.span.end,
-                    replacement: None,
-                });
+                // Check if this import has a namespace mapping (npm module)
+                if let Some(ns) = namespace_map.get(source) {
+                    // Replace import with namespace lookups
+                    let mut replacements = Vec::new();
+                    if let Some(specifiers) = &import.specifiers {
+                        for spec in specifiers {
+                            match spec {
+                                oxc_ast::ast::ImportDeclarationSpecifier::ImportSpecifier(s) => {
+                                    let imported = s.imported.name();
+                                    let local = &s.local.name;
+                                    replacements
+                                        .push(format!("var {local} = {ns}.{imported};"));
+                                }
+                                oxc_ast::ast::ImportDeclarationSpecifier::ImportDefaultSpecifier(
+                                    s,
+                                ) => {
+                                    let local = &s.local.name;
+                                    replacements
+                                        .push(format!("var {local} = {ns}.default;"));
+                                }
+                                oxc_ast::ast::ImportDeclarationSpecifier::ImportNamespaceSpecifier(
+                                    s,
+                                ) => {
+                                    let local = &s.local.name;
+                                    replacements.push(format!("var {local} = {ns};"));
+                                }
+                            }
+                        }
+                    }
+                    let replacement = if replacements.is_empty() {
+                        None
+                    } else {
+                        Some(replacements.join("\n"))
+                    };
+                    edits.push(TextEdit {
+                        start: import.span.start,
+                        end: import.span.end,
+                        replacement,
+                    });
+                } else {
+                    // Regular local import — strip entirely
+                    edits.push(TextEdit {
+                        start: import.span.start,
+                        end: import.span.end,
+                        replacement: None,
+                    });
+                }
             } else {
                 let mut named = BTreeSet::new();
                 let mut default = None;

@@ -255,6 +255,49 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<(String, Option<SourceMa
     let mut all_externals: Vec<ExternalImport> = Vec::new();
     let mut sections: Vec<ModuleSection> = Vec::new();
 
+    // Build namespace map: npm file path → namespace variable name
+    // and specifier → namespace for project code imports
+    let node_modules_dir = p.root_dir.join("node_modules");
+    let mut file_to_namespace: HashMap<PathBuf, String> = HashMap::new();
+    let mut specifier_to_namespace: HashMap<String, String> = HashMap::new();
+
+    // First pass: assign namespaces to all npm modules in this chunk
+    for module_path in p.module_paths {
+        let is_npm = module_path
+            .components()
+            .any(|c| c.as_os_str() == "node_modules");
+        if is_npm {
+            let ns = crate::npm_wrap::namespace_from_path(module_path, &node_modules_dir);
+            debug!(path = %module_path.display(), namespace = %ns, "assigned npm namespace");
+            file_to_namespace.insert(module_path.clone(), ns);
+        }
+    }
+    debug!(
+        npm_module_count = file_to_namespace.len(),
+        total_modules = p.module_paths.len(),
+        "npm namespace assignment complete"
+    );
+
+    // Build specifier → namespace mapping for project code
+    // Map each bare specifier to the namespace of its resolved entry file
+    for spec in p.bundled_specifiers.iter() {
+        // Find the npm entry file for this specifier by checking which file path
+        // in the graph matches this specifier
+        for (path, ns) in &file_to_namespace {
+            let path_str = path.to_string_lossy();
+            // Match bare specifiers to their entry files
+            let (pkg_name, _) = crate::npm_wrap::split_package_name(spec);
+            if path_str.contains(&pkg_name.replace('/', std::path::MAIN_SEPARATOR_STR)) {
+                // Check if this is likely the entry point (not an internal file)
+                // by seeing if the specifier resolves to this exact file
+                specifier_to_namespace
+                    .entry(spec.clone())
+                    .or_insert_with(|| ns.clone());
+            }
+        }
+    }
+
+    // Process each module
     for module_path in p.module_paths {
         let js_code = p
             .all_modules
@@ -266,40 +309,88 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<(String, Option<SourceMa
                 ),
             })?;
 
+        let is_npm = file_to_namespace.contains_key(module_path);
         let file_name = module_path.to_string_lossy();
-        let module_unused = p.unused_exports.get(module_path);
 
-        // If ALL exports are unused and the module is in the unused map, skip it entirely
-        let rewritten = rewrite::rewrite_module_with_shaking(
-            js_code,
-            &file_name,
-            p.prefix_refs,
-            p.specifier_rewrites,
-            module_unused,
-            p.bundled_specifiers,
-        )?;
+        if is_npm {
+            // NPM module: wrap in IIFE with namespace isolation
+            let namespace = &file_to_namespace[module_path];
+            let ft_ns = file_to_namespace.clone();
 
-        all_externals.extend(rewritten.external_imports);
+            let wrapped =
+                crate::npm_wrap::wrap_npm_module(js_code, &file_name, namespace, |specifier| {
+                    // Resolve import specifier to target namespace
+                    if specifier.starts_with('.') {
+                        // Relative import within npm — resolve to a file path
+                        let from_dir = module_path.parent()?;
+                        let target = from_dir.join(specifier);
+                        // Try exact, then with extensions
+                        for candidate in &[
+                            target.clone(),
+                            target.with_extension("mjs"),
+                            target.with_extension("js"),
+                            target.join("index.mjs"),
+                            target.join("index.js"),
+                        ] {
+                            let canonical = candidate.canonicalize().ok()?;
+                            if let Some(ns) = ft_ns.get(&canonical) {
+                                return Some(ns.clone());
+                            }
+                        }
+                        None
+                    } else {
+                        // Bare specifier — look up in specifier map
+                        specifier_to_namespace.get(specifier).cloned()
+                    }
+                })?;
 
-        let trimmed = rewritten.code.trim();
-        if !trimmed.is_empty() {
-            let relative = module_path.strip_prefix(p.root_dir).unwrap_or(module_path);
-            let display_path = relative.with_extension("js");
-            let section_code = format!("// {}\n{}", display_path.display(), trimmed);
-            let line_count = section_code.chars().filter(|&c| c == '\n').count() as u32 + 1;
-            sections.push(ModuleSection {
-                code: section_code,
-                line_count,
-                source_path: module_path.clone(),
-            });
+            // Collect external imports from unresolvable bare specifiers in npm code
+            // (these become hoisted imports at the top of the bundle)
+            // For now, npm modules' external imports are handled by wrap_npm_module
+            // which strips them.
+
+            let code = &wrapped.wrapped_code;
+            let trimmed = code.trim();
+            if !trimmed.is_empty() {
+                let relative = module_path.strip_prefix(p.root_dir).unwrap_or(module_path);
+                let display_path = relative.with_extension("js");
+                let section_code = format!("// {}\n{}", display_path.display(), trimmed);
+                let line_count = section_code.chars().filter(|&c| c == '\n').count() as u32 + 1;
+                sections.push(ModuleSection {
+                    code: section_code,
+                    line_count,
+                    source_path: module_path.clone(),
+                });
+            }
+        } else {
+            // Project module: use existing rewriter with namespace map
+            let module_unused = p.unused_exports.get(module_path);
+            let rewritten = rewrite::rewrite_module_with_shaking(
+                js_code,
+                &file_name,
+                p.prefix_refs,
+                p.specifier_rewrites,
+                module_unused,
+                p.bundled_specifiers,
+                &specifier_to_namespace,
+            )?;
+
+            all_externals.extend(rewritten.external_imports);
+
+            let trimmed = rewritten.code.trim();
+            if !trimmed.is_empty() {
+                let relative = module_path.strip_prefix(p.root_dir).unwrap_or(module_path);
+                let display_path = relative.with_extension("js");
+                let section_code = format!("// {}\n{}", display_path.display(), trimmed);
+                let line_count = section_code.chars().filter(|&c| c == '\n').count() as u32 + 1;
+                sections.push(ModuleSection {
+                    code: section_code,
+                    line_count,
+                    source_path: module_path.clone(),
+                });
+            }
         }
     }
-
-    // Deduplicate top-level names across npm modules to prevent shadowing errors.
-    // When two npm modules define the same top-level name (e.g. `function zip()`),
-    // we rename the later one by appending a numeric suffix and update all
-    // references within that module section.
-    deduplicate_section_names(&mut sections);
 
     let mut merged = merge_external_imports(all_externals);
     deduplicate_import_names(&mut merged);
@@ -361,65 +452,6 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<(String, Option<SourceMa
     };
 
     Ok((output, combined_map))
-}
-
-/// Deduplicate top-level declaration names across module sections.
-///
-/// When multiple modules define the same top-level name (e.g., two npm packages
-/// both define `function zip()`), this renames later occurrences by appending
-/// a numeric suffix (`zip` → `zip$2`) and updates all references within that
-/// module section.
-fn deduplicate_section_names(sections: &mut [ModuleSection]) {
-    let mut seen_names: HashMap<String, usize> = HashMap::new();
-
-    // Regex for top-level declarations: function, var, let, const, class
-    let decl_re =
-        regex::Regex::new(r"(?m)^(?:function|var|let|const|class)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)")
-            .expect("valid regex");
-
-    for section in sections.iter_mut() {
-        // Only check npm modules (node_modules paths) for collisions
-        let is_npm = section
-            .source_path
-            .components()
-            .any(|c| c.as_os_str() == "node_modules");
-        if !is_npm {
-            // Still register project-level names so they're tracked
-            for cap in decl_re.captures_iter(&section.code) {
-                let name = cap[1].to_string();
-                seen_names.entry(name).or_insert(0);
-            }
-            continue;
-        }
-
-        // Collect names declared in this section
-        let names_in_section: Vec<String> = decl_re
-            .captures_iter(&section.code)
-            .map(|cap| cap[1].to_string())
-            .collect();
-
-        // Find collisions and build rename map
-        let mut renames: Vec<(String, String)> = Vec::new();
-        for name in &names_in_section {
-            let count = seen_names.entry(name.clone()).or_insert(0);
-            *count += 1;
-            if *count > 1 {
-                let new_name = format!("{name}${}", count);
-                renames.push((name.clone(), new_name));
-            }
-        }
-
-        // Apply renames to this section's code (whole-word replacement)
-        for (old_name, new_name) in &renames {
-            tracing::debug!(old = old_name, new = new_name, path = %section.source_path.display(), "renaming duplicate declaration");
-            // Use word boundary replacement to avoid partial matches
-            let word_re = regex::Regex::new(&format!(r"\b{}\b", regex::escape(old_name)))
-                .expect("valid regex");
-            let replacement = regex::NoExpand(new_name.as_str());
-            section.code = word_re.replace_all(&section.code, replacement).to_string();
-            section.line_count = section.code.chars().filter(|&c| c == '\n').count() as u32 + 1;
-        }
-    }
 }
 
 /// Compute a truncated SHA-256 content hash (8 hex characters).
