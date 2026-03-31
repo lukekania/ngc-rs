@@ -494,12 +494,7 @@ impl IvyCodegen {
         self.slot_index += 1;
         self.ivy_imports.insert("\u{0275}\u{0275}text".to_string());
 
-        let escaped = text
-            .value
-            .replace('\\', "\\\\")
-            .replace('\'', "\\'")
-            .replace('\n', "\\n")
-            .replace('\r', "\\r");
+        let escaped = escape_js_string(&text.value);
         self.creation
             .push(format!("\u{0275}\u{0275}text({slot}, '{escaped}');"));
     }
@@ -1385,9 +1380,22 @@ fn build_conditional_expr(
 fn format_static_attrs(attrs: &[(&str, &str)]) -> String {
     let pairs: Vec<String> = attrs
         .iter()
-        .flat_map(|(k, v)| vec![format!("'{k}'"), format!("'{v}'")])
+        .flat_map(|(k, v)| {
+            vec![
+                format!("'{}'", escape_js_string(k)),
+                format!("'{}'", escape_js_string(v)),
+            ]
+        })
         .collect();
     format!("[{}]", pairs.join(", "))
+}
+
+/// Escape a string for use inside a single-quoted JavaScript string literal.
+fn escape_js_string(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 #[cfg(test)]
