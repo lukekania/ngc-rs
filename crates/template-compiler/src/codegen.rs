@@ -56,10 +56,6 @@ pub fn generate_ivy(
 
     gen.ivy_imports
         .insert("\u{0275}\u{0275}defineComponent".to_string());
-    if component.standalone {
-        gen.ivy_imports
-            .insert("\u{0275}\u{0275}StandaloneFeature".to_string());
-    }
 
     gen.generate_nodes(template_nodes);
 
@@ -100,7 +96,6 @@ pub fn generate_ivy(
     dc.push_str(&format!("    selectors: [['{}']],\n", component.selector));
     if component.standalone {
         dc.push_str("    standalone: true,\n");
-        dc.push_str("    features: [\u{0275}\u{0275}StandaloneFeature],\n");
     }
     dc.push_str(&format!("    decls: {decls},\n"));
     dc.push_str(&format!("    vars: {vars},\n"));
