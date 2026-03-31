@@ -138,8 +138,8 @@ fn resolve_condition(value: &serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::String(s) => Some(s.clone()),
         serde_json::Value::Object(map) => {
-            // Prefer "default" condition (ESM), then "import", then "require"
-            for key in &["default", "import", "require"] {
+            // Prefer "module" (bundler ESM), then "import" (ESM), then "default"
+            for key in &["module", "import", "default", "require"] {
                 if let Some(val) = map.get(*key) {
                     if let Some(resolved) = resolve_condition(val) {
                         // Skip .d.ts files
