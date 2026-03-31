@@ -119,13 +119,11 @@ mod tests {
 
         // Navigate to the object expression
         if let oxc_ast::ast::Statement::VariableDeclaration(decl) = &program.body[0] {
-            if let Some(init) = &decl.declarations[0].init {
-                if let Expression::ObjectExpression(obj) = init {
-                    assert_eq!(get_string_prop(obj, "name"), Some("hello".to_string()));
-                    assert_eq!(get_string_prop(obj, "count"), None); // not a string
-                    assert_eq!(get_string_prop(obj, "missing"), None);
-                    return;
-                }
+            if let Some(Expression::ObjectExpression(obj)) = &decl.declarations[0].init {
+                assert_eq!(get_string_prop(obj, "name"), Some("hello".to_string()));
+                assert_eq!(get_string_prop(obj, "count"), None); // not a string
+                assert_eq!(get_string_prop(obj, "missing"), None);
+                return;
             }
         }
         panic!("failed to parse test object");
@@ -139,12 +137,10 @@ mod tests {
         let program = parsed.program;
 
         if let oxc_ast::ast::Statement::VariableDeclaration(decl) = &program.body[0] {
-            if let Some(init) = &decl.declarations[0].init {
-                if let Expression::ObjectExpression(obj) = init {
-                    assert_eq!(get_source_text(obj, "deps", code), Some("[a, b, c]"));
-                    assert_eq!(get_source_text(obj, "name", code), Some("'test'"));
-                    return;
-                }
+            if let Some(Expression::ObjectExpression(obj)) = &decl.declarations[0].init {
+                assert_eq!(get_source_text(obj, "deps", code), Some("[a, b, c]"));
+                assert_eq!(get_source_text(obj, "name", code), Some("'test'"));
+                return;
             }
         }
         panic!("failed to parse test object");
@@ -158,13 +154,11 @@ mod tests {
         let program = parsed.program;
 
         if let oxc_ast::ast::Statement::VariableDeclaration(decl) = &program.body[0] {
-            if let Some(init) = &decl.declarations[0].init {
-                if let Expression::ObjectExpression(obj) = init {
-                    assert_eq!(get_bool_prop(obj, "standalone"), Some(true));
-                    assert_eq!(get_bool_prop(obj, "pure"), Some(false));
-                    assert_eq!(get_bool_prop(obj, "missing"), None);
-                    return;
-                }
+            if let Some(Expression::ObjectExpression(obj)) = &decl.declarations[0].init {
+                assert_eq!(get_bool_prop(obj, "standalone"), Some(true));
+                assert_eq!(get_bool_prop(obj, "pure"), Some(false));
+                assert_eq!(get_bool_prop(obj, "missing"), None);
+                return;
             }
         }
         panic!("failed to parse test object");
@@ -178,15 +172,13 @@ mod tests {
         let program = parsed.program;
 
         if let oxc_ast::ast::Statement::VariableDeclaration(decl) = &program.body[0] {
-            if let Some(init) = &decl.declarations[0].init {
-                if let Expression::ObjectExpression(obj) = init {
-                    assert_eq!(
-                        get_identifier_prop(obj, "type"),
-                        Some("MyService".to_string())
-                    );
-                    assert_eq!(get_identifier_prop(obj, "name"), None); // string, not ident
-                    return;
-                }
+            if let Some(Expression::ObjectExpression(obj)) = &decl.declarations[0].init {
+                assert_eq!(
+                    get_identifier_prop(obj, "type"),
+                    Some("MyService".to_string())
+                );
+                assert_eq!(get_identifier_prop(obj, "name"), None); // string, not ident
+                return;
             }
         }
         panic!("failed to parse test object");
