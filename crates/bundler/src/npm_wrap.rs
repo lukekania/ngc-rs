@@ -253,14 +253,28 @@ where
     let allocator2 = Allocator::new();
     let check = Parser::new(&allocator2, &wrapped, SourceType::mjs()).parse();
     if check.panicked || !check.errors.is_empty() {
-        // IIFE wrapping produced invalid JS — fall back to raw code with export stripping only
+        // IIFE wrapping produced invalid JS — fall back to flat code with namespace population.
+        // We still create the namespace variable and assign exports to it so other
+        // IIFE-wrapped modules can reference this module's symbols via __ns_xxx.name.
         tracing::warn!(
             file_name,
-            "IIFE wrapping produced parse errors, falling back to flat inclusion"
+            "IIFE wrapping produced parse errors, falling back to flat inclusion with namespace"
         );
-        let fallback_code = strip_exports_simple(js_code);
+        let flat_code = strip_exports_simple(js_code);
+        let mut ns_assignments = format!("var {namespace} = {{}};\n");
+        ns_assignments.push_str(&flat_code);
+        ns_assignments.push('\n');
+        for name in &unique_exports {
+            if name == "default" {
+                continue;
+            }
+            // Use typeof check to avoid ReferenceError for names that might not exist
+            ns_assignments.push_str(&format!(
+                "if (typeof {name} !== 'undefined') {namespace}.{name} = {name};\n"
+            ));
+        }
         return Ok(NpmModuleInfo {
-            wrapped_code: fallback_code,
+            wrapped_code: ns_assignments,
             exported_names: unique_exports.into_iter().collect(),
         });
     }
