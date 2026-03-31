@@ -60,10 +60,11 @@ pub fn resolve_npm_dependencies(
     for spec in specifiers {
         match resolve::resolve_bare_specifier(spec, project_root) {
             Ok(entry_path) => {
+                let canonical = entry_path.canonicalize().unwrap_or(entry_path);
                 resolved_specifiers.insert(spec.clone());
-                specifier_to_entry.insert(spec.clone(), entry_path.clone());
-                if visited.insert(entry_path.clone()) {
-                    queue.push_back(entry_path);
+                specifier_to_entry.insert(spec.clone(), canonical.clone());
+                if visited.insert(canonical.clone()) {
+                    queue.push_back(canonical);
                 }
             }
             Err(e) => {
@@ -114,14 +115,17 @@ pub fn resolve_npm_dependencies(
             };
 
             if let Some(target_path) = resolved {
-                edges.push((file_path.clone(), target_path.clone(), kind));
-                if visited.insert(target_path.clone()) {
-                    queue.push_back(target_path);
+                // Canonicalize to avoid duplicate entries from different relative paths
+                // (e.g. "../Subscription.js" vs "../observable/../Subscription.js")
+                let canonical = target_path.canonicalize().unwrap_or(target_path);
+                edges.push((file_path.clone(), canonical.clone(), kind));
+                if visited.insert(canonical.clone()) {
+                    queue.push_back(canonical);
                 }
             }
         }
 
-        modules.insert(file_path, source);
+        modules.insert(file_path.clone(), source);
     }
 
     debug!(
