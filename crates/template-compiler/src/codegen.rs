@@ -113,13 +113,14 @@ pub fn generate_ivy(
     dc.push_str("    }");
 
     // For standalone components, use getComponentDepsFactory to resolve NgModule imports
-    // to their exported directives/pipes at runtime. This matches what Angular's AOT compiler does.
+    // to their exported directives/pipes at runtime via the depsTracker.
+    // rawImports must be the direct array, not wrapped in a function.
     if let Some(ref imports_src) = component.imports_source {
         if component.standalone {
             gen.ivy_imports
                 .insert("\u{0275}\u{0275}getComponentDepsFactory".to_string());
             dc.push_str(&format!(
-                ",\n    dependencies: \u{0275}\u{0275}getComponentDepsFactory({}, () => {imports_src})",
+                ",\n    dependencies: \u{0275}\u{0275}getComponentDepsFactory({}, {imports_src})",
                 component.class_name
             ));
         } else {
