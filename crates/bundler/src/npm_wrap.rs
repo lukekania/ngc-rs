@@ -223,14 +223,23 @@ where
     let mut export_lines = String::new();
     let unique_exports: BTreeSet<String> = exported_names.iter().cloned().collect();
     for name in &unique_exports {
+        // Skip "default" — it's a reserved word and can't be used as an identifier.
+        // Default exports are handled inline (expression → __exports.default = expr)
+        // or via the named function/class assignment below.
+        if name == "default" {
+            continue;
+        }
         export_lines.push_str(&format!("  __exports.{name} = {name};\n"));
     }
     if has_default_export {
-        // If there's a named default export function/class, also assign it
-        // (the unnamed expression case is handled inline above)
-        if let Some(name) = exported_names.first() {
-            if !export_lines.contains("__exports.default =") {
-                export_lines.push_str(&format!("  __exports.default = {name};\n"));
+        // For named default exports (export default function X / class X),
+        // assign the named identifier to __exports.default
+        for name in &exported_names {
+            if name != "default" {
+                if !export_lines.contains("__exports.default =") {
+                    export_lines.push_str(&format!("  __exports.default = {name};\n"));
+                }
+                break;
             }
         }
     }
