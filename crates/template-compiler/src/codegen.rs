@@ -268,9 +268,10 @@ impl IvyCodegen {
                     TemplateAttribute::Event { name, handler } => {
                         self.ivy_imports
                             .insert("\u{0275}\u{0275}listener".to_string());
+                        let compiled_handler = compile_event_handler(handler);
                         self.creation.push(format!(
-                            "\u{0275}\u{0275}listener('{}', function() {{ return ctx.{}; }});",
-                            name, handler
+                            "\u{0275}\u{0275}listener('{}', function($event) {{ {compiled_handler} }});",
+                            name,
                         ));
                     }
                     TemplateAttribute::TwoWayBinding { name, expression } => {
@@ -510,9 +511,9 @@ impl IvyCodegen {
 
         self.creation.push(format!("\u{0275}\u{0275}text({slot});"));
 
-        // Build the expression with pipe wrapping
+        // Build the expression with pipe wrapping and nested pipe compilation
         let expr = if interp.pipes.is_empty() {
-            ctx_expr(&interp.expression)
+            self.compile_binding_expr(&interp.expression)
         } else {
             self.wrap_with_pipes(&interp.expression, &interp.pipes)
         };
@@ -809,7 +810,7 @@ impl IvyCodegen {
     }
 
     fn wrap_with_pipes(&mut self, base_expr: &str, pipes: &[PipeCall]) -> String {
-        let mut expr = ctx_expr(base_expr);
+        let mut expr = self.compile_binding_expr(base_expr);
         for pipe in pipes {
             let pipe_slot = self.slot_index;
             self.slot_index += 1;
@@ -846,7 +847,7 @@ impl IvyCodegen {
     /// expression, compiles each to a `ɵɵpipeBind*` call, and applies `ctx.` prefixes.
     fn compile_binding_expr(&mut self, expression: &str) -> String {
         let segments = extract_all_pipe_segments(expression);
-        if segments.len() <= 1 {
+        if segments.is_empty() {
             // No pipes found — just compile with ctx. prefix
             return ctx_expr(expression);
         }
@@ -862,22 +863,33 @@ impl IvyCodegen {
     fn replace_pipes_in_expr(&mut self, expression: &str) -> String {
         let trimmed = expression.trim();
 
-        // Check for top-level pipe: `baseExpr | pipeName`
-        if let Some((base, pipe_name)) = split_top_level_pipe(trimmed) {
+        // Check for top-level pipe: `baseExpr | pipeName : arg1 : arg2`
+        if let Some((base, pipe_name, args)) = split_top_level_pipe_with_args(trimmed) {
             let compiled_base = self.replace_pipes_in_expr(&base);
             let pipe_slot = self.slot_index;
             self.slot_index += 1;
-            self.var_count += 1;
+            self.var_count += 1 + args.len() as u32;
             self.ivy_imports.insert("\u{0275}\u{0275}pipe".to_string());
-            self.ivy_imports
-                .insert("\u{0275}\u{0275}pipeBind1".to_string());
+
+            let bind_fn = match args.len() {
+                0 => "\u{0275}\u{0275}pipeBind1",
+                1 => "\u{0275}\u{0275}pipeBind2",
+                2 => "\u{0275}\u{0275}pipeBind3",
+                _ => "\u{0275}\u{0275}pipeBindV",
+            };
+            self.ivy_imports.insert(bind_fn.to_string());
             self.creation.push(format!(
                 "\u{0275}\u{0275}pipe({pipe_slot}, '{}');",
                 pipe_name
             ));
             let pipe_var_slot = self.var_count;
+            if args.is_empty() {
+                return format!("{bind_fn}({pipe_slot}, {pipe_var_slot}, {compiled_base})");
+            }
+            let compiled_args: Vec<String> = args.iter().map(|a| ctx_expr(a)).collect();
             return format!(
-                "\u{0275}\u{0275}pipeBind1({pipe_slot}, {pipe_var_slot}, {compiled_base})"
+                "{bind_fn}({pipe_slot}, {pipe_var_slot}, {compiled_base}, {})",
+                compiled_args.join(", ")
             );
         }
 
@@ -1011,6 +1023,70 @@ fn split_top_level_pipe(expr: &str) -> Option<(String, String)> {
     Some((base, name))
 }
 
+/// Split a top-level pipe from an expression, including pipe arguments.
+///
+/// Returns `(base_expression, pipe_name, vec_of_args)`.
+/// Pipe arguments are separated by `:` after the pipe name.
+fn split_top_level_pipe_with_args(expr: &str) -> Option<(String, String, Vec<String>)> {
+    let (base, name) = split_top_level_pipe(expr)?;
+
+    // Find where the pipe name ends in the original expression
+    let pipe_pos = base.len(); // position of `|`
+    let rest = expr[pipe_pos + 1..].trim();
+    let after_name = &rest[name.len()..];
+
+    // Parse colon-separated arguments
+    let mut args = Vec::new();
+    let mut remaining = after_name.trim();
+    while remaining.starts_with(':') {
+        remaining = remaining[1..].trim();
+        // Extract the argument (up to next `:` at depth 0, or end)
+        let mut depth = 0i32;
+        let mut end = 0;
+        let chars: Vec<char> = remaining.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            match chars[i] {
+                '(' | '[' => {
+                    depth += 1;
+                    i += 1;
+                }
+                ')' | ']' => {
+                    depth -= 1;
+                    i += 1;
+                }
+                '\'' | '"' | '`' => {
+                    let q = chars[i];
+                    i += 1;
+                    while i < chars.len() && chars[i] != q {
+                        if chars[i] == '\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                    if i < chars.len() {
+                        i += 1;
+                    }
+                }
+                ':' if depth == 0 => {
+                    break;
+                }
+                _ => {
+                    i += 1;
+                }
+            }
+            end = i;
+        }
+        let arg = remaining[..end].trim().to_string();
+        if !arg.is_empty() {
+            args.push(arg);
+        }
+        remaining = &remaining[end..];
+    }
+
+    Some((base, name, args))
+}
+
 /// Replace `(expr | pipeName)` sub-expressions with compiled pipe calls.
 ///
 /// Scans for parenthesized expressions containing a single `|` pipe operator
@@ -1047,24 +1123,38 @@ fn replace_nested_pipe_parens(expr: &str, gen: &mut IvyCodegen) -> String {
             // chars[start] = '(', chars[j-1] = ')'
             let inner: String = chars[start + 1..j - 1].iter().collect();
 
-            // Check if the inner expression has a pipe
-            if let Some((base, pipe_name)) = split_top_level_pipe(&inner) {
+            // Check if the inner expression has a pipe (with optional arguments)
+            if let Some((base, pipe_name, args)) = split_top_level_pipe_with_args(&inner) {
                 // Compile the base expression recursively
                 let compiled_base = replace_nested_pipe_parens(&base, gen);
                 let compiled_base = ctx_expr(&compiled_base);
 
                 let pipe_slot = gen.slot_index;
                 gen.slot_index += 1;
-                gen.var_count += 1;
+                gen.var_count += 1 + args.len() as u32;
                 gen.ivy_imports.insert("\u{0275}\u{0275}pipe".to_string());
-                gen.ivy_imports
-                    .insert("\u{0275}\u{0275}pipeBind1".to_string());
+
+                let bind_fn = match args.len() {
+                    0 => "\u{0275}\u{0275}pipeBind1",
+                    1 => "\u{0275}\u{0275}pipeBind2",
+                    2 => "\u{0275}\u{0275}pipeBind3",
+                    _ => "\u{0275}\u{0275}pipeBindV",
+                };
+                gen.ivy_imports.insert(bind_fn.to_string());
                 gen.creation
                     .push(format!("\u{0275}\u{0275}pipe({pipe_slot}, '{pipe_name}');"));
                 let pipe_var_slot = gen.var_count;
-                result.push_str(&format!(
-                    "\u{0275}\u{0275}pipeBind1({pipe_slot}, {pipe_var_slot}, {compiled_base})"
-                ));
+                if args.is_empty() {
+                    result.push_str(&format!(
+                        "{bind_fn}({pipe_slot}, {pipe_var_slot}, {compiled_base})"
+                    ));
+                } else {
+                    let compiled_args: Vec<String> = args.iter().map(|a| ctx_expr(a)).collect();
+                    result.push_str(&format!(
+                        "{bind_fn}({pipe_slot}, {pipe_var_slot}, {compiled_base}, {})",
+                        compiled_args.join(", ")
+                    ));
+                }
             } else {
                 // No pipe inside — recurse on inner, keep parens
                 let compiled_inner = replace_nested_pipe_parens(&inner, gen);
@@ -1388,6 +1478,37 @@ fn format_static_attrs(attrs: &[(&str, &str)]) -> String {
         })
         .collect();
     format!("[{}]", pairs.join(", "))
+}
+
+/// Compile an Angular event handler expression.
+///
+/// Handles multi-statement handlers like `$event.stopPropagation(); doSomething()`
+/// by splitting on `;`, applying `ctx.` to each statement, and adding `return` to
+/// the last statement.
+fn compile_event_handler(handler: &str) -> String {
+    let trimmed = handler.trim();
+    // Split on semicolons (respecting strings and parens)
+    let statements: Vec<&str> = trimmed
+        .split(';')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if statements.is_empty() {
+        return String::new();
+    }
+
+    let mut parts = Vec::new();
+    for (i, stmt) in statements.iter().enumerate() {
+        let compiled = ctx_expr(stmt);
+        if i == statements.len() - 1 {
+            parts.push(format!("return {compiled};"));
+        } else {
+            parts.push(format!("{compiled};"));
+        }
+    }
+
+    parts.join(" ")
 }
 
 /// Escape a string for use inside a single-quoted JavaScript string literal.
