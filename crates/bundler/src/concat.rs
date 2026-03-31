@@ -289,6 +289,17 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<(String, Option<SourceMa
             let canonical = entry_path.canonicalize().unwrap_or(entry_path);
             if let Some(ns) = file_to_namespace.get(&canonical) {
                 specifier_to_namespace.insert(spec.clone(), ns.clone());
+                continue;
+            }
+        }
+        // Fallback: for vendored/synthetic modules (e.g., @oxc-project/runtime/helpers/decorate)
+        // that don't have a package.json, match by path suffix in the file_to_namespace map.
+        let spec_path_suffix = spec.replace('/', std::path::MAIN_SEPARATOR_STR);
+        for (path, ns) in &file_to_namespace {
+            let path_str = path.to_string_lossy();
+            if path_str.contains(&spec_path_suffix) {
+                specifier_to_namespace.insert(spec.clone(), ns.clone());
+                break;
             }
         }
     }
