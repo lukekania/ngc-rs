@@ -57,21 +57,14 @@ pub fn transform(
         props.push("standalone: true".to_string());
     }
 
-    // Features
+    // Features — only emit features that exist in the Angular runtime.
+    // ɵɵStandaloneFeature was removed in Angular 19+; standalone is handled via property.
     let mut features = Vec::new();
     if metadata::get_bool_prop(obj, "usesInheritance") == Some(true) {
         let feat = if ng_import.is_empty() {
             "\u{0275}\u{0275}InheritDefinitionFeature".to_string()
         } else {
             format!("{ng_import}.\u{0275}\u{0275}InheritDefinitionFeature")
-        };
-        features.push(feat);
-    }
-    if is_standalone {
-        let feat = if ng_import.is_empty() {
-            "\u{0275}\u{0275}StandaloneFeature".to_string()
-        } else {
-            format!("{ng_import}.\u{0275}\u{0275}StandaloneFeature")
         };
         features.push(feat);
     }
