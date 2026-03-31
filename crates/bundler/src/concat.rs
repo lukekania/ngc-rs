@@ -295,6 +295,12 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<(String, Option<SourceMa
         }
     }
 
+    // Deduplicate top-level names across npm modules to prevent shadowing errors.
+    // When two npm modules define the same top-level name (e.g. `function zip()`),
+    // we rename the later one by appending a numeric suffix and update all
+    // references within that module section.
+    deduplicate_section_names(&mut sections);
+
     let mut merged = merge_external_imports(all_externals);
     deduplicate_import_names(&mut merged);
     let mut output = String::new();
@@ -355,6 +361,65 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<(String, Option<SourceMa
     };
 
     Ok((output, combined_map))
+}
+
+/// Deduplicate top-level declaration names across module sections.
+///
+/// When multiple modules define the same top-level name (e.g., two npm packages
+/// both define `function zip()`), this renames later occurrences by appending
+/// a numeric suffix (`zip` → `zip$2`) and updates all references within that
+/// module section.
+fn deduplicate_section_names(sections: &mut [ModuleSection]) {
+    let mut seen_names: HashMap<String, usize> = HashMap::new();
+
+    // Regex for top-level declarations: function, var, let, const, class
+    let decl_re =
+        regex::Regex::new(r"(?m)^(?:function|var|let|const|class)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)")
+            .expect("valid regex");
+
+    for section in sections.iter_mut() {
+        // Only check npm modules (node_modules paths) for collisions
+        let is_npm = section
+            .source_path
+            .components()
+            .any(|c| c.as_os_str() == "node_modules");
+        if !is_npm {
+            // Still register project-level names so they're tracked
+            for cap in decl_re.captures_iter(&section.code) {
+                let name = cap[1].to_string();
+                seen_names.entry(name).or_insert(0);
+            }
+            continue;
+        }
+
+        // Collect names declared in this section
+        let names_in_section: Vec<String> = decl_re
+            .captures_iter(&section.code)
+            .map(|cap| cap[1].to_string())
+            .collect();
+
+        // Find collisions and build rename map
+        let mut renames: Vec<(String, String)> = Vec::new();
+        for name in &names_in_section {
+            let count = seen_names.entry(name.clone()).or_insert(0);
+            *count += 1;
+            if *count > 1 {
+                let new_name = format!("{name}${}", count);
+                renames.push((name.clone(), new_name));
+            }
+        }
+
+        // Apply renames to this section's code (whole-word replacement)
+        for (old_name, new_name) in &renames {
+            tracing::debug!(old = old_name, new = new_name, path = %section.source_path.display(), "renaming duplicate declaration");
+            // Use word boundary replacement to avoid partial matches
+            let word_re = regex::Regex::new(&format!(r"\b{}\b", regex::escape(old_name)))
+                .expect("valid regex");
+            let replacement = regex::NoExpand(new_name.as_str());
+            section.code = word_re.replace_all(&section.code, replacement).to_string();
+            section.line_count = section.code.chars().filter(|&c| c == '\n').count() as u32 + 1;
+        }
+    }
 }
 
 /// Compute a truncated SHA-256 content hash (8 hex characters).
