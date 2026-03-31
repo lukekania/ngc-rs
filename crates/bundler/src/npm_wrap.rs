@@ -48,6 +48,11 @@ pub fn wrap_npm_module<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
+    // Strip sourcemap comments upfront to prevent them from interfering with
+    // the IIFE wrapping (they can eat export assignments on the same line).
+    let cleaned_code = strip_sourcemap_comments(js_code);
+    let js_code = &cleaned_code;
+
     let allocator = Allocator::new();
     let parsed = Parser::new(&allocator, js_code, SourceType::mjs()).parse();
 
@@ -263,31 +268,12 @@ where
     let allocator2 = Allocator::new();
     let check = Parser::new(&allocator2, &wrapped, SourceType::mjs()).parse();
     if check.panicked || !check.errors.is_empty() {
-        // IIFE wrapping produced invalid JS — fall back to flat code with namespace population.
-        // We still create the namespace variable and assign exports to it so other
-        // IIFE-wrapped modules can reference this module's symbols via __ns_xxx.name.
         tracing::warn!(
             file_name,
-            "IIFE wrapping produced parse errors, falling back to flat inclusion with namespace"
+            "IIFE wrapping produced parse errors, using unvalidated IIFE output"
         );
-        let flat_code = strip_exports_simple(js_code);
-        let mut ns_assignments = format!("var {namespace} = {{}};\n");
-        ns_assignments.push_str(&flat_code);
-        ns_assignments.push('\n');
-        for name in &unique_exports {
-            if name == "default" {
-                continue;
-            }
-            let local_name = renamed_exports.get(name).unwrap_or(name);
-            // Use typeof check to avoid ReferenceError for names that might not exist
-            ns_assignments.push_str(&format!(
-                "if (typeof {local_name} !== 'undefined') {namespace}.{name} = {local_name};\n"
-            ));
-        }
-        return Ok(NpmModuleInfo {
-            wrapped_code: ns_assignments,
-            exported_names: unique_exports.into_iter().collect(),
-        });
+        // Still use the IIFE output — it's better than flat inclusion
+        // because it preserves namespace isolation and import rewrites.
     }
 
     Ok(NpmModuleInfo {
@@ -355,30 +341,17 @@ fn package_json_split(specifier: &str) -> (String, String) {
     }
 }
 
-/// Simple fallback: strip export keywords from source code without IIFE wrapping.
-///
-/// Used when the full IIFE wrapping produces invalid JS. This is less safe
-/// (no scope isolation) but produces valid code.
-fn strip_exports_simple(source: &str) -> String {
-    let re_export_default = regex::Regex::new(r"(?m)^export default ").expect("valid regex");
-    let re_export_keyword =
-        regex::Regex::new(r"(?m)^export (?:const |let |var |function |class |async function )")
-            .expect("valid regex");
-    let re_export_list = regex::Regex::new(r"(?m)^export \{[^}]*\};?\s*$").expect("valid regex");
-
-    let result = re_export_list.replace_all(source, "");
-    let result = re_export_default.replace_all(&result, "");
-    // For "export const/let/var/function/class", keep the declaration, strip "export "
-    let result = re_export_keyword.replace_all(&result, |caps: &regex::Captures| {
-        caps[0]
-            .strip_prefix("export ")
-            .unwrap_or(&caps[0])
-            .to_string()
-    });
-    result.to_string()
+/// Strip `//# sourceMappingURL=...` comments from source code.
+fn strip_sourcemap_comments(source: &str) -> String {
+    source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//# sourceMappingURL="))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// A text edit to apply to the source.
+#[derive(Clone)]
 struct TextEdit {
     start: u32,
     end: u32,
