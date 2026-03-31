@@ -26,7 +26,8 @@ mod metadata;
 mod ng_module;
 mod pipe;
 mod selector;
-mod transform;
+/// Low-level linking API for transforming a single source file.
+pub mod transform;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
