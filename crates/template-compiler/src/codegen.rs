@@ -494,7 +494,12 @@ impl IvyCodegen {
         self.slot_index += 1;
         self.ivy_imports.insert("\u{0275}\u{0275}text".to_string());
 
-        let escaped = text.value.replace('\'', "\\'");
+        let escaped = text
+            .value
+            .replace('\\', "\\\\")
+            .replace('\'', "\\'")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r");
         self.creation
             .push(format!("\u{0275}\u{0275}text({slot}, '{escaped}');"));
     }
@@ -881,7 +886,9 @@ impl IvyCodegen {
             );
         }
 
-        // No top-level pipe — scan for `(expr | pipe)` sub-expressions and replace them
+        // No top-level pipe — scan for `(expr | pipe)` sub-expressions and replace them.
+        // Apply ctx_expr after pipe replacement; ɵɵ-prefixed symbols are excluded
+        // from ctx. prefixing by is_builtin().
         let result = replace_nested_pipe_parens(trimmed, self);
         ctx_expr(&result)
     }
@@ -1231,6 +1238,10 @@ fn collect_ctx_rewrites(
     use oxc_span::GetSpan;
 
     fn is_builtin(name: &str) -> bool {
+        // Angular runtime symbols (ɵɵ-prefixed) are not component properties
+        if name.starts_with('\u{0275}') {
+            return true;
+        }
         matches!(
             name,
             "null"

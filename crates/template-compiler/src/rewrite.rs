@@ -71,12 +71,6 @@ pub fn rewrite_source_generic(
 
     let mut result = String::new();
 
-    // Prepend child template functions
-    for child_fn in &ivy_output.child_template_functions {
-        result.push_str(child_fn);
-        result.push('\n');
-    }
-
     // Segment A+B: everything before the decorator, with import rewriting
     if let Some((import_start, import_end)) = common.angular_core_import_span {
         let import_start = import_start as usize;
@@ -88,6 +82,12 @@ pub fn rewrite_source_generic(
         result.push_str(&new_import);
         result.push('\n');
         result.push_str(&source[..decorator_start]);
+    }
+
+    // Insert child template functions after imports, before the class
+    for child_fn in &ivy_output.child_template_functions {
+        result.push_str(child_fn);
+        result.push('\n');
     }
 
     // Segment C: skip the decorator and trailing newlines
