@@ -151,14 +151,27 @@ fn visit_statement(
             }
         }
         Statement::ExportNamedDeclaration(export) => {
-            if let Some(oxc_ast::ast::Declaration::VariableDeclaration(var_decl)) =
+            if let Some(ref decl) = export.declaration {
+                match decl {
+                    oxc_ast::ast::Declaration::VariableDeclaration(var_decl) => {
+                        for declarator in &var_decl.declarations {
+                            if let Some(init) = &declarator.init {
+                                visit_expression(init, source, file_path, replacements)?;
+                            }
+                        }
+                    }
+                    oxc_ast::ast::Declaration::ClassDeclaration(class) => {
+                        visit_class_body(class, source, file_path, replacements)?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Statement::ExportDefaultDeclaration(export) => {
+            if let oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(class) =
                 &export.declaration
             {
-                for declarator in &var_decl.declarations {
-                    if let Some(init) = &declarator.init {
-                        visit_expression(init, source, file_path, replacements)?;
-                    }
-                }
+                visit_class_body(class, source, file_path, replacements)?;
             }
         }
         Statement::ClassDeclaration(class) => {
@@ -169,7 +182,8 @@ fn visit_statement(
     Ok(())
 }
 
-/// Visit class body looking for static property definitions with `ɵɵngDeclare*` initializers.
+/// Visit class body looking for static property definitions and static blocks
+/// with `ɵɵngDeclare*` initializers.
 fn visit_class_body(
     class: &oxc_ast::ast::Class<'_>,
     source: &str,
@@ -177,10 +191,19 @@ fn visit_class_body(
     replacements: &mut Vec<Replacement>,
 ) -> NgcResult<()> {
     for element in &class.body.body {
-        if let oxc_ast::ast::ClassElement::PropertyDefinition(prop) = element {
-            if let Some(ref init) = prop.value {
-                visit_expression(init, source, file_path, replacements)?;
+        match element {
+            oxc_ast::ast::ClassElement::PropertyDefinition(prop) => {
+                if let Some(ref init) = prop.value {
+                    visit_expression(init, source, file_path, replacements)?;
+                }
             }
+            oxc_ast::ast::ClassElement::StaticBlock(block) => {
+                // static { this.ɵfac = i0.ɵɵngDeclareFactory({...}); }
+                for stmt in &block.body {
+                    visit_statement(stmt, source, file_path, replacements)?;
+                }
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -206,6 +229,9 @@ fn visit_expression(
             for expr in &seq.expressions {
                 visit_expression(expr, source, file_path, replacements)?;
             }
+        }
+        Expression::ClassExpression(class) => {
+            visit_class_body(class, source, file_path, replacements)?;
         }
         _ => {}
     }
