@@ -7,6 +7,7 @@
 mod chunk;
 mod concat;
 mod minify;
+pub mod npm_wrap;
 mod rewrite;
 mod shake;
 
