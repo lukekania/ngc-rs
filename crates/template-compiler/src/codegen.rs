@@ -858,13 +858,81 @@ impl IvyCodegen {
 ///
 /// Simple paths like `title` or `foo.bar` become `ctx.title` / `ctx.foo.bar`.
 /// Complex expressions like `'text' + prop` or `fn()` are left as-is.
+/// Compile an Angular template expression to JavaScript by adding `ctx.` prefixes
+/// to component property references and stripping TypeScript non-null assertions.
+///
+/// Uses oxc to parse the expression AST and walk it, ensuring all standalone
+/// identifiers (not member properties, not builtins) get the `ctx.` prefix.
 fn ctx_expr(expr: &str) -> String {
     let trimmed = expr.trim();
-    if is_simple_property_path(trimmed) {
-        format!("ctx.{trimmed}")
-    } else {
-        trimmed.to_string()
+    if trimmed.is_empty() {
+        return String::new();
     }
+
+    // Fast path for simple property paths
+    if is_simple_property_path(trimmed) {
+        return format!("ctx.{trimmed}");
+    }
+
+    // Parse expression with oxc for proper AST-based rewriting
+    let wrapper = format!("var __expr = {trimmed};");
+    let alloc = oxc_allocator::Allocator::default();
+    let parsed = oxc_parser::Parser::new(&alloc, &wrapper, oxc_span::SourceType::tsx()).parse();
+
+    if !parsed.errors.is_empty() || parsed.panicked {
+        // If parsing fails, fall back to simple heuristic
+        return trimmed.to_string();
+    }
+
+    // Extract the initializer expression
+    let init_expr = match parsed.program.body.first() {
+        Some(oxc_ast::ast::Statement::VariableDeclaration(decl)) => {
+            decl.declarations.first().and_then(|d| d.init.as_ref())
+        }
+        _ => None,
+    };
+
+    let init_expr = match init_expr {
+        Some(e) => e,
+        None => return trimmed.to_string(),
+    };
+
+    // Collect positions of identifiers that need `ctx.` prefix and `!` to remove
+    let mut ctx_inserts: Vec<u32> = Vec::new();
+    let mut remove_ranges: Vec<(u32, u32)> = Vec::new();
+    collect_ctx_rewrites(init_expr, &mut ctx_inserts, &mut remove_ranges, false);
+
+    // Map wrapper offsets back to expression offsets
+    let expr_offset = "var __expr = ".len() as u32;
+    let mut result = trimmed.to_string();
+
+    // Apply removals first (sorted reverse)
+    let mut sorted_removes: Vec<(usize, usize)> = remove_ranges
+        .iter()
+        .map(|(s, e)| ((s - expr_offset) as usize, (e - expr_offset) as usize))
+        .collect();
+    sorted_removes.sort_by(|a, b| b.0.cmp(&a.0));
+    for (s, e) in &sorted_removes {
+        if *s <= result.len() && *e <= result.len() {
+            result.replace_range(*s..*e, "");
+        }
+    }
+
+    // Apply ctx. insertions (sorted reverse)
+    let mut sorted_inserts: Vec<usize> = ctx_inserts
+        .iter()
+        .map(|off| (off - expr_offset) as usize)
+        .collect();
+    sorted_inserts.sort_unstable();
+    sorted_inserts.dedup();
+    sorted_inserts.reverse();
+    for off in &sorted_inserts {
+        if *off <= result.len() {
+            result.insert_str(*off, "ctx.");
+        }
+    }
+
+    result
 }
 
 /// Check if a string is a simple property path (e.g. `foo`, `foo.bar`, `$data`).
@@ -875,6 +943,136 @@ fn is_simple_property_path(s: &str) -> bool {
             .is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$')
         && s.chars()
             .all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '$')
+}
+
+/// Recursively collect identifier positions that need `ctx.` prefix and
+/// TypeScript non-null assertion `!` positions to remove.
+fn collect_ctx_rewrites(
+    expr: &oxc_ast::ast::Expression<'_>,
+    ctx_inserts: &mut Vec<u32>,
+    remove_ranges: &mut Vec<(u32, u32)>,
+    is_member_property: bool,
+) {
+    use oxc_ast::ast::*;
+    use oxc_span::GetSpan;
+
+    fn is_builtin(name: &str) -> bool {
+        matches!(
+            name,
+            "null"
+                | "undefined"
+                | "true"
+                | "false"
+                | "NaN"
+                | "Infinity"
+                | "this"
+                | "Math"
+                | "Date"
+                | "JSON"
+                | "console"
+                | "window"
+                | "document"
+                | "Array"
+                | "Object"
+                | "String"
+                | "Number"
+                | "Boolean"
+                | "Error"
+                | "RegExp"
+                | "Symbol"
+                | "Promise"
+                | "Map"
+                | "Set"
+                | "$event"
+        )
+    }
+
+    match expr {
+        Expression::Identifier(id) => {
+            if !is_member_property && !is_builtin(&id.name) {
+                ctx_inserts.push(id.span.start);
+            }
+        }
+        Expression::CallExpression(call) => {
+            collect_ctx_rewrites(&call.callee, ctx_inserts, remove_ranges, false);
+            for arg in &call.arguments {
+                if let Argument::SpreadElement(spread) = arg {
+                    collect_ctx_rewrites(&spread.argument, ctx_inserts, remove_ranges, false);
+                } else {
+                    collect_ctx_rewrites(arg.to_expression(), ctx_inserts, remove_ranges, false);
+                }
+            }
+        }
+        Expression::StaticMemberExpression(member) => {
+            collect_ctx_rewrites(&member.object, ctx_inserts, remove_ranges, false);
+        }
+        Expression::ComputedMemberExpression(member) => {
+            collect_ctx_rewrites(&member.object, ctx_inserts, remove_ranges, false);
+            collect_ctx_rewrites(&member.expression, ctx_inserts, remove_ranges, false);
+        }
+        Expression::UnaryExpression(unary) => {
+            collect_ctx_rewrites(&unary.argument, ctx_inserts, remove_ranges, false);
+        }
+        Expression::BinaryExpression(binary) => {
+            collect_ctx_rewrites(&binary.left, ctx_inserts, remove_ranges, false);
+            collect_ctx_rewrites(&binary.right, ctx_inserts, remove_ranges, false);
+        }
+        Expression::LogicalExpression(logical) => {
+            collect_ctx_rewrites(&logical.left, ctx_inserts, remove_ranges, false);
+            collect_ctx_rewrites(&logical.right, ctx_inserts, remove_ranges, false);
+        }
+        Expression::ConditionalExpression(cond) => {
+            collect_ctx_rewrites(&cond.test, ctx_inserts, remove_ranges, false);
+            collect_ctx_rewrites(&cond.consequent, ctx_inserts, remove_ranges, false);
+            collect_ctx_rewrites(&cond.alternate, ctx_inserts, remove_ranges, false);
+        }
+        Expression::ParenthesizedExpression(paren) => {
+            collect_ctx_rewrites(&paren.expression, ctx_inserts, remove_ranges, false);
+        }
+        Expression::AssignmentExpression(assign) => {
+            if let AssignmentTarget::AssignmentTargetIdentifier(id) = &assign.left {
+                if !is_builtin(&id.name) {
+                    ctx_inserts.push(id.span.start);
+                }
+            }
+            collect_ctx_rewrites(&assign.right, ctx_inserts, remove_ranges, false);
+        }
+        Expression::TSNonNullExpression(non_null) => {
+            collect_ctx_rewrites(
+                &non_null.expression,
+                ctx_inserts,
+                remove_ranges,
+                is_member_property,
+            );
+            let inner_end = non_null.expression.span().end;
+            let outer_end = non_null.span.end;
+            if outer_end > inner_end {
+                remove_ranges.push((inner_end, outer_end));
+            }
+        }
+        Expression::ObjectExpression(obj) => {
+            for prop in &obj.properties {
+                if let ObjectPropertyKind::ObjectProperty(p) = prop {
+                    collect_ctx_rewrites(&p.value, ctx_inserts, remove_ranges, false);
+                }
+            }
+        }
+        Expression::ArrayExpression(arr) => {
+            for elem in &arr.elements {
+                if let ArrayExpressionElement::SpreadElement(spread) = elem {
+                    collect_ctx_rewrites(&spread.argument, ctx_inserts, remove_ranges, false);
+                } else if !elem.is_elision() {
+                    collect_ctx_rewrites(elem.to_expression(), ctx_inserts, remove_ranges, false);
+                }
+            }
+        }
+        Expression::TemplateLiteral(tpl) => {
+            for expr in &tpl.expressions {
+                collect_ctx_rewrites(expr, ctx_inserts, remove_ranges, false);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Build a conditional expression for @if chains.
@@ -973,8 +1171,7 @@ mod tests {
         let output = generate_ivy(&comp, &nodes).expect("should generate");
         assert!(output.static_fields[0].contains("decls: 1"));
         assert!(output.static_fields[0].contains("vars: 1"));
-        assert!(output.static_fields[0]
-            .contains("\u{0275}\u{0275}textInterpolate(ctx.title);"));
+        assert!(output.static_fields[0].contains("\u{0275}\u{0275}textInterpolate(ctx.title);"));
     }
 
     #[test]
@@ -1003,5 +1200,63 @@ mod tests {
         let output = generate_ivy(&comp, &nodes).expect("should generate");
         assert!(output.factory_code.contains("TestComponent_Factory"));
         assert!(output.factory_code.contains("new (t || TestComponent)()"));
+    }
+
+    #[test]
+    fn test_ctx_expr_simple() {
+        assert_eq!(ctx_expr("title"), "ctx.title");
+        assert_eq!(ctx_expr("foo.bar"), "ctx.foo.bar");
+    }
+
+    #[test]
+    fn test_ctx_expr_negation() {
+        assert_eq!(ctx_expr("!isCollapsed"), "!ctx.isCollapsed");
+    }
+
+    #[test]
+    fn test_ctx_expr_logical_or() {
+        assert_eq!(
+            ctx_expr("!isCollapsed || mobileMenu.isMobileMenuOpen()"),
+            "!ctx.isCollapsed || ctx.mobileMenu.isMobileMenuOpen()"
+        );
+    }
+
+    #[test]
+    fn test_ctx_expr_method_call() {
+        assert_eq!(
+            ctx_expr("getBadgeClass(subscription().tier)"),
+            "ctx.getBadgeClass(ctx.subscription().tier)"
+        );
+    }
+
+    #[test]
+    fn test_ctx_expr_ternary() {
+        assert_eq!(
+            ctx_expr("isCollapsed ? 'Expand sidebar' : 'Collapse sidebar'"),
+            "ctx.isCollapsed ? 'Expand sidebar' : 'Collapse sidebar'"
+        );
+    }
+
+    #[test]
+    fn test_ctx_expr_ts_non_null_stripped() {
+        assert_eq!(ctx_expr("subscription()!.tier"), "ctx.subscription().tier");
+    }
+
+    #[test]
+    fn test_ctx_expr_object_literal() {
+        assert_eq!(ctx_expr("{ exact: true }"), "{ exact: true }");
+    }
+
+    #[test]
+    fn test_ctx_expr_negation_of_member() {
+        assert_eq!(ctx_expr("!auth.token"), "!ctx.auth.token");
+    }
+
+    #[test]
+    fn test_ctx_expr_style_transform() {
+        assert_eq!(
+            ctx_expr("isCollapsed ? 'rotate(180deg)' : 'rotate(0deg)'"),
+            "ctx.isCollapsed ? 'rotate(180deg)' : 'rotate(0deg)'"
+        );
     }
 }
