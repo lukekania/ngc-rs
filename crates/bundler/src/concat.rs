@@ -278,21 +278,17 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<(String, Option<SourceMa
         "npm namespace assignment complete"
     );
 
-    // Build specifier → namespace mapping for project code
-    // Map each bare specifier to the namespace of its resolved entry file
+    // Build specifier → namespace mapping for project code and npm cross-references.
+    // Resolve each bare specifier to its actual entry file path and look up the namespace.
     for spec in p.bundled_specifiers.iter() {
-        // Find the npm entry file for this specifier by checking which file path
-        // in the graph matches this specifier
-        for (path, ns) in &file_to_namespace {
-            let path_str = path.to_string_lossy();
-            // Match bare specifiers to their entry files
-            let (pkg_name, _) = crate::npm_wrap::split_package_name(spec);
-            if path_str.contains(&pkg_name.replace('/', std::path::MAIN_SEPARATOR_STR)) {
-                // Check if this is likely the entry point (not an internal file)
-                // by seeing if the specifier resolves to this exact file
-                specifier_to_namespace
-                    .entry(spec.clone())
-                    .or_insert_with(|| ns.clone());
+        // Try to resolve the specifier to its entry file using the npm resolver
+        if let Ok(entry_path) = ngc_npm_resolver::resolve::resolve_bare_specifier(
+            spec,
+            node_modules_dir.parent().unwrap_or(&node_modules_dir),
+        ) {
+            let canonical = entry_path.canonicalize().unwrap_or(entry_path);
+            if let Some(ns) = file_to_namespace.get(&canonical) {
+                specifier_to_namespace.insert(spec.clone(), ns.clone());
             }
         }
     }
