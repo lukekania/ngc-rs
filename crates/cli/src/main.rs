@@ -342,6 +342,14 @@ fn run_build(
     for (filename, code) in &bundle_output.chunks {
         let mut final_code = code.clone();
 
+        // TEMPORARY DIAGNOSTIC: patch assertDefined to log what's null
+        if filename.starts_with("main") {
+            final_code = final_code.replace(
+                "'Array must be defined.'",
+                "(console.error('ASSERT_NULL:',new Error().stack),'Array must be defined.')",
+            );
+        }
+
         // Append source map reference if we have a map for this chunk
         if let Some(source_map) = bundle_output.chunk_source_maps.get(filename) {
             if bundle_options.source_maps {
