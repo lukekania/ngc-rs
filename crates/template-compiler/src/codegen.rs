@@ -5,13 +5,13 @@ use ngc_diagnostics::NgcResult;
 use crate::ast::*;
 use crate::extract::ExtractedComponent;
 
-/// Generated Ivy output for a component.
+/// Generated Ivy output for any Angular decorator.
 #[derive(Debug, Clone)]
 pub struct IvyOutput {
     /// The `static ɵfac = ...` field code.
     pub factory_code: String,
-    /// The `static ɵcmp = ɵɵdefineComponent({...})` field code.
-    pub define_component_code: String,
+    /// Static definition fields (e.g. ɵcmp, ɵprov, ɵdir, ɵpipe, ɵmod + ɵinj).
+    pub static_fields: Vec<String>,
     /// Child template functions (for @if, @for, @switch blocks).
     pub child_template_functions: Vec<String>,
     /// Set of Ivy runtime symbols needed from `@angular/core`.
@@ -28,6 +28,8 @@ struct IvyCodegen {
     child_templates: Vec<ChildTemplate>,
     ivy_imports: BTreeSet<String>,
     child_counter: u32,
+    /// Collected static attribute arrays for the `consts` field.
+    consts: Vec<String>,
 }
 
 struct ChildTemplate {
@@ -52,6 +54,7 @@ pub fn generate_ivy(
         child_templates: Vec::new(),
         ivy_imports: BTreeSet::new(),
         child_counter: 0,
+        consts: Vec::new(),
     };
 
     gen.ivy_imports
@@ -97,6 +100,9 @@ pub fn generate_ivy(
     if component.standalone {
         dc.push_str("    standalone: true,\n");
     }
+    if !gen.consts.is_empty() {
+        dc.push_str(&format!("    consts: [{}],\n", gen.consts.join(", ")));
+    }
     dc.push_str(&format!("    decls: {decls},\n"));
     dc.push_str(&format!("    vars: {vars},\n"));
     dc.push_str(&format!(
@@ -106,9 +112,20 @@ pub fn generate_ivy(
     dc.push_str(&template_body);
     dc.push_str("    }");
 
-    // Add dependencies if imports exist
+    // For standalone components, use getComponentDepsFactory to resolve NgModule imports
+    // to their exported directives/pipes at runtime via the depsTracker.
+    // rawImports must be the direct array, not wrapped in a function.
     if let Some(ref imports_src) = component.imports_source {
-        dc.push_str(&format!(",\n    dependencies: {imports_src}"));
+        if component.standalone {
+            gen.ivy_imports
+                .insert("\u{0275}\u{0275}getComponentDepsFactory".to_string());
+            dc.push_str(&format!(
+                ",\n    dependencies: \u{0275}\u{0275}getComponentDepsFactory({}, {imports_src})",
+                component.class_name
+            ));
+        } else {
+            dc.push_str(&format!(",\n    dependencies: () => {imports_src}"));
+        }
     }
     if let Some(ref styles_src) = component.styles_source {
         dc.push_str(&format!(",\n    styles: {styles_src}"));
@@ -124,7 +141,7 @@ pub fn generate_ivy(
 
     Ok(IvyOutput {
         factory_code,
-        define_component_code: dc,
+        static_fields: vec![dc],
         child_template_functions: child_fns,
         ivy_imports: gen.ivy_imports,
     })
@@ -238,9 +255,9 @@ impl IvyCodegen {
                 self.creation
                     .push(format!("{instr}({slot}, '{}');", el.tag));
             } else {
-                let attrs_str = format_static_attrs(&static_attrs);
+                let const_idx = self.register_const(&static_attrs);
                 self.creation
-                    .push(format!("{instr}({slot}, '{}', {attrs_str});", el.tag));
+                    .push(format!("{instr}({slot}, '{}', {const_idx});", el.tag));
             }
         } else {
             let (start_instr, end_instr) = if is_ng_container {
@@ -257,9 +274,9 @@ impl IvyCodegen {
                 self.creation
                     .push(format!("{start_instr}({slot}, '{}');", el.tag));
             } else {
-                let attrs_str = format_static_attrs(&static_attrs);
+                let const_idx = self.register_const(&static_attrs);
                 self.creation
-                    .push(format!("{start_instr}({slot}, '{}', {attrs_str});", el.tag));
+                    .push(format!("{start_instr}({slot}, '{}', {const_idx});", el.tag));
             }
 
             // Event listeners and two-way binding listeners in creation block
@@ -268,9 +285,10 @@ impl IvyCodegen {
                     TemplateAttribute::Event { name, handler } => {
                         self.ivy_imports
                             .insert("\u{0275}\u{0275}listener".to_string());
+                        let compiled_handler = compile_event_handler(handler);
                         self.creation.push(format!(
-                            "\u{0275}\u{0275}listener('{}', function() {{ return ctx.{}; }});",
-                            name, handler
+                            "\u{0275}\u{0275}listener('{}', function($event) {{ {compiled_handler} }});",
+                            name,
                         ));
                     }
                     TemplateAttribute::TwoWayBinding { name, expression } => {
@@ -312,21 +330,17 @@ impl IvyCodegen {
                 TemplateAttribute::Property { name, expression } => {
                     self.ivy_imports
                         .insert("\u{0275}\u{0275}property".to_string());
-                    self.update.push(format!(
-                        "\u{0275}\u{0275}property('{}', {});",
-                        name,
-                        ctx_expr(expression)
-                    ));
+                    let compiled = self.compile_binding_expr(expression);
+                    self.update
+                        .push(format!("\u{0275}\u{0275}property('{}', {compiled});", name,));
                     self.var_count += 1;
                 }
                 TemplateAttribute::TwoWayBinding { name, expression } => {
                     self.ivy_imports
                         .insert("\u{0275}\u{0275}property".to_string());
-                    self.update.push(format!(
-                        "\u{0275}\u{0275}property('{}', {});",
-                        name,
-                        ctx_expr(expression)
-                    ));
+                    let compiled = self.compile_binding_expr(expression);
+                    self.update
+                        .push(format!("\u{0275}\u{0275}property('{}', {compiled});", name,));
                     self.var_count += 1;
                 }
                 TemplateAttribute::ClassBinding {
@@ -335,10 +349,10 @@ impl IvyCodegen {
                 } => {
                     self.ivy_imports
                         .insert("\u{0275}\u{0275}classProp".to_string());
+                    let compiled = self.compile_binding_expr(expression);
                     self.update.push(format!(
-                        "\u{0275}\u{0275}classProp('{}', {});",
+                        "\u{0275}\u{0275}classProp('{}', {compiled});",
                         class_name,
-                        ctx_expr(expression)
                     ));
                     self.var_count += 1;
                 }
@@ -348,20 +362,20 @@ impl IvyCodegen {
                 } => {
                     self.ivy_imports
                         .insert("\u{0275}\u{0275}styleProp".to_string());
+                    let compiled = self.compile_binding_expr(expression);
                     self.update.push(format!(
-                        "\u{0275}\u{0275}styleProp('{}', {});",
+                        "\u{0275}\u{0275}styleProp('{}', {compiled});",
                         property,
-                        ctx_expr(expression)
                     ));
                     self.var_count += 1;
                 }
                 TemplateAttribute::AttrBinding { name, expression } => {
                     self.ivy_imports
                         .insert("\u{0275}\u{0275}attribute".to_string());
+                    let compiled = self.compile_binding_expr(expression);
                     self.update.push(format!(
-                        "\u{0275}\u{0275}attribute('{}', {});",
+                        "\u{0275}\u{0275}attribute('{}', {compiled});",
                         name,
-                        ctx_expr(expression)
                     ));
                     self.var_count += 1;
                 }
@@ -450,6 +464,7 @@ impl IvyCodegen {
         let parent_var = self.var_count;
         let parent_creation = std::mem::take(&mut self.creation);
         let parent_update = std::mem::take(&mut self.update);
+        let parent_consts = std::mem::take(&mut self.consts);
 
         self.slot_index = 0;
         self.var_count = 0;
@@ -484,6 +499,7 @@ impl IvyCodegen {
         self.var_count = parent_var;
         self.creation = parent_creation;
         self.update = parent_update;
+        self.consts = parent_consts;
 
         ChildTemplate {
             function_name: fn_name.to_string(),
@@ -498,7 +514,7 @@ impl IvyCodegen {
         self.slot_index += 1;
         self.ivy_imports.insert("\u{0275}\u{0275}text".to_string());
 
-        let escaped = text.value.replace('\'', "\\'");
+        let escaped = escape_js_string(&text.value);
         self.creation
             .push(format!("\u{0275}\u{0275}text({slot}, '{escaped}');"));
     }
@@ -514,9 +530,9 @@ impl IvyCodegen {
 
         self.creation.push(format!("\u{0275}\u{0275}text({slot});"));
 
-        // Build the expression with pipe wrapping
+        // Build the expression with pipe wrapping and nested pipe compilation
         let expr = if interp.pipes.is_empty() {
-            ctx_expr(&interp.expression)
+            self.compile_binding_expr(&interp.expression)
         } else {
             self.wrap_with_pipes(&interp.expression, &interp.pipes)
         };
@@ -712,6 +728,7 @@ impl IvyCodegen {
         let parent_var = self.var_count;
         let parent_creation = std::mem::take(&mut self.creation);
         let parent_update = std::mem::take(&mut self.update);
+        let parent_consts = std::mem::take(&mut self.consts);
 
         self.slot_index = 0;
         self.var_count = 0;
@@ -747,6 +764,7 @@ impl IvyCodegen {
         self.var_count = parent_var;
         self.creation = parent_creation;
         self.update = parent_update;
+        self.consts = parent_consts;
 
         ChildTemplate {
             function_name: fn_name.to_string(),
@@ -767,6 +785,7 @@ impl IvyCodegen {
         let parent_var = self.var_count;
         let parent_creation = std::mem::take(&mut self.creation);
         let parent_update = std::mem::take(&mut self.update);
+        let parent_consts = std::mem::take(&mut self.consts);
 
         self.slot_index = 0;
         self.var_count = 0;
@@ -803,6 +822,7 @@ impl IvyCodegen {
         self.var_count = parent_var;
         self.creation = parent_creation;
         self.update = parent_update;
+        self.consts = parent_consts;
 
         ChildTemplate {
             function_name: fn_name.to_string(),
@@ -813,7 +833,7 @@ impl IvyCodegen {
     }
 
     fn wrap_with_pipes(&mut self, base_expr: &str, pipes: &[PipeCall]) -> String {
-        let mut expr = ctx_expr(base_expr);
+        let mut expr = self.compile_binding_expr(base_expr);
         for pipe in pipes {
             let pipe_slot = self.slot_index;
             self.slot_index += 1;
@@ -844,6 +864,73 @@ impl IvyCodegen {
         expr
     }
 
+    /// Compile a binding expression, handling embedded Angular pipes at any depth.
+    ///
+    /// Scans for `expr | pipeName` patterns (Angular pipe syntax) anywhere in the
+    /// expression, compiles each to a `ɵɵpipeBind*` call, and applies `ctx.` prefixes.
+    fn compile_binding_expr(&mut self, expression: &str) -> String {
+        let segments = extract_all_pipe_segments(expression);
+        if segments.is_empty() {
+            // No pipes found — just compile with ctx. prefix
+            return ctx_expr(expression);
+        }
+
+        // First segment is the base expression, rest are pipe names
+        // But pipes can be nested in sub-expressions. We need to replace
+        // pipe segments bottom-up. For simplicity, handle the common pattern:
+        // the entire expression or sub-expressions of form `(expr | pipe)`.
+        self.replace_pipes_in_expr(expression)
+    }
+
+    /// Replace all `expr | pipeName` patterns in an expression with `ɵɵpipeBind*` calls.
+    fn replace_pipes_in_expr(&mut self, expression: &str) -> String {
+        let trimmed = expression.trim();
+
+        // Check for top-level pipe: `baseExpr | pipeName : arg1 : arg2`
+        if let Some((base, pipe_name, args)) = split_top_level_pipe_with_args(trimmed) {
+            let compiled_base = self.replace_pipes_in_expr(&base);
+            let pipe_slot = self.slot_index;
+            self.slot_index += 1;
+            self.var_count += 1 + args.len() as u32;
+            self.ivy_imports.insert("\u{0275}\u{0275}pipe".to_string());
+
+            let bind_fn = match args.len() {
+                0 => "\u{0275}\u{0275}pipeBind1",
+                1 => "\u{0275}\u{0275}pipeBind2",
+                2 => "\u{0275}\u{0275}pipeBind3",
+                _ => "\u{0275}\u{0275}pipeBindV",
+            };
+            self.ivy_imports.insert(bind_fn.to_string());
+            self.creation.push(format!(
+                "\u{0275}\u{0275}pipe({pipe_slot}, '{}');",
+                pipe_name
+            ));
+            let pipe_var_slot = self.var_count;
+            if args.is_empty() {
+                return format!("{bind_fn}({pipe_slot}, {pipe_var_slot}, {compiled_base})");
+            }
+            let compiled_args: Vec<String> = args.iter().map(|a| ctx_expr(a)).collect();
+            return format!(
+                "{bind_fn}({pipe_slot}, {pipe_var_slot}, {compiled_base}, {})",
+                compiled_args.join(", ")
+            );
+        }
+
+        // No top-level pipe — scan for `(expr | pipe)` sub-expressions and replace them.
+        // Apply ctx_expr after pipe replacement; ɵɵ-prefixed symbols are excluded
+        // from ctx. prefixing by is_builtin().
+        let result = replace_nested_pipe_parens(trimmed, self);
+        ctx_expr(&result)
+    }
+
+    /// Register a static attribute array in the `consts` table and return its index.
+    fn register_const(&mut self, attrs: &[(&str, &str)]) -> usize {
+        let formatted = format_static_attrs(attrs);
+        let idx = self.consts.len();
+        self.consts.push(formatted);
+        idx
+    }
+
     /// Add an `ɵɵadvance()` instruction to the update block if needed.
     fn add_advance(&mut self, _target_slot: u32) {
         self.ivy_imports
@@ -854,17 +941,395 @@ impl IvyCodegen {
     }
 }
 
+/// Check if an expression has any Angular pipe segments.
+fn extract_all_pipe_segments(expr: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let chars: Vec<char> = expr.trim().chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        match chars[i] {
+            '\'' | '"' | '`' => {
+                let quote = chars[i];
+                i += 1;
+                while i < chars.len() && chars[i] != quote {
+                    if chars[i] == '\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                if i < chars.len() {
+                    i += 1;
+                }
+            }
+            '|' => {
+                if i + 1 < chars.len() && chars[i + 1] == '|' {
+                    i += 2;
+                    continue;
+                }
+                // Possible pipe — check if followed by identifier
+                let mut j = i + 1;
+                while j < chars.len() && chars[j].is_whitespace() {
+                    j += 1;
+                }
+                let name_start = j;
+                while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+                    j += 1;
+                }
+                if j > name_start {
+                    let name: String = chars[name_start..j].iter().collect();
+                    segments.push(name);
+                }
+                i = j;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    segments
+}
+
+/// Split a top-level pipe from an expression: `baseExpr | pipeName` → `(baseExpr, pipeName)`.
+///
+/// Only splits on `|` at parenthesis depth 0 (not inside parens/brackets).
+fn split_top_level_pipe(expr: &str) -> Option<(String, String)> {
+    let chars: Vec<char> = expr.chars().collect();
+    let mut depth = 0i32;
+    let mut last_pipe_pos = None;
+
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '(' | '[' => {
+                depth += 1;
+                i += 1;
+            }
+            ')' | ']' => {
+                depth -= 1;
+                i += 1;
+            }
+            '\'' | '"' | '`' => {
+                let quote = chars[i];
+                i += 1;
+                while i < chars.len() && chars[i] != quote {
+                    if chars[i] == '\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                if i < chars.len() {
+                    i += 1;
+                }
+            }
+            '|' if depth == 0 => {
+                if i + 1 < chars.len() && chars[i + 1] == '|' {
+                    i += 2;
+                    continue;
+                }
+                last_pipe_pos = Some(i);
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    let pos = last_pipe_pos?;
+    let base = expr[..pos].trim().to_string();
+    let rest = expr[pos + 1..].trim();
+
+    // Extract pipe name (first identifier in rest)
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+
+    if name.is_empty() {
+        return None;
+    }
+
+    Some((base, name))
+}
+
+/// Split a top-level pipe from an expression, including pipe arguments.
+///
+/// Returns `(base_expression, pipe_name, vec_of_args)`.
+/// Pipe arguments are separated by `:` after the pipe name.
+fn split_top_level_pipe_with_args(expr: &str) -> Option<(String, String, Vec<String>)> {
+    let (base, name) = split_top_level_pipe(expr)?;
+
+    // Find where the pipe name ends in the original expression
+    let pipe_pos = base.len(); // position of `|`
+    let rest = expr[pipe_pos + 1..].trim();
+    let after_name = &rest[name.len()..];
+
+    // Parse colon-separated arguments
+    let mut args = Vec::new();
+    let mut remaining = after_name.trim();
+    while remaining.starts_with(':') {
+        remaining = remaining[1..].trim();
+        // Extract the argument (up to next `:` at depth 0, or end)
+        let mut depth = 0i32;
+        let mut end = 0;
+        let chars: Vec<char> = remaining.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            match chars[i] {
+                '(' | '[' => {
+                    depth += 1;
+                    i += 1;
+                }
+                ')' | ']' => {
+                    depth -= 1;
+                    i += 1;
+                }
+                '\'' | '"' | '`' => {
+                    let q = chars[i];
+                    i += 1;
+                    while i < chars.len() && chars[i] != q {
+                        if chars[i] == '\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                    if i < chars.len() {
+                        i += 1;
+                    }
+                }
+                ':' if depth == 0 => {
+                    break;
+                }
+                _ => {
+                    i += 1;
+                }
+            }
+            end = i;
+        }
+        let arg = remaining[..end].trim().to_string();
+        if !arg.is_empty() {
+            args.push(arg);
+        }
+        remaining = &remaining[end..];
+    }
+
+    Some((base, name, args))
+}
+
+/// Replace `(expr | pipeName)` sub-expressions with compiled pipe calls.
+///
+/// Scans for parenthesized expressions containing a single `|` pipe operator
+/// and replaces them with the compiled `ɵɵpipeBind1(...)` call.
+fn replace_nested_pipe_parens(expr: &str, gen: &mut IvyCodegen) -> String {
+    let chars: Vec<char> = expr.chars().collect();
+    let mut result = String::new();
+    let mut i = 0;
+
+    while i < chars.len() {
+        if chars[i] == '(' {
+            // Find matching close paren
+            let start = i;
+            let mut depth = 1;
+            let mut j = i + 1;
+            while j < chars.len() && depth > 0 {
+                match chars[j] {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    '\'' | '"' | '`' => {
+                        let q = chars[j];
+                        j += 1;
+                        while j < chars.len() && chars[j] != q {
+                            if chars[j] == '\\' {
+                                j += 1;
+                            }
+                            j += 1;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            // chars[start] = '(', chars[j-1] = ')'
+            let inner: String = chars[start + 1..j - 1].iter().collect();
+
+            // Check if the inner expression has a pipe (with optional arguments)
+            if let Some((base, pipe_name, args)) = split_top_level_pipe_with_args(&inner) {
+                // Compile the base expression recursively
+                let compiled_base = replace_nested_pipe_parens(&base, gen);
+                let compiled_base = ctx_expr(&compiled_base);
+
+                let pipe_slot = gen.slot_index;
+                gen.slot_index += 1;
+                gen.var_count += 1 + args.len() as u32;
+                gen.ivy_imports.insert("\u{0275}\u{0275}pipe".to_string());
+
+                let bind_fn = match args.len() {
+                    0 => "\u{0275}\u{0275}pipeBind1",
+                    1 => "\u{0275}\u{0275}pipeBind2",
+                    2 => "\u{0275}\u{0275}pipeBind3",
+                    _ => "\u{0275}\u{0275}pipeBindV",
+                };
+                gen.ivy_imports.insert(bind_fn.to_string());
+                gen.creation
+                    .push(format!("\u{0275}\u{0275}pipe({pipe_slot}, '{pipe_name}');"));
+                let pipe_var_slot = gen.var_count;
+                if args.is_empty() {
+                    result.push_str(&format!(
+                        "{bind_fn}({pipe_slot}, {pipe_var_slot}, {compiled_base})"
+                    ));
+                } else {
+                    let compiled_args: Vec<String> = args.iter().map(|a| ctx_expr(a)).collect();
+                    result.push_str(&format!(
+                        "{bind_fn}({pipe_slot}, {pipe_var_slot}, {compiled_base}, {})",
+                        compiled_args.join(", ")
+                    ));
+                }
+            } else {
+                // No pipe inside — recurse on inner, keep parens
+                let compiled_inner = replace_nested_pipe_parens(&inner, gen);
+                result.push('(');
+                result.push_str(&compiled_inner);
+                result.push(')');
+            }
+            i = j;
+        } else if chars[i] == '\'' || chars[i] == '"' || chars[i] == '`' {
+            // Copy string literals verbatim
+            let q = chars[i];
+            result.push(q);
+            i += 1;
+            while i < chars.len() && chars[i] != q {
+                if chars[i] == '\\' {
+                    result.push(chars[i]);
+                    i += 1;
+                    if i < chars.len() {
+                        result.push(chars[i]);
+                        i += 1;
+                    }
+                } else {
+                    result.push(chars[i]);
+                    i += 1;
+                }
+            }
+            if i < chars.len() {
+                result.push(chars[i]);
+                i += 1;
+            }
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+
+    result
+}
+
 /// Wrap a template expression with `ctx.` if it's a simple property path.
 ///
 /// Simple paths like `title` or `foo.bar` become `ctx.title` / `ctx.foo.bar`.
 /// Complex expressions like `'text' + prop` or `fn()` are left as-is.
+/// Compile an Angular template expression to JavaScript by adding `ctx.` prefixes
+/// to component property references and stripping TypeScript non-null assertions.
+///
+/// Uses oxc to parse the expression AST and walk it, ensuring all standalone
+/// identifiers (not member properties, not builtins) get the `ctx.` prefix.
 fn ctx_expr(expr: &str) -> String {
     let trimmed = expr.trim();
-    if is_simple_property_path(trimmed) {
-        format!("ctx.{trimmed}")
-    } else {
-        trimmed.to_string()
+    if trimmed.is_empty() {
+        return String::new();
     }
+
+    // Fast path for simple property paths
+    if is_simple_property_path(trimmed) {
+        return format!("ctx.{trimmed}");
+    }
+
+    // Parse expression with oxc for proper AST-based rewriting
+    let wrapper = format!("var __expr = {trimmed};");
+    let alloc = oxc_allocator::Allocator::default();
+    let parsed = oxc_parser::Parser::new(&alloc, &wrapper, oxc_span::SourceType::tsx()).parse();
+
+    if !parsed.errors.is_empty() || parsed.panicked {
+        // If parsing fails, fall back to simple heuristic
+        return trimmed.to_string();
+    }
+
+    // Extract the initializer expression
+    let init_expr = match parsed.program.body.first() {
+        Some(oxc_ast::ast::Statement::VariableDeclaration(decl)) => {
+            decl.declarations.first().and_then(|d| d.init.as_ref())
+        }
+        _ => None,
+    };
+
+    let init_expr = match init_expr {
+        Some(e) => e,
+        None => return trimmed.to_string(),
+    };
+
+    // Collect positions of identifiers that need `ctx.` prefix and `!` to remove
+    let mut ctx_inserts: Vec<u32> = Vec::new();
+    let mut remove_ranges: Vec<(u32, u32)> = Vec::new();
+    collect_ctx_rewrites(init_expr, &mut ctx_inserts, &mut remove_ranges, false);
+
+    // Map wrapper byte offsets back to expression byte offsets
+    let expr_offset = "var __expr = ".len() as u32;
+
+    // Build a unified list of edits (all with byte offsets into `trimmed`)
+    // sorted by position descending so we can apply them back-to-front
+    // without invalidating earlier positions.
+    enum Edit {
+        Insert(usize),        // insert "ctx." at this byte offset
+        Remove(usize, usize), // remove bytes [start..end)
+    }
+
+    let mut edits: Vec<(usize, Edit)> = Vec::new();
+
+    for off in &ctx_inserts {
+        let pos = (*off - expr_offset) as usize;
+        edits.push((pos, Edit::Insert(pos)));
+    }
+    for (s, e) in &remove_ranges {
+        let start = (*s - expr_offset) as usize;
+        let end = (*e - expr_offset) as usize;
+        edits.push((start, Edit::Remove(start, end)));
+    }
+
+    // Sort by position descending; removals before insertions at same position
+    edits.sort_by(|a, b| {
+        b.0.cmp(&a.0).then_with(|| {
+            // Removals first at same position
+            let a_is_remove = matches!(a.1, Edit::Remove(..));
+            let b_is_remove = matches!(b.1, Edit::Remove(..));
+            b_is_remove.cmp(&a_is_remove)
+        })
+    });
+
+    // Deduplicate insertions at the same position
+    edits.dedup_by(|a, b| matches!((&a.1, &b.1), (Edit::Insert(_), Edit::Insert(_))) && a.0 == b.0);
+
+    let mut result = trimmed.to_string();
+    for (_pos, edit) in &edits {
+        match edit {
+            Edit::Insert(off) => {
+                if *off <= result.len() && result.is_char_boundary(*off) {
+                    result.insert_str(*off, "ctx.");
+                }
+            }
+            Edit::Remove(s, e) => {
+                if *s <= result.len()
+                    && *e <= result.len()
+                    && result.is_char_boundary(*s)
+                    && result.is_char_boundary(*e)
+                {
+                    result.replace_range(*s..*e, "");
+                }
+            }
+        }
+    }
+
+    result
 }
 
 /// Check if a string is a simple property path (e.g. `foo`, `foo.bar`, `$data`).
@@ -875,6 +1340,140 @@ fn is_simple_property_path(s: &str) -> bool {
             .is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$')
         && s.chars()
             .all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '$')
+}
+
+/// Recursively collect identifier positions that need `ctx.` prefix and
+/// TypeScript non-null assertion `!` positions to remove.
+fn collect_ctx_rewrites(
+    expr: &oxc_ast::ast::Expression<'_>,
+    ctx_inserts: &mut Vec<u32>,
+    remove_ranges: &mut Vec<(u32, u32)>,
+    is_member_property: bool,
+) {
+    use oxc_ast::ast::*;
+    use oxc_span::GetSpan;
+
+    fn is_builtin(name: &str) -> bool {
+        // Angular runtime symbols (ɵɵ-prefixed) are not component properties
+        if name.starts_with('\u{0275}') {
+            return true;
+        }
+        matches!(
+            name,
+            "null"
+                | "undefined"
+                | "true"
+                | "false"
+                | "NaN"
+                | "Infinity"
+                | "this"
+                | "Math"
+                | "Date"
+                | "JSON"
+                | "console"
+                | "window"
+                | "document"
+                | "Array"
+                | "Object"
+                | "String"
+                | "Number"
+                | "Boolean"
+                | "Error"
+                | "RegExp"
+                | "Symbol"
+                | "Promise"
+                | "Map"
+                | "Set"
+                | "$event"
+        )
+    }
+
+    match expr {
+        Expression::Identifier(id) => {
+            if !is_member_property && !is_builtin(&id.name) {
+                ctx_inserts.push(id.span.start);
+            }
+        }
+        Expression::CallExpression(call) => {
+            collect_ctx_rewrites(&call.callee, ctx_inserts, remove_ranges, false);
+            for arg in &call.arguments {
+                if let Argument::SpreadElement(spread) = arg {
+                    collect_ctx_rewrites(&spread.argument, ctx_inserts, remove_ranges, false);
+                } else {
+                    collect_ctx_rewrites(arg.to_expression(), ctx_inserts, remove_ranges, false);
+                }
+            }
+        }
+        Expression::StaticMemberExpression(member) => {
+            collect_ctx_rewrites(&member.object, ctx_inserts, remove_ranges, false);
+        }
+        Expression::ComputedMemberExpression(member) => {
+            collect_ctx_rewrites(&member.object, ctx_inserts, remove_ranges, false);
+            collect_ctx_rewrites(&member.expression, ctx_inserts, remove_ranges, false);
+        }
+        Expression::UnaryExpression(unary) => {
+            collect_ctx_rewrites(&unary.argument, ctx_inserts, remove_ranges, false);
+        }
+        Expression::BinaryExpression(binary) => {
+            collect_ctx_rewrites(&binary.left, ctx_inserts, remove_ranges, false);
+            collect_ctx_rewrites(&binary.right, ctx_inserts, remove_ranges, false);
+        }
+        Expression::LogicalExpression(logical) => {
+            collect_ctx_rewrites(&logical.left, ctx_inserts, remove_ranges, false);
+            collect_ctx_rewrites(&logical.right, ctx_inserts, remove_ranges, false);
+        }
+        Expression::ConditionalExpression(cond) => {
+            collect_ctx_rewrites(&cond.test, ctx_inserts, remove_ranges, false);
+            collect_ctx_rewrites(&cond.consequent, ctx_inserts, remove_ranges, false);
+            collect_ctx_rewrites(&cond.alternate, ctx_inserts, remove_ranges, false);
+        }
+        Expression::ParenthesizedExpression(paren) => {
+            collect_ctx_rewrites(&paren.expression, ctx_inserts, remove_ranges, false);
+        }
+        Expression::AssignmentExpression(assign) => {
+            if let AssignmentTarget::AssignmentTargetIdentifier(id) = &assign.left {
+                if !is_builtin(&id.name) {
+                    ctx_inserts.push(id.span.start);
+                }
+            }
+            collect_ctx_rewrites(&assign.right, ctx_inserts, remove_ranges, false);
+        }
+        Expression::TSNonNullExpression(non_null) => {
+            collect_ctx_rewrites(
+                &non_null.expression,
+                ctx_inserts,
+                remove_ranges,
+                is_member_property,
+            );
+            let inner_end = non_null.expression.span().end;
+            let outer_end = non_null.span.end;
+            if outer_end > inner_end {
+                remove_ranges.push((inner_end, outer_end));
+            }
+        }
+        Expression::ObjectExpression(obj) => {
+            for prop in &obj.properties {
+                if let ObjectPropertyKind::ObjectProperty(p) = prop {
+                    collect_ctx_rewrites(&p.value, ctx_inserts, remove_ranges, false);
+                }
+            }
+        }
+        Expression::ArrayExpression(arr) => {
+            for elem in &arr.elements {
+                if let ArrayExpressionElement::SpreadElement(spread) = elem {
+                    collect_ctx_rewrites(&spread.argument, ctx_inserts, remove_ranges, false);
+                } else if !elem.is_elision() {
+                    collect_ctx_rewrites(elem.to_expression(), ctx_inserts, remove_ranges, false);
+                }
+            }
+        }
+        Expression::TemplateLiteral(tpl) => {
+            for expr in &tpl.expressions {
+                collect_ctx_rewrites(expr, ctx_inserts, remove_ranges, false);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Build a conditional expression for @if chains.
@@ -902,9 +1501,53 @@ fn build_conditional_expr(
 fn format_static_attrs(attrs: &[(&str, &str)]) -> String {
     let pairs: Vec<String> = attrs
         .iter()
-        .flat_map(|(k, v)| vec![format!("'{k}'"), format!("'{v}'")])
+        .flat_map(|(k, v)| {
+            vec![
+                format!("'{}'", escape_js_string(k)),
+                format!("'{}'", escape_js_string(v)),
+            ]
+        })
         .collect();
     format!("[{}]", pairs.join(", "))
+}
+
+/// Compile an Angular event handler expression.
+///
+/// Handles multi-statement handlers like `$event.stopPropagation(); doSomething()`
+/// by splitting on `;`, applying `ctx.` to each statement, and adding `return` to
+/// the last statement.
+fn compile_event_handler(handler: &str) -> String {
+    let trimmed = handler.trim();
+    // Split on semicolons (respecting strings and parens)
+    let statements: Vec<&str> = trimmed
+        .split(';')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if statements.is_empty() {
+        return String::new();
+    }
+
+    let mut parts = Vec::new();
+    for (i, stmt) in statements.iter().enumerate() {
+        let compiled = ctx_expr(stmt);
+        if i == statements.len() - 1 {
+            parts.push(format!("return {compiled};"));
+        } else {
+            parts.push(format!("{compiled};"));
+        }
+    }
+
+    parts.join(" ")
+}
+
+/// Escape a string for use inside a single-quoted JavaScript string literal.
+fn escape_js_string(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 #[cfg(test)]
@@ -941,8 +1584,8 @@ mod tests {
             is_void: true,
         })];
         let output = generate_ivy(&comp, &nodes).expect("should generate");
-        assert!(output.define_component_code.contains("decls: 1"));
-        assert!(output.define_component_code.contains("vars: 0"));
+        assert!(output.static_fields[0].contains("decls: 1"));
+        assert!(output.static_fields[0].contains("vars: 0"));
         assert!(output.ivy_imports.contains("\u{0275}\u{0275}element"));
     }
 
@@ -958,7 +1601,7 @@ mod tests {
             is_void: false,
         })];
         let output = generate_ivy(&comp, &nodes).expect("should generate");
-        assert!(output.define_component_code.contains("decls: 2"));
+        assert!(output.static_fields[0].contains("decls: 2"));
         assert!(output.ivy_imports.contains("\u{0275}\u{0275}elementStart"));
         assert!(output.ivy_imports.contains("\u{0275}\u{0275}text"));
     }
@@ -971,11 +1614,9 @@ mod tests {
             pipes: Vec::new(),
         })];
         let output = generate_ivy(&comp, &nodes).expect("should generate");
-        assert!(output.define_component_code.contains("decls: 1"));
-        assert!(output.define_component_code.contains("vars: 1"));
-        assert!(output
-            .define_component_code
-            .contains("\u{0275}\u{0275}textInterpolate(ctx.title);"));
+        assert!(output.static_fields[0].contains("decls: 1"));
+        assert!(output.static_fields[0].contains("vars: 1"));
+        assert!(output.static_fields[0].contains("\u{0275}\u{0275}textInterpolate(ctx.title);"));
     }
 
     #[test]
@@ -994,7 +1635,7 @@ mod tests {
         })];
         let output = generate_ivy(&comp, &nodes).expect("should generate");
         assert!(output.ivy_imports.contains("\u{0275}\u{0275}listener"));
-        assert!(output.define_component_code.contains("listener"));
+        assert!(output.static_fields[0].contains("listener"));
     }
 
     #[test]
@@ -1004,5 +1645,127 @@ mod tests {
         let output = generate_ivy(&comp, &nodes).expect("should generate");
         assert!(output.factory_code.contains("TestComponent_Factory"));
         assert!(output.factory_code.contains("new (t || TestComponent)()"));
+    }
+
+    #[test]
+    fn test_ctx_expr_simple() {
+        assert_eq!(ctx_expr("title"), "ctx.title");
+        assert_eq!(ctx_expr("foo.bar"), "ctx.foo.bar");
+    }
+
+    #[test]
+    fn test_ctx_expr_negation() {
+        assert_eq!(ctx_expr("!isCollapsed"), "!ctx.isCollapsed");
+    }
+
+    #[test]
+    fn test_ctx_expr_logical_or() {
+        assert_eq!(
+            ctx_expr("!isCollapsed || mobileMenu.isMobileMenuOpen()"),
+            "!ctx.isCollapsed || ctx.mobileMenu.isMobileMenuOpen()"
+        );
+    }
+
+    #[test]
+    fn test_ctx_expr_method_call() {
+        assert_eq!(
+            ctx_expr("getBadgeClass(subscription().tier)"),
+            "ctx.getBadgeClass(ctx.subscription().tier)"
+        );
+    }
+
+    #[test]
+    fn test_ctx_expr_ternary() {
+        assert_eq!(
+            ctx_expr("isCollapsed ? 'Expand sidebar' : 'Collapse sidebar'"),
+            "ctx.isCollapsed ? 'Expand sidebar' : 'Collapse sidebar'"
+        );
+    }
+
+    #[test]
+    fn test_ctx_expr_ts_non_null_stripped() {
+        assert_eq!(ctx_expr("subscription()!.tier"), "ctx.subscription().tier");
+    }
+
+    #[test]
+    fn test_ctx_expr_object_literal() {
+        assert_eq!(ctx_expr("{ exact: true }"), "{ exact: true }");
+    }
+
+    #[test]
+    fn test_ctx_expr_negation_of_member() {
+        assert_eq!(ctx_expr("!auth.token"), "!ctx.auth.token");
+    }
+
+    #[test]
+    fn test_ctx_expr_style_transform() {
+        assert_eq!(
+            ctx_expr("isCollapsed ? 'rotate(180deg)' : 'rotate(0deg)'"),
+            "ctx.isCollapsed ? 'rotate(180deg)' : 'rotate(0deg)'"
+        );
+    }
+
+    #[test]
+    fn test_extract_all_pipe_segments() {
+        let segments = extract_all_pipe_segments("'NAV.UPGRADE' | translate");
+        assert_eq!(segments, vec!["translate"]);
+
+        let segments = extract_all_pipe_segments("foo || bar");
+        assert!(segments.is_empty(), "|| should not be treated as pipe");
+
+        let segments =
+            extract_all_pipe_segments("x === 'a' ? ('B' | translate) : ('C' | translate)");
+        assert_eq!(segments, vec!["translate", "translate"]);
+    }
+
+    #[test]
+    fn test_split_top_level_pipe() {
+        assert_eq!(
+            split_top_level_pipe("'NAV.UPGRADE' | translate"),
+            Some(("'NAV.UPGRADE'".to_string(), "translate".to_string()))
+        );
+        assert_eq!(split_top_level_pipe("foo || bar"), None,);
+        // Pipe inside parens is not top-level
+        assert_eq!(split_top_level_pipe("x ? ('A' | translate) : 'B'"), None,);
+    }
+
+    #[test]
+    fn test_ctx_expr_multiple_non_null_assertions() {
+        // Reproduces the pattern that caused the char boundary panic:
+        // removing `!` shifts byte offsets for subsequent insertions
+        let result = ctx_expr("getBadgeClass(subscription()!.tier, subscription()!.status)");
+        assert!(result.contains("ctx.getBadgeClass"));
+        assert!(result.contains("ctx.subscription().tier"));
+        assert!(result.contains("ctx.subscription().status"));
+        assert!(!result.contains('!'));
+    }
+
+    #[test]
+    fn test_compile_binding_expr_with_nested_pipes() {
+        let comp = test_component();
+        let nodes = vec![TemplateNode::Element(ElementNode {
+            tag: "div".to_string(),
+            attributes: vec![TemplateAttribute::AttrBinding {
+                name: "title".to_string(),
+                expression:
+                    "x === 'free' ? ('NAV.UPGRADE' | translate) : ('NAV.BILLING' | translate)"
+                        .to_string(),
+            }],
+            children: vec![],
+            is_void: false,
+        })];
+        let output = generate_ivy(&comp, &nodes).expect("should generate");
+        let dc = &output.static_fields[0];
+        // Should have pipeBind1 calls instead of raw | translate
+        assert!(
+            dc.contains("pipeBind1"),
+            "should compile pipes to pipeBind1: {dc}"
+        );
+        assert!(
+            !dc.contains("| translate"),
+            "should not have raw pipe syntax: {dc}"
+        );
+        assert!(output.ivy_imports.contains("\u{0275}\u{0275}pipe"));
+        assert!(output.ivy_imports.contains("\u{0275}\u{0275}pipeBind1"));
     }
 }

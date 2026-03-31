@@ -66,6 +66,7 @@ pub fn rewrite_module(
         None,
         &HashSet::new(),
         &HashMap::new(),
+        false,
     )
 }
 
@@ -73,6 +74,7 @@ pub fn rewrite_module(
 ///
 /// When `unused_exports` is provided, declarations of exports in that set
 /// are fully removed (not just the `export` keyword stripped).
+#[allow(clippy::too_many_arguments)]
 pub fn rewrite_module_with_shaking(
     js_code: &str,
     file_name: &str,
@@ -81,6 +83,7 @@ pub fn rewrite_module_with_shaking(
     unused_exports: Option<&HashSet<String>>,
     bundled_specifiers: &HashSet<String>,
     namespace_map: &HashMap<String, String>,
+    preserve_exports: bool,
 ) -> NgcResult<RewrittenModule> {
     let allocator = Allocator::new();
     let source_type = SourceType::mjs();
@@ -107,6 +110,7 @@ pub fn rewrite_module_with_shaking(
                 unused_exports,
                 bundled_specifiers,
                 namespace_map,
+                preserve_exports,
             );
         }
 
@@ -129,6 +133,7 @@ pub fn rewrite_module_with_shaking(
 }
 
 /// Process a top-level module declaration (import/export) and collect edits.
+#[allow(clippy::too_many_arguments)]
 fn collect_module_decl_edits(
     module_decl: &ModuleDeclaration,
     local_prefixes: &[&str],
@@ -137,6 +142,7 @@ fn collect_module_decl_edits(
     unused_exports: Option<&HashSet<String>>,
     bundled_specifiers: &HashSet<String>,
     namespace_map: &HashMap<String, String>,
+    preserve_exports: bool,
 ) {
     match module_decl {
         ModuleDeclaration::ImportDeclaration(import) => {
@@ -227,7 +233,9 @@ fn collect_module_decl_edits(
             }
         }
         ModuleDeclaration::ExportNamedDeclaration(export) => {
-            if export.source.is_some() {
+            if preserve_exports {
+                // Keep exports intact for lazy chunk entry modules
+            } else if export.source.is_some() {
                 edits.push(TextEdit {
                     start: export.span.start,
                     end: export.span.end,
@@ -255,7 +263,7 @@ fn collect_module_decl_edits(
                         replacement: None,
                     });
                 }
-            } else {
+            } else if !preserve_exports {
                 edits.push(TextEdit {
                     start: export.span.start,
                     end: export.span.end,
@@ -264,23 +272,27 @@ fn collect_module_decl_edits(
             }
         }
         ModuleDeclaration::ExportDefaultDeclaration(export) => {
-            match &export.declaration {
-                ExportDefaultDeclarationKind::FunctionDeclaration(_)
-                | ExportDefaultDeclarationKind::ClassDeclaration(_) => {
-                    edits.push(TextEdit {
-                        start: export.span.start,
-                        end: export.span.start + 15, // "export default "
-                        replacement: None,
-                    });
+            if preserve_exports {
+                // Keep exports intact for lazy chunk entry modules
+            } else {
+                match &export.declaration {
+                    ExportDefaultDeclarationKind::FunctionDeclaration(_)
+                    | ExportDefaultDeclarationKind::ClassDeclaration(_) => {
+                        edits.push(TextEdit {
+                            start: export.span.start,
+                            end: export.span.start + 15, // "export default "
+                            replacement: None,
+                        });
+                    }
+                    _ => {
+                        edits.push(TextEdit {
+                            start: export.span.start,
+                            end: export.span.end,
+                            replacement: None,
+                        });
+                    }
                 }
-                _ => {
-                    edits.push(TextEdit {
-                        start: export.span.start,
-                        end: export.span.end,
-                        replacement: None,
-                    });
-                }
-            }
+            } // close else block for preserve_exports
         }
         ModuleDeclaration::ExportAllDeclaration(export) => {
             if is_local(

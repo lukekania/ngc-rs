@@ -119,13 +119,10 @@ pub fn build_define_call(
         props.push(format!("providers: {providers}"));
     }
 
-    // Queries
-    if let Some(queries) = metadata::get_source_text(obj, "queries", source) {
-        props.push(format!("contentQueries: {queries}"));
-    }
-    if let Some(view_queries) = metadata::get_source_text(obj, "viewQueries", source) {
-        props.push(format!("viewQuery: {view_queries}"));
-    }
+    // Queries: contentQueries and viewQuery require compilation from declare format
+    // (array of descriptors) to runtime format (functions with ɵɵcontentQuery/ɵɵviewQuery calls).
+    // Skipped for now — the raw array format crashes the Angular runtime.
+    // TODO: compile query descriptors to query functions
 
     Ok(format!("{define_fn}({{ {} }})", props.join(", ")))
 }
