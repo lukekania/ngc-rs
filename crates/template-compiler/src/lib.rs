@@ -106,7 +106,7 @@ pub fn generate_template_fn(
 
 /// Extract the template function from the IvyOutput's defineComponent code.
 fn extract_template_fn_from_ivy(ivy: &codegen::IvyOutput, class_name: &str) -> String {
-    let dc = &ivy.define_component_code;
+    let dc = ivy.static_fields.first().map(|s| s.as_str()).unwrap_or("");
     let template_marker = format!("template: function {class_name}_Template");
 
     if let Some(start) = dc.find(&template_marker) {
@@ -140,7 +140,7 @@ fn extract_template_fn_from_ivy(ivy: &codegen::IvyOutput, class_name: &str) -> S
 
 /// Extract decls and vars from the IvyOutput's defineComponent code.
 fn extract_decls_vars_from_ivy(ivy: &codegen::IvyOutput) -> (u32, u32) {
-    let dc = &ivy.define_component_code;
+    let dc = ivy.static_fields.first().map(|s| s.as_str()).unwrap_or("");
 
     let decls = extract_number_prop(dc, "decls: ").unwrap_or(0);
     let vars = extract_number_prop(dc, "vars: ").unwrap_or(0);

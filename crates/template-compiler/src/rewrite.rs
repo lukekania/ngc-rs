@@ -83,9 +83,11 @@ pub fn rewrite_source(
     result.push_str("  ");
     result.push_str(&ivy_output.factory_code);
     result.push_str(";\n");
-    result.push_str("  ");
-    result.push_str(&ivy_output.define_component_code);
-    result.push_str(";\n");
+    for field in &ivy_output.static_fields {
+        result.push_str("  ");
+        result.push_str(field);
+        result.push_str(";\n");
+    }
 
     // Segment E: rest of the file (after class body `{`)
     result.push_str(&source[class_body_start + 1..]);
@@ -136,7 +138,7 @@ mod tests {
     fn make_ivy_output() -> IvyOutput {
         IvyOutput {
             factory_code: "static \u{0275}fac = function AppComponent_Factory(t: any) { return new (t || AppComponent)(); }".to_string(),
-            define_component_code: "static \u{0275}cmp = \u{0275}\u{0275}defineComponent({\n    type: AppComponent\n  })".to_string(),
+            static_fields: vec!["static \u{0275}cmp = \u{0275}\u{0275}defineComponent({\n    type: AppComponent\n  })".to_string()],
             child_template_functions: Vec::new(),
             ivy_imports: BTreeSet::from([
                 "\u{0275}\u{0275}defineComponent".to_string(),
