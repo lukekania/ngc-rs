@@ -249,6 +249,22 @@ where
         "var {namespace} = {{}};\n(function(__exports) {{\n{module_code}{export_lines}}})({namespace});"
     );
 
+    // Validate the wrapped code parses correctly
+    let allocator2 = Allocator::new();
+    let check = Parser::new(&allocator2, &wrapped, SourceType::mjs()).parse();
+    if check.panicked || !check.errors.is_empty() {
+        // IIFE wrapping produced invalid JS — fall back to raw code with export stripping only
+        tracing::warn!(
+            file_name,
+            "IIFE wrapping produced parse errors, falling back to flat inclusion"
+        );
+        let fallback_code = strip_exports_simple(js_code);
+        return Ok(NpmModuleInfo {
+            wrapped_code: fallback_code,
+            exported_names: unique_exports.into_iter().collect(),
+        });
+    }
+
     Ok(NpmModuleInfo {
         wrapped_code: wrapped,
         exported_names: unique_exports.into_iter().collect(),
@@ -312,6 +328,29 @@ fn package_json_split(specifier: &str) -> (String, String) {
             (specifier.to_string(), ".".to_string())
         }
     }
+}
+
+/// Simple fallback: strip export keywords from source code without IIFE wrapping.
+///
+/// Used when the full IIFE wrapping produces invalid JS. This is less safe
+/// (no scope isolation) but produces valid code.
+fn strip_exports_simple(source: &str) -> String {
+    let re_export_default = regex::Regex::new(r"(?m)^export default ").expect("valid regex");
+    let re_export_keyword =
+        regex::Regex::new(r"(?m)^export (?:const |let |var |function |class |async function )")
+            .expect("valid regex");
+    let re_export_list = regex::Regex::new(r"(?m)^export \{[^}]*\};?\s*$").expect("valid regex");
+
+    let result = re_export_list.replace_all(source, "");
+    let result = re_export_default.replace_all(&result, "");
+    // For "export const/let/var/function/class", keep the declaration, strip "export "
+    let result = re_export_keyword.replace_all(&result, |caps: &regex::Captures| {
+        caps[0]
+            .strip_prefix("export ")
+            .unwrap_or(&caps[0])
+            .to_string()
+    });
+    result.to_string()
 }
 
 /// A text edit to apply to the source.

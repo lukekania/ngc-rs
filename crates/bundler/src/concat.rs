@@ -332,9 +332,10 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<(String, Option<SourceMa
                             target.join("index.mjs"),
                             target.join("index.js"),
                         ] {
-                            let canonical = candidate.canonicalize().ok()?;
-                            if let Some(ns) = ft_ns.get(&canonical) {
-                                return Some(ns.clone());
+                            if let Ok(canonical) = candidate.canonicalize() {
+                                if let Some(ns) = ft_ns.get(&canonical) {
+                                    return Some(ns.clone());
+                                }
                             }
                         }
                         None
