@@ -244,9 +244,10 @@ where
         }
     }
 
-    // Wrap in IIFE
+    // Wrap in IIFE — ensure newline before export lines in case the module code
+    // ends with a single-line comment (e.g. //# sourceMappingURL=...)
     let wrapped = format!(
-        "var {namespace} = {{}};\n(function(__exports) {{\n{module_code}{export_lines}}})({namespace});"
+        "var {namespace} = {{}};\n(function(__exports) {{\n{module_code}\n{export_lines}}})({namespace});"
     );
 
     // Validate the wrapped code parses correctly
