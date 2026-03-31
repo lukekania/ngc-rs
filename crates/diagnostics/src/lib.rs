@@ -178,6 +178,15 @@ pub enum NgcError {
         /// Description of what went wrong.
         message: String,
     },
+
+    /// The Angular linker failed to process a partially compiled file.
+    #[error("linker error in {path}: {message}")]
+    LinkerError {
+        /// The path to the file that failed to link.
+        path: PathBuf,
+        /// Description of what went wrong.
+        message: String,
+    },
 }
 
 /// A type alias for Results using NgcError.
