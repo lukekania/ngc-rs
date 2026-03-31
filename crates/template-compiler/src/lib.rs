@@ -80,18 +80,27 @@ pub fn generate_template_fn(
     let ivy_output = codegen::generate_ivy(&extracted, &template_ast)?;
 
     // Extract just the template function from the defineComponent code
-    // The codegen produces: `static ɵcmp = ɵɵdefineComponent({ ..., template: function Name_Template(rf, ctx) { ... }, ... })`
-    // We need to extract just the template function part
     let template_fn = extract_template_fn_from_ivy(&ivy_output, &meta.class_name);
+
+    // Strip TypeScript type annotations — the codegen produces TS (`rf: number, ctx: ClassName`)
+    // but the linker outputs into .mjs files which must be plain JavaScript.
+    let template_fn = strip_ts_annotations(&template_fn, &meta.class_name);
 
     // Extract decls and vars from the defineComponent code
     let (decls, vars) = extract_decls_vars_from_ivy(&ivy_output);
+
+    // Strip TS annotations from child template functions too
+    let child_fns = ivy_output
+        .child_template_functions
+        .iter()
+        .map(|f| strip_ts_annotations(f, &meta.class_name))
+        .collect();
 
     Ok(TemplateFnOutput {
         template_function: template_fn,
         decls,
         vars,
-        child_template_functions: ivy_output.child_template_functions,
+        child_template_functions: child_fns,
     })
 }
 
@@ -145,6 +154,17 @@ fn extract_number_prop(code: &str, prefix: &str) -> Option<u32> {
     let remaining = &code[start..];
     let end = remaining.find(|c: char| !c.is_ascii_digit())?;
     remaining[..end].parse().ok()
+}
+
+/// Strip TypeScript type annotations from generated template functions.
+///
+/// The codegen produces TypeScript-flavored output like `(rf: number, ctx: ClassName)`
+/// which is valid TS but not valid JS. For the linker (which outputs into `.mjs` files),
+/// we need to strip these annotations.
+fn strip_ts_annotations(code: &str, class_name: &str) -> String {
+    code.replace(&format!("rf: number, ctx: {class_name}"), "rf, ctx")
+        .replace("rf: number, ctx: any", "rf, ctx")
+        .replace("t: any", "t")
 }
 
 /// Result of template compilation for a single file.
