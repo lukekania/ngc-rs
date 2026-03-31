@@ -112,9 +112,9 @@ pub fn generate_ivy(
     dc.push_str(&template_body);
     dc.push_str("    }");
 
-    // Add dependencies if imports exist
+    // Add dependencies if imports exist (wrapped in function for forward reference support)
     if let Some(ref imports_src) = component.imports_source {
-        dc.push_str(&format!(",\n    dependencies: {imports_src}"));
+        dc.push_str(&format!(",\n    dependencies: () => {imports_src}"));
     }
     if let Some(ref styles_src) = component.styles_source {
         dc.push_str(&format!(",\n    styles: {styles_src}"));
