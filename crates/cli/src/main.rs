@@ -288,15 +288,27 @@ fn run_build(
         }
     }
 
-    // Add injected helpers to resolved specifiers and connect edges
+    // Add injected helpers to resolved specifiers and connect dependency edges.
+    // We connect every project file that imports the helper (not just the entry point)
+    // so topological ordering places the helper before all files that use it.
     let mut bundled_specifiers = npm_resolution.resolved_specifiers;
     for (spec, helper_path) in &injected_helpers {
         bundled_specifiers.insert(spec.clone());
-        // Connect from the entry point to ensure the helper is reachable
-        if let (Some(&entry_idx), Some(&to_idx)) =
-            (path_index.get(&entry), path_index.get(helper_path))
-        {
-            graph.add_edge(entry_idx, to_idx, ngc_project_resolver::ImportKind::Static);
+        if let Some(&to_idx) = path_index.get(helper_path) {
+            // Find all project modules that import this specifier
+            for (module_path, module_source) in &modules {
+                if module_path
+                    .components()
+                    .any(|c| c.as_os_str() == "node_modules")
+                {
+                    continue;
+                }
+                if module_source.contains(spec.as_str()) {
+                    if let Some(&from_idx) = path_index.get(module_path) {
+                        graph.add_edge(from_idx, to_idx, ngc_project_resolver::ImportKind::Static);
+                    }
+                }
+            }
         }
     }
 
