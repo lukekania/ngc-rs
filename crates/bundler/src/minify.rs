@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use ngc_diagnostics::{NgcError, NgcResult};
+use ngc_diagnostics::NgcResult;
 use oxc_allocator::Allocator;
 use oxc_codegen::{Codegen, CodegenOptions};
 use oxc_parser::Parser;
@@ -34,9 +34,14 @@ pub fn minify_chunk(
     let allocator = Allocator::new();
     let parsed = Parser::new(&allocator, code, SourceType::mjs()).parse();
 
-    if parsed.panicked {
-        return Err(NgcError::BundleError {
-            message: format!("minification parse failed for {filename}"),
+    if parsed.panicked || !parsed.errors.is_empty() {
+        tracing::warn!(
+            filename,
+            "minification skipped: parse errors in bundled output, using unminified code"
+        );
+        return Ok(MinifiedChunk {
+            code: code.to_string(),
+            source_map: bundle_map.cloned(),
         });
     }
 
