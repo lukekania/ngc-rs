@@ -429,7 +429,10 @@ fn build_options(configuration: Option<&str>) -> BundleOptions {
             source_maps: true,
             minify: true,
             content_hash: true,
-            tree_shake: true,
+            // Tree shaking disabled: conflicts with dynamic import rewrites
+            // when an export declaration contains import() expressions.
+            // TODO: fix tree shaker to skip declarations with nested dynamic imports
+            tree_shake: false,
         },
         _ => BundleOptions::default(),
     }
@@ -1212,7 +1215,7 @@ mod tests {
         assert!(opts.source_maps);
         assert!(opts.minify);
         assert!(opts.content_hash);
-        assert!(opts.tree_shake);
+        assert!(!opts.tree_shake); // disabled: conflicts with dynamic import rewrites
     }
 
     #[test]
