@@ -50,7 +50,7 @@ class AppComponent {
 				ɵɵtextInterpolate(ctx.title);
 			}
 		},
-		dependencies: ɵɵgetComponentDepsFactory(AppComponent, () => [RouterOutlet])
+		dependencies: ɵɵgetComponentDepsFactory(AppComponent, [RouterOutlet])
 	});
 	title = SharedUtils.appName();
 }
