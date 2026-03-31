@@ -543,10 +543,8 @@ mod tests {
         let program = parsed.program;
 
         if let oxc_ast::ast::Statement::VariableDeclaration(decl) = &program.body[0] {
-            if let Some(init) = &decl.declarations[0].init {
-                if let Expression::ObjectExpression(obj) = init {
-                    return transform(obj, &code, "i0", &PathBuf::from("test.mjs")).unwrap();
-                }
+            if let Some(Expression::ObjectExpression(obj)) = &decl.declarations[0].init {
+                return transform(obj, &code, "i0", &PathBuf::from("test.mjs")).unwrap();
             }
         }
         panic!("failed to parse");
