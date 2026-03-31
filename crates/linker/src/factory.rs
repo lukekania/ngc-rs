@@ -76,7 +76,20 @@ fn transform_dep(
     ng_import: &str,
     inject_fn: &str,
 ) -> Option<String> {
-    // Check for attribute injection first
+    // Check for attribute injection: { token: 'attrName', attribute: true }
+    if metadata::get_bool_prop(dep_obj, "attribute") == Some(true) {
+        let attr_name = metadata::get_string_prop(dep_obj, "token")
+            .or_else(|| metadata::get_source_text(dep_obj, "token", source).map(|s| s.to_string()));
+        if let Some(attr_name) = attr_name {
+            let inject_attr = if ng_import.is_empty() {
+                format!("\u{0275}\u{0275}injectAttribute('{attr_name}')")
+            } else {
+                format!("{ng_import}.\u{0275}\u{0275}injectAttribute('{attr_name}')")
+            };
+            return Some(inject_attr);
+        }
+    }
+    // Legacy format: { attribute: 'attrName' }
     if let Some(attr_name) = metadata::get_string_prop(dep_obj, "attribute") {
         let inject_attr = if ng_import.is_empty() {
             format!("\u{0275}\u{0275}injectAttribute('{attr_name}')")
