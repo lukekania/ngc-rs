@@ -2,7 +2,7 @@
 source: crates/bundler/tests/snapshot_tests.rs
 expression: bundle
 ---
-import { ɵɵadvance, ɵɵdefineComponent, ɵɵelement, ɵɵelementEnd, ɵɵelementStart, ɵɵtext, ɵɵtextInterpolate } from '@angular/core';
+import { ɵɵadvance, ɵɵdefineComponent, ɵɵelement, ɵɵelementEnd, ɵɵelementStart, ɵɵgetComponentDepsFactory, ɵɵtext, ɵɵtextInterpolate } from '@angular/core';
 import { RouterOutlet, provideRouter } from '@angular/router';
 import { bootstrapApplication } from '@angular/platform-browser';
 
@@ -50,7 +50,7 @@ class AppComponent {
 				ɵɵtextInterpolate(ctx.title);
 			}
 		},
-		dependencies: () => [RouterOutlet]
+		dependencies: ɵɵgetComponentDepsFactory(AppComponent, () => [RouterOutlet])
 	});
 	title = SharedUtils.appName();
 }

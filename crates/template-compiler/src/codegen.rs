@@ -112,9 +112,19 @@ pub fn generate_ivy(
     dc.push_str(&template_body);
     dc.push_str("    }");
 
-    // Add dependencies for component scope resolution
+    // For standalone components, use getComponentDepsFactory to resolve NgModule imports
+    // to their exported directives/pipes at runtime. This matches what Angular's AOT compiler does.
     if let Some(ref imports_src) = component.imports_source {
-        dc.push_str(&format!(",\n    dependencies: () => {imports_src}"));
+        if component.standalone {
+            gen.ivy_imports
+                .insert("\u{0275}\u{0275}getComponentDepsFactory".to_string());
+            dc.push_str(&format!(
+                ",\n    dependencies: \u{0275}\u{0275}getComponentDepsFactory({}, () => {imports_src})",
+                component.class_name
+            ));
+        } else {
+            dc.push_str(&format!(",\n    dependencies: () => {imports_src}"));
+        }
     }
     if let Some(ref styles_src) = component.styles_source {
         dc.push_str(&format!(",\n    styles: {styles_src}"));
