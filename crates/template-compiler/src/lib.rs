@@ -389,6 +389,200 @@ mod tests {
     }
 
     #[test]
+    fn test_complex_component_roundtrip() {
+        // Exact reproduction of SidenavComponent patterns including:
+        // - HTML comments, multi-line attribute bindings, pipes in ternary sub-expressions
+        // - non-null assertions, complex class/style/attr bindings, routerLink directives
+        // - CSS styles in template literal array
+        let source = r#"import { Component, DestroyRef, inject, OnInit, signal } from '@angular/core';
+import { RouterModule } from '@angular/router';
+import { TranslateModule } from '@ngx-translate/core';
+
+@Component({
+  selector: 'app-side-nav',
+  standalone: true,
+  imports: [RouterModule, TranslateModule],
+  template: `
+    <!-- Mobile Overlay Backdrop -->
+    @if (mobileMenu.isMobileMenuOpen() && auth.token) {
+      <div
+        class="fixed inset-0 bg-neutral-900/60 backdrop-blur-sm z-40 md:hidden animate-fade-in"
+        (click)="mobileMenu.close()"
+        aria-hidden="true"
+      ></div>
+    }
+
+    <nav
+      class="sidebar"
+      [class.w-64]="!isCollapsed || mobileMenu.isMobileMenuOpen()"
+      [class.w-20]="isCollapsed && !mobileMenu.isMobileMenuOpen()"
+      [class.translate-x-0]="mobileMenu.isMobileMenuOpen()"
+      [hidden]="!auth.token"
+    >
+      <div class="flex items-center justify-between p-4">
+        <div [class.hidden]="isCollapsed && !mobileMenu.isMobileMenuOpen()">
+          <span class="text-xl font-bold">Treasr</span>
+        </div>
+
+        @if (isCollapsed && !mobileMenu.isMobileMenuOpen()) {
+          <div class="mx-auto">
+            <span class="material-icons text-white text-xl">trending_up</span>
+          </div>
+        }
+
+        <button
+          type="button"
+          class="p-2 cursor-pointer hidden md:block"
+          [class.ml-auto]="!isCollapsed"
+          [class.hidden]="isCollapsed && !mobileMenu.isMobileMenuOpen()"
+          (click)="toggleSidebar()"
+          [attr.aria-expanded]="!isCollapsed"
+          [attr.aria-label]="
+            isCollapsed ? 'Expand sidebar' : 'Collapse sidebar'
+          "
+        >
+          <span
+            class="material-icons"
+            [style.transform]="isCollapsed ? 'rotate(180deg)' : 'rotate(0deg)'"
+          >
+            chevron_left
+          </span>
+        </button>
+      </div>
+
+      @if (subscription() && (!isCollapsed || mobileMenu.isMobileMenuOpen())) {
+        <a
+          routerLink="/billing"
+          (click)="mobileMenu.close()"
+          class="mx-3 mb-4 px-3 py-2.5 rounded-xl block cursor-pointer"
+          [class]="getBadgeClass(subscription()!.tier, subscription()!.status)"
+          [attr.title]="
+            subscription()!.tier === 'free'
+              ? ('NAV.UPGRADE' | translate)
+              : ('NAV.BILLING' | translate)
+          "
+        >
+          <div class="flex items-center justify-between">
+            <div>
+              <div class="text-xs font-semibold">
+                {{ getTierDisplayName(subscription()!.tier) | translate }}
+              </div>
+              @if (subscription()!.status === 'trialing') {
+                <div class="text-xs opacity-80">
+                  {{ 'NAV.TRIAL' | translate }}
+                </div>
+              }
+              @if (subscription()!.status === 'canceled') {
+                <div class="text-xs opacity-80">
+                  {{ 'NAV.EXPIRING' | translate }}
+                </div>
+              }
+            </div>
+            @if (subscription()!.tier === 'free') {
+              <span class="material-icons text-sm opacity-80">arrow_upward</span>
+            } @else {
+              <span class="material-icons text-sm opacity-60">chevron_right</span>
+            }
+          </div>
+        </a>
+      }
+
+      <ul class="flex-1 space-y-1 px-3">
+        <li>
+          <a
+            routerLink="/portfolio"
+            (click)="mobileMenu.close()"
+            class="sidebar-nav-item"
+            routerLinkActive="active"
+            [routerLinkActiveOptions]="{ exact: true }"
+            [class.justify-center]="isCollapsed && !mobileMenu.isMobileMenuOpen()"
+            title="Portfolio"
+          >
+            <span class="material-icons text-xl">account_balance</span>
+            <span
+              class="font-medium"
+              [class.hidden]="isCollapsed && !mobileMenu.isMobileMenuOpen()"
+            >{{ 'NAV.PORTFOLIO' | translate }}</span>
+          </a>
+        </li>
+      </ul>
+
+      <div class="px-3 pb-2">
+        <div
+          class="border-t my-3"
+          [class.hidden]="isCollapsed && !mobileMenu.isMobileMenuOpen()"
+        ></div>
+        <div
+          class="px-3 mb-2 text-xs"
+          [class.hidden]="isCollapsed && !mobileMenu.isMobileMenuOpen()"
+        >
+          {{ 'NAV.ACCOUNT' | translate }}
+        </div>
+      </div>
+
+      @if (isCollapsed && !mobileMenu.isMobileMenuOpen()) {
+        <div class="px-3 pb-4">
+          <button
+            type="button"
+            class="w-full p-2 cursor-pointer flex items-center justify-center"
+            (click)="toggleSidebar()"
+            aria-label="Expand sidebar"
+          >
+            <span class="material-icons">chevron_right</span>
+          </button>
+        </div>
+      }
+    </nav>
+  `,
+  styles: [
+    `
+      .sidebar {
+        background: linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%);
+        border-right: 1px solid rgba(0, 0, 0, 0.08);
+      }
+      .sidebar-nav-item {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 12px 16px;
+      }
+    `,
+  ],
+})
+export class SidenavComponent implements OnInit {
+  isCollapsed = false;
+  subscription = signal<any>(null);
+
+  protected auth = inject(AuthService);
+  protected mobileMenu = inject(MobileMenuService);
+
+  ngOnInit() {}
+  toggleSidebar() { this.isCollapsed = !this.isCollapsed; }
+  getTierDisplayName(tier: string): string { return tier; }
+  getBadgeClass(tier: string, status: string): string { return ''; }
+}
+"#;
+        let path = PathBuf::from("test.component.ts");
+        let result = compile_file(source, &path).expect("should compile");
+        assert!(result.compiled, "should be compiled");
+        assert!(
+            !result.source.contains("@Component"),
+            "decorator should be removed"
+        );
+
+        // The compiled source must be parseable by oxc ts-transform
+        let js = ngc_ts_transform::transform_source(&result.source, "test.component.ts");
+        assert!(
+            js.is_ok(),
+            "oxc should parse compiled source: {:?}\n\nCompiled source:\n{}",
+            js.err(),
+            result.source
+        );
+        let js = js.unwrap();
+        assert!(js.contains("\u{0275}cmp"), "ɵcmp should survive transform");
+    }
+
+    #[test]
     fn test_injectable_roundtrip() {
         let source = r#"import { Injectable } from '@angular/core';
 
