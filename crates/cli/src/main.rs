@@ -165,9 +165,9 @@ fn run_build(
         })
         .unwrap_or_else(|| config_dir.join("dist"));
 
-    // Step 4: Compile templates
+    // Step 4: Compile Angular decorators (@Component, @Injectable, @Directive, @Pipe, @NgModule)
     let files: Vec<PathBuf> = file_graph.graph.node_weights().cloned().collect();
-    let compiled = ngc_template_compiler::compile_templates(&files)?;
+    let compiled = ngc_template_compiler::compile_all_decorators(&files)?;
 
     // Report any JIT fallbacks
     for cf in &compiled {
