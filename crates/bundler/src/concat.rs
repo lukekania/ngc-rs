@@ -113,6 +113,7 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
             generate_source_maps: input.options.source_maps,
             unused_exports: &unused_exports,
             bundled_specifiers: &input.bundled_specifiers,
+            chunk_entry: &chunk.entry,
         })?;
         output_chunks.insert(chunk.filename.clone(), chunk_code);
         if let Some(map) = chunk_map {
@@ -248,6 +249,8 @@ struct ChunkBundleParams<'a> {
     generate_source_maps: bool,
     unused_exports: &'a HashMap<PathBuf, HashSet<String>>,
     bundled_specifiers: &'a HashSet<String>,
+    /// The chunk's entry module — exports from this module are preserved.
+    chunk_entry: &'a Path,
 }
 
 /// Bundle a single chunk's modules into an ESM string, optionally with a source map.
@@ -373,6 +376,7 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<(String, Option<SourceMa
         } else {
             // Project module: use existing rewriter with namespace map
             let module_unused = p.unused_exports.get(module_path);
+            let is_chunk_entry = module_path == p.chunk_entry;
             let rewritten = rewrite::rewrite_module_with_shaking(
                 js_code,
                 &file_name,
@@ -381,6 +385,7 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<(String, Option<SourceMa
                 module_unused,
                 p.bundled_specifiers,
                 &specifier_to_namespace,
+                is_chunk_entry,
             )?;
 
             all_externals.extend(rewritten.external_imports);
