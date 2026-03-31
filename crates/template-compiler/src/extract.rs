@@ -389,10 +389,7 @@ pub fn extract_injectable(
 /// Extract `@Directive` metadata from a TypeScript source file.
 ///
 /// Returns `None` if no `@Directive` decorator is found.
-pub fn extract_directive(
-    source: &str,
-    file_path: &Path,
-) -> NgcResult<Option<ExtractedDirective>> {
+pub fn extract_directive(source: &str, file_path: &Path) -> NgcResult<Option<ExtractedDirective>> {
     let allocator = Allocator::new();
     let source_type =
         SourceType::from_path(file_path).map_err(|_| NgcError::TemplateCompileError {
@@ -590,10 +587,7 @@ pub fn extract_pipe(source: &str, file_path: &Path) -> NgcResult<Option<Extracte
 /// Extract `@NgModule` metadata from a TypeScript source file.
 ///
 /// Returns `None` if no `@NgModule` decorator is found.
-pub fn extract_ng_module(
-    source: &str,
-    file_path: &Path,
-) -> NgcResult<Option<ExtractedNgModule>> {
+pub fn extract_ng_module(source: &str, file_path: &Path) -> NgcResult<Option<ExtractedNgModule>> {
     let allocator = Allocator::new();
     let source_type =
         SourceType::from_path(file_path).map_err(|_| NgcError::TemplateCompileError {
