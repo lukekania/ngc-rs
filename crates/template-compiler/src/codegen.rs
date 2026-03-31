@@ -28,6 +28,8 @@ struct IvyCodegen {
     child_templates: Vec<ChildTemplate>,
     ivy_imports: BTreeSet<String>,
     child_counter: u32,
+    /// Collected static attribute arrays for the `consts` field.
+    consts: Vec<String>,
 }
 
 struct ChildTemplate {
@@ -52,6 +54,7 @@ pub fn generate_ivy(
         child_templates: Vec::new(),
         ivy_imports: BTreeSet::new(),
         child_counter: 0,
+        consts: Vec::new(),
     };
 
     gen.ivy_imports
@@ -96,6 +99,9 @@ pub fn generate_ivy(
     dc.push_str(&format!("    selectors: [['{}']],\n", component.selector));
     if component.standalone {
         dc.push_str("    standalone: true,\n");
+    }
+    if !gen.consts.is_empty() {
+        dc.push_str(&format!("    consts: [{}],\n", gen.consts.join(", ")));
     }
     dc.push_str(&format!("    decls: {decls},\n"));
     dc.push_str(&format!("    vars: {vars},\n"));
@@ -238,9 +244,9 @@ impl IvyCodegen {
                 self.creation
                     .push(format!("{instr}({slot}, '{}');", el.tag));
             } else {
-                let attrs_str = format_static_attrs(&static_attrs);
+                let const_idx = self.register_const(&static_attrs);
                 self.creation
-                    .push(format!("{instr}({slot}, '{}', {attrs_str});", el.tag));
+                    .push(format!("{instr}({slot}, '{}', {const_idx});", el.tag));
             }
         } else {
             let (start_instr, end_instr) = if is_ng_container {
@@ -257,9 +263,9 @@ impl IvyCodegen {
                 self.creation
                     .push(format!("{start_instr}({slot}, '{}');", el.tag));
             } else {
-                let attrs_str = format_static_attrs(&static_attrs);
+                let const_idx = self.register_const(&static_attrs);
                 self.creation
-                    .push(format!("{start_instr}({slot}, '{}', {attrs_str});", el.tag));
+                    .push(format!("{start_instr}({slot}, '{}', {const_idx});", el.tag));
             }
 
             // Event listeners and two-way binding listeners in creation block
@@ -447,6 +453,7 @@ impl IvyCodegen {
         let parent_var = self.var_count;
         let parent_creation = std::mem::take(&mut self.creation);
         let parent_update = std::mem::take(&mut self.update);
+        let parent_consts = std::mem::take(&mut self.consts);
 
         self.slot_index = 0;
         self.var_count = 0;
@@ -481,6 +488,7 @@ impl IvyCodegen {
         self.var_count = parent_var;
         self.creation = parent_creation;
         self.update = parent_update;
+        self.consts = parent_consts;
 
         ChildTemplate {
             function_name: fn_name.to_string(),
@@ -709,6 +717,7 @@ impl IvyCodegen {
         let parent_var = self.var_count;
         let parent_creation = std::mem::take(&mut self.creation);
         let parent_update = std::mem::take(&mut self.update);
+        let parent_consts = std::mem::take(&mut self.consts);
 
         self.slot_index = 0;
         self.var_count = 0;
@@ -744,6 +753,7 @@ impl IvyCodegen {
         self.var_count = parent_var;
         self.creation = parent_creation;
         self.update = parent_update;
+        self.consts = parent_consts;
 
         ChildTemplate {
             function_name: fn_name.to_string(),
@@ -764,6 +774,7 @@ impl IvyCodegen {
         let parent_var = self.var_count;
         let parent_creation = std::mem::take(&mut self.creation);
         let parent_update = std::mem::take(&mut self.update);
+        let parent_consts = std::mem::take(&mut self.consts);
 
         self.slot_index = 0;
         self.var_count = 0;
@@ -800,6 +811,7 @@ impl IvyCodegen {
         self.var_count = parent_var;
         self.creation = parent_creation;
         self.update = parent_update;
+        self.consts = parent_consts;
 
         ChildTemplate {
             function_name: fn_name.to_string(),
@@ -898,6 +910,14 @@ impl IvyCodegen {
         // from ctx. prefixing by is_builtin().
         let result = replace_nested_pipe_parens(trimmed, self);
         ctx_expr(&result)
+    }
+
+    /// Register a static attribute array in the `consts` table and return its index.
+    fn register_const(&mut self, attrs: &[(&str, &str)]) -> usize {
+        let formatted = format_static_attrs(attrs);
+        let idx = self.consts.len();
+        self.consts.push(formatted);
+        idx
     }
 
     /// Add an `ɵɵadvance()` instruction to the update block if needed.
