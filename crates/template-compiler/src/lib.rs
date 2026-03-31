@@ -1,14 +1,21 @@
-//! Angular template compiler for ngc-rs.
+//! Angular Ivy compiler for ngc-rs.
 //!
-//! Compiles `@Component` templates to Angular Ivy instructions. Parses template
-//! HTML with pest, generates Ivy codegen (ɵɵdefineComponent, template function),
-//! and rewrites TypeScript source to replace the decorator with static Ivy metadata.
+//! AOT-compiles Angular decorators (`@Component`, `@Injectable`, `@Directive`,
+//! `@Pipe`, `@NgModule`) to Ivy static fields. Parses template HTML with pest,
+//! generates Ivy codegen, and rewrites TypeScript source to replace decorators
+//! with static Ivy metadata.
 
 mod ast;
 mod codegen;
+mod directive_codegen;
 mod extract;
+mod factory_codegen;
+mod injectable_codegen;
+mod ng_module_codegen;
 mod parser;
+mod pipe_codegen;
 mod rewrite;
+mod selector;
 
 use std::path::{Path, PathBuf};
 
@@ -106,7 +113,7 @@ pub fn generate_template_fn(
 
 /// Extract the template function from the IvyOutput's defineComponent code.
 fn extract_template_fn_from_ivy(ivy: &codegen::IvyOutput, class_name: &str) -> String {
-    let dc = &ivy.define_component_code;
+    let dc = ivy.static_fields.first().map(|s| s.as_str()).unwrap_or("");
     let template_marker = format!("template: function {class_name}_Template");
 
     if let Some(start) = dc.find(&template_marker) {
@@ -140,7 +147,7 @@ fn extract_template_fn_from_ivy(ivy: &codegen::IvyOutput, class_name: &str) -> S
 
 /// Extract decls and vars from the IvyOutput's defineComponent code.
 fn extract_decls_vars_from_ivy(ivy: &codegen::IvyOutput) -> (u32, u32) {
-    let dc = &ivy.define_component_code;
+    let dc = ivy.static_fields.first().map(|s| s.as_str()).unwrap_or("");
 
     let decls = extract_number_prop(dc, "decls: ").unwrap_or(0);
     let vars = extract_number_prop(dc, "vars: ").unwrap_or(0);
@@ -180,15 +187,15 @@ pub struct CompiledFile {
     pub jit_fallback: bool,
 }
 
-/// Compile Angular component templates in the given TypeScript source files.
+/// Compile all Angular decorators in the given TypeScript source files.
 ///
-/// For each file that contains an `@Component` decorator with an inline `template`,
-/// parses the template, generates Ivy instructions, and rewrites the source to
-/// replace the decorator with static Ivy metadata. Files without `@Component`
-/// decorators are returned unchanged.
+/// Handles `@Component`, `@Injectable`, `@Directive`, `@Pipe`, and `@NgModule`.
+/// For each file, extracts Angular decorators, generates Ivy instructions, and
+/// rewrites the source to replace decorators with static Ivy metadata.
+/// Files without Angular decorators are returned unchanged.
 ///
 /// Files are processed in parallel using rayon.
-pub fn compile_templates(files: &[PathBuf]) -> NgcResult<Vec<CompiledFile>> {
+pub fn compile_all_decorators(files: &[PathBuf]) -> NgcResult<Vec<CompiledFile>> {
     let results: Vec<NgcResult<CompiledFile>> = files
         .par_iter()
         .map(|file_path| {
@@ -197,11 +204,89 @@ pub fn compile_templates(files: &[PathBuf]) -> NgcResult<Vec<CompiledFile>> {
                 source: e,
             })?;
 
-            compile_component(&source, file_path)
+            compile_file(&source, file_path)
         })
         .collect();
 
     results.into_iter().collect()
+}
+
+/// Backward-compatible alias for `compile_all_decorators`.
+pub fn compile_templates(files: &[PathBuf]) -> NgcResult<Vec<CompiledFile>> {
+    compile_all_decorators(files)
+}
+
+/// Compile a single TypeScript source file, handling all Angular decorator types.
+///
+/// Tries `@Component` first, then falls through to `@Injectable`, `@Directive`,
+/// `@Pipe`, and `@NgModule`. Returns the source unchanged if no Angular decorator
+/// is found.
+fn compile_file(source: &str, file_path: &Path) -> NgcResult<CompiledFile> {
+    // Try @Component first (most complex, has template compilation)
+    let component_result = compile_component(source, file_path)?;
+    if component_result.compiled || component_result.jit_fallback {
+        return Ok(component_result);
+    }
+
+    // Try @Injectable
+    if let Some(extracted) = extract::extract_injectable(source, file_path)? {
+        let ivy_output = injectable_codegen::generate_injectable_ivy(&extracted)?;
+        let rewritten = rewrite::rewrite_source_generic(source, &extracted.common, &ivy_output)?;
+        debug!(path = %file_path.display(), "compiled @Injectable to Ivy");
+        return Ok(CompiledFile {
+            source_path: file_path.to_path_buf(),
+            source: rewritten,
+            compiled: true,
+            jit_fallback: false,
+        });
+    }
+
+    // Try @Directive
+    if let Some(extracted) = extract::extract_directive(source, file_path)? {
+        let ivy_output = directive_codegen::generate_directive_ivy(&extracted)?;
+        let rewritten = rewrite::rewrite_source_generic(source, &extracted.common, &ivy_output)?;
+        debug!(path = %file_path.display(), "compiled @Directive to Ivy");
+        return Ok(CompiledFile {
+            source_path: file_path.to_path_buf(),
+            source: rewritten,
+            compiled: true,
+            jit_fallback: false,
+        });
+    }
+
+    // Try @Pipe
+    if let Some(extracted) = extract::extract_pipe(source, file_path)? {
+        let ivy_output = pipe_codegen::generate_pipe_ivy(&extracted)?;
+        let rewritten = rewrite::rewrite_source_generic(source, &extracted.common, &ivy_output)?;
+        debug!(path = %file_path.display(), "compiled @Pipe to Ivy");
+        return Ok(CompiledFile {
+            source_path: file_path.to_path_buf(),
+            source: rewritten,
+            compiled: true,
+            jit_fallback: false,
+        });
+    }
+
+    // Try @NgModule
+    if let Some(extracted) = extract::extract_ng_module(source, file_path)? {
+        let ivy_output = ng_module_codegen::generate_ng_module_ivy(&extracted)?;
+        let rewritten = rewrite::rewrite_source_generic(source, &extracted.common, &ivy_output)?;
+        debug!(path = %file_path.display(), "compiled @NgModule to Ivy");
+        return Ok(CompiledFile {
+            source_path: file_path.to_path_buf(),
+            source: rewritten,
+            compiled: true,
+            jit_fallback: false,
+        });
+    }
+
+    // No Angular decorator found
+    Ok(CompiledFile {
+        source_path: file_path.to_path_buf(),
+        source: source.to_string(),
+        compiled: false,
+        jit_fallback: false,
+    })
 }
 
 /// Compile a single TypeScript source string containing an Angular component.
@@ -301,5 +386,346 @@ mod tests {
             js.err(),
             result.source
         );
+    }
+
+    #[test]
+    fn test_complex_component_roundtrip() {
+        // Exact reproduction of SidenavComponent patterns including:
+        // - HTML comments, multi-line attribute bindings, pipes in ternary sub-expressions
+        // - non-null assertions, complex class/style/attr bindings, routerLink directives
+        // - CSS styles in template literal array
+        let source = r#"import { Component, DestroyRef, inject, OnInit, signal } from '@angular/core';
+import { RouterModule } from '@angular/router';
+import { TranslateModule } from '@ngx-translate/core';
+
+@Component({
+  selector: 'app-side-nav',
+  standalone: true,
+  imports: [RouterModule, TranslateModule],
+  template: `
+    <!-- Mobile Overlay Backdrop -->
+    @if (mobileMenu.isMobileMenuOpen() && auth.token) {
+      <div
+        class="fixed inset-0 bg-neutral-900/60 backdrop-blur-sm z-40 md:hidden animate-fade-in"
+        (click)="mobileMenu.close()"
+        aria-hidden="true"
+      ></div>
+    }
+
+    <nav
+      class="sidebar"
+      [class.w-64]="!isCollapsed || mobileMenu.isMobileMenuOpen()"
+      [class.w-20]="isCollapsed && !mobileMenu.isMobileMenuOpen()"
+      [class.translate-x-0]="mobileMenu.isMobileMenuOpen()"
+      [hidden]="!auth.token"
+    >
+      <div class="flex items-center justify-between p-4">
+        <div [class.hidden]="isCollapsed && !mobileMenu.isMobileMenuOpen()">
+          <span class="text-xl font-bold">Treasr</span>
+        </div>
+
+        @if (isCollapsed && !mobileMenu.isMobileMenuOpen()) {
+          <div class="mx-auto">
+            <span class="material-icons text-white text-xl">trending_up</span>
+          </div>
+        }
+
+        <button
+          type="button"
+          class="p-2 cursor-pointer hidden md:block"
+          [class.ml-auto]="!isCollapsed"
+          [class.hidden]="isCollapsed && !mobileMenu.isMobileMenuOpen()"
+          (click)="toggleSidebar()"
+          [attr.aria-expanded]="!isCollapsed"
+          [attr.aria-label]="
+            isCollapsed ? 'Expand sidebar' : 'Collapse sidebar'
+          "
+        >
+          <span
+            class="material-icons"
+            [style.transform]="isCollapsed ? 'rotate(180deg)' : 'rotate(0deg)'"
+          >
+            chevron_left
+          </span>
+        </button>
+      </div>
+
+      @if (subscription() && (!isCollapsed || mobileMenu.isMobileMenuOpen())) {
+        <a
+          routerLink="/billing"
+          (click)="mobileMenu.close()"
+          class="mx-3 mb-4 px-3 py-2.5 rounded-xl block cursor-pointer"
+          [class]="getBadgeClass(subscription()!.tier, subscription()!.status)"
+          [attr.title]="
+            subscription()!.tier === 'free'
+              ? ('NAV.UPGRADE' | translate)
+              : ('NAV.BILLING' | translate)
+          "
+        >
+          <div class="flex items-center justify-between">
+            <div>
+              <div class="text-xs font-semibold">
+                {{ getTierDisplayName(subscription()!.tier) | translate }}
+              </div>
+              @if (subscription()!.status === 'trialing') {
+                <div class="text-xs opacity-80">
+                  {{ 'NAV.TRIAL' | translate }}
+                </div>
+              }
+              @if (subscription()!.status === 'canceled') {
+                <div class="text-xs opacity-80">
+                  {{ 'NAV.EXPIRING' | translate }}
+                </div>
+              }
+            </div>
+            @if (subscription()!.tier === 'free') {
+              <span class="material-icons text-sm opacity-80">arrow_upward</span>
+            } @else {
+              <span class="material-icons text-sm opacity-60">chevron_right</span>
+            }
+          </div>
+        </a>
+      }
+
+      <ul class="flex-1 space-y-1 px-3">
+        <li>
+          <a
+            routerLink="/portfolio"
+            (click)="mobileMenu.close()"
+            class="sidebar-nav-item"
+            routerLinkActive="active"
+            [routerLinkActiveOptions]="{ exact: true }"
+            [class.justify-center]="isCollapsed && !mobileMenu.isMobileMenuOpen()"
+            title="Portfolio"
+          >
+            <span class="material-icons text-xl">account_balance</span>
+            <span
+              class="font-medium"
+              [class.hidden]="isCollapsed && !mobileMenu.isMobileMenuOpen()"
+            >{{ 'NAV.PORTFOLIO' | translate }}</span>
+          </a>
+        </li>
+      </ul>
+
+      <div class="px-3 pb-2">
+        <div
+          class="border-t my-3"
+          [class.hidden]="isCollapsed && !mobileMenu.isMobileMenuOpen()"
+        ></div>
+        <div
+          class="px-3 mb-2 text-xs"
+          [class.hidden]="isCollapsed && !mobileMenu.isMobileMenuOpen()"
+        >
+          {{ 'NAV.ACCOUNT' | translate }}
+        </div>
+      </div>
+
+      @if (isCollapsed && !mobileMenu.isMobileMenuOpen()) {
+        <div class="px-3 pb-4">
+          <button
+            type="button"
+            class="w-full p-2 cursor-pointer flex items-center justify-center"
+            (click)="toggleSidebar()"
+            aria-label="Expand sidebar"
+          >
+            <span class="material-icons">chevron_right</span>
+          </button>
+        </div>
+      }
+    </nav>
+  `,
+  styles: [
+    `
+      .sidebar {
+        background: linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%);
+        border-right: 1px solid rgba(0, 0, 0, 0.08);
+      }
+      .sidebar-nav-item {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 12px 16px;
+      }
+    `,
+  ],
+})
+export class SidenavComponent implements OnInit {
+  isCollapsed = false;
+  subscription = signal<any>(null);
+
+  protected auth = inject(AuthService);
+  protected mobileMenu = inject(MobileMenuService);
+
+  ngOnInit() {}
+  toggleSidebar() { this.isCollapsed = !this.isCollapsed; }
+  getTierDisplayName(tier: string): string { return tier; }
+  getBadgeClass(tier: string, status: string): string { return ''; }
+}
+"#;
+        let path = PathBuf::from("test.component.ts");
+        let result = compile_file(source, &path).expect("should compile");
+        assert!(result.compiled, "should be compiled");
+        assert!(
+            !result.source.contains("@Component"),
+            "decorator should be removed"
+        );
+
+        // The compiled source must be parseable by oxc ts-transform
+        let js = ngc_ts_transform::transform_source(&result.source, "test.component.ts");
+        assert!(
+            js.is_ok(),
+            "oxc should parse compiled source: {:?}\n\nCompiled source:\n{}",
+            js.err(),
+            result.source
+        );
+        let js = js.unwrap();
+        assert!(js.contains("\u{0275}cmp"), "ɵcmp should survive transform");
+    }
+
+    #[test]
+    fn test_injectable_roundtrip() {
+        let source = r#"import { Injectable } from '@angular/core';
+
+@Injectable({ providedIn: 'root' })
+export class AuthService {
+  isLoggedIn = false;
+}
+"#;
+        let path = PathBuf::from("auth.service.ts");
+        let result = compile_file(source, &path).expect("should compile");
+        assert!(result.compiled, "should be compiled");
+        assert!(result.source.contains("\u{0275}prov"));
+        assert!(result.source.contains("\u{0275}\u{0275}defineInjectable"));
+        assert!(!result.source.contains("@Injectable"));
+
+        let js = ngc_ts_transform::transform_source(&result.source, "auth.service.ts");
+        assert!(
+            js.is_ok(),
+            "oxc should parse compiled source: {:?}\n\nCompiled source:\n{}",
+            js.err(),
+            result.source
+        );
+    }
+
+    #[test]
+    fn test_injectable_with_deps_roundtrip() {
+        let source = r#"import { Injectable } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
+import { Router } from '@angular/router';
+
+@Injectable({ providedIn: 'root' })
+export class DataService {
+  constructor(private http: HttpClient, private router: Router) {}
+}
+"#;
+        let path = PathBuf::from("data.service.ts");
+        let result = compile_file(source, &path).expect("should compile");
+        assert!(result.compiled);
+        assert!(result.source.contains("\u{0275}\u{0275}inject(HttpClient)"));
+        assert!(result.source.contains("\u{0275}\u{0275}inject(Router)"));
+
+        let js = ngc_ts_transform::transform_source(&result.source, "data.service.ts");
+        assert!(
+            js.is_ok(),
+            "oxc should parse compiled source: {:?}\n\nCompiled source:\n{}",
+            js.err(),
+            result.source
+        );
+    }
+
+    #[test]
+    fn test_directive_roundtrip() {
+        let source = r#"import { Directive, ElementRef } from '@angular/core';
+
+@Directive({
+  selector: '[appHighlight]',
+  standalone: true
+})
+export class HighlightDirective {
+  constructor(private el: ElementRef) {}
+}
+"#;
+        let path = PathBuf::from("highlight.directive.ts");
+        let result = compile_file(source, &path).expect("should compile");
+        assert!(result.compiled);
+        assert!(result.source.contains("\u{0275}dir"));
+        assert!(result.source.contains("\u{0275}\u{0275}defineDirective"));
+        assert!(result.source.contains("\u{0275}\u{0275}inject(ElementRef)"));
+        assert!(!result.source.contains("@Directive"));
+
+        let js = ngc_ts_transform::transform_source(&result.source, "highlight.directive.ts");
+        assert!(
+            js.is_ok(),
+            "oxc should parse compiled source: {:?}\n\nCompiled source:\n{}",
+            js.err(),
+            result.source
+        );
+    }
+
+    #[test]
+    fn test_pipe_roundtrip() {
+        let source = r#"import { Pipe, PipeTransform } from '@angular/core';
+
+@Pipe({
+  name: 'dateFormat',
+  standalone: true
+})
+export class DateFormatPipe implements PipeTransform {
+  transform(value: any): string { return ''; }
+}
+"#;
+        let path = PathBuf::from("date-format.pipe.ts");
+        let result = compile_file(source, &path).expect("should compile");
+        assert!(result.compiled);
+        assert!(result.source.contains("\u{0275}pipe"));
+        assert!(result.source.contains("\u{0275}\u{0275}definePipe"));
+        assert!(result.source.contains("name: 'dateFormat'"));
+        assert!(!result.source.contains("@Pipe"));
+
+        let js = ngc_ts_transform::transform_source(&result.source, "date-format.pipe.ts");
+        assert!(
+            js.is_ok(),
+            "oxc should parse compiled source: {:?}\n\nCompiled source:\n{}",
+            js.err(),
+            result.source
+        );
+    }
+
+    #[test]
+    fn test_ng_module_roundtrip() {
+        let source = r#"import { NgModule } from '@angular/core';
+
+@NgModule({
+  declarations: [AppComponent],
+  imports: [CommonModule],
+  bootstrap: [AppComponent]
+})
+export class AppModule {}
+"#;
+        let path = PathBuf::from("app.module.ts");
+        let result = compile_file(source, &path).expect("should compile");
+        assert!(result.compiled);
+        assert!(result.source.contains("\u{0275}mod"));
+        assert!(result.source.contains("\u{0275}inj"));
+        assert!(result.source.contains("\u{0275}\u{0275}defineNgModule"));
+        assert!(result.source.contains("\u{0275}\u{0275}defineInjector"));
+        assert!(!result.source.contains("@NgModule"));
+
+        let js = ngc_ts_transform::transform_source(&result.source, "app.module.ts");
+        assert!(
+            js.is_ok(),
+            "oxc should parse compiled source: {:?}\n\nCompiled source:\n{}",
+            js.err(),
+            result.source
+        );
+    }
+
+    #[test]
+    fn test_plain_class_unchanged() {
+        let source = "export class PlainClass { x = 1; }\n";
+        let path = PathBuf::from("plain.ts");
+        let result = compile_file(source, &path).expect("should compile");
+        assert!(!result.compiled);
+        assert_eq!(result.source, source);
     }
 }

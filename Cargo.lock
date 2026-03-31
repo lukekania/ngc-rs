@@ -680,7 +680,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-bundler"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "insta",
  "ngc-diagnostics",
@@ -703,7 +703,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-diagnostics"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "serde_json",
  "thiserror",
@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-linker"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "insta",
  "ngc-diagnostics",
@@ -725,7 +725,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-npm-resolver"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ngc-diagnostics",
  "ngc-project-resolver",
@@ -739,7 +739,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-project-resolver"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "criterion",
  "glob",
@@ -756,7 +756,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-rs"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "clap",
  "colored",
@@ -779,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-template-compiler"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "insta",
  "ngc-diagnostics",
@@ -797,7 +797,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-ts-transform"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "insta",
  "ngc-diagnostics",
