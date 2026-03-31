@@ -941,8 +941,8 @@ mod tests {
             is_void: true,
         })];
         let output = generate_ivy(&comp, &nodes).expect("should generate");
-        assert!(output.define_component_code.contains("decls: 1"));
-        assert!(output.define_component_code.contains("vars: 0"));
+        assert!(output.static_fields[0].contains("decls: 1"));
+        assert!(output.static_fields[0].contains("vars: 0"));
         assert!(output.ivy_imports.contains("\u{0275}\u{0275}element"));
     }
 
@@ -958,7 +958,7 @@ mod tests {
             is_void: false,
         })];
         let output = generate_ivy(&comp, &nodes).expect("should generate");
-        assert!(output.define_component_code.contains("decls: 2"));
+        assert!(output.static_fields[0].contains("decls: 2"));
         assert!(output.ivy_imports.contains("\u{0275}\u{0275}elementStart"));
         assert!(output.ivy_imports.contains("\u{0275}\u{0275}text"));
     }
@@ -971,10 +971,9 @@ mod tests {
             pipes: Vec::new(),
         })];
         let output = generate_ivy(&comp, &nodes).expect("should generate");
-        assert!(output.define_component_code.contains("decls: 1"));
-        assert!(output.define_component_code.contains("vars: 1"));
-        assert!(output
-            .define_component_code
+        assert!(output.static_fields[0].contains("decls: 1"));
+        assert!(output.static_fields[0].contains("vars: 1"));
+        assert!(output.static_fields[0]
             .contains("\u{0275}\u{0275}textInterpolate(ctx.title);"));
     }
 
@@ -994,7 +993,7 @@ mod tests {
         })];
         let output = generate_ivy(&comp, &nodes).expect("should generate");
         assert!(output.ivy_imports.contains("\u{0275}\u{0275}listener"));
-        assert!(output.define_component_code.contains("listener"));
+        assert!(output.static_fields[0].contains("listener"));
     }
 
     #[test]
