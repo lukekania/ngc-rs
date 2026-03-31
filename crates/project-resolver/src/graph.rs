@@ -21,6 +21,9 @@ pub struct FileGraph {
     pub entry_points: Vec<PathBuf>,
     /// Import specifiers that could not be resolved to a file.
     pub unresolved: Vec<UnresolvedImport>,
+    /// Bare module specifiers (npm packages) and the project files that import them.
+    /// Used for npm resolution: maps specifier → list of (importing_file, import_kind).
+    pub npm_import_sites: HashMap<String, Vec<(PathBuf, ImportKind)>>,
 }
 
 /// Record of an import that could not be resolved to a file on disk.
@@ -115,6 +118,7 @@ pub fn build_file_graph(config: &ResolvedTsConfig) -> NgcResult<FileGraph> {
         .collect();
 
     let mut unresolved = Vec::new();
+    let mut npm_import_sites: HashMap<String, Vec<(PathBuf, ImportKind)>> = HashMap::new();
 
     // Resolve imports and add edges (single-threaded for graph mutation)
     for (from_file, scanned_imports) in &scan_results {
@@ -128,12 +132,18 @@ pub fn build_file_graph(config: &ResolvedTsConfig) -> NgcResult<FileGraph> {
                     // If resolved but not in our file set, it's an external file — skip
                 }
                 None => {
-                    // Only record as unresolved if it looks like a project-local import
                     if is_project_local(&scanned.specifier, &resolver_config) {
+                        // Project-local import that failed to resolve
                         unresolved.push(UnresolvedImport {
                             from_file: from_file.clone(),
                             specifier: scanned.specifier.clone(),
                         });
+                    } else {
+                        // Bare module specifier — record for npm resolution
+                        npm_import_sites
+                            .entry(scanned.specifier.clone())
+                            .or_default()
+                            .push((from_file.clone(), scanned.kind));
                     }
                 }
             }
@@ -163,6 +173,7 @@ pub fn build_file_graph(config: &ResolvedTsConfig) -> NgcResult<FileGraph> {
         path_index,
         entry_points,
         unresolved,
+        npm_import_sites,
     })
 }
 

@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use ngc_diagnostics::{NgcError, NgcResult};
+use ngc_diagnostics::NgcResult;
 use oxc_allocator::Allocator;
 use oxc_codegen::{Codegen, CodegenOptions};
 use oxc_parser::Parser;
@@ -34,9 +34,14 @@ pub fn minify_chunk(
     let allocator = Allocator::new();
     let parsed = Parser::new(&allocator, code, SourceType::mjs()).parse();
 
-    if parsed.panicked {
-        return Err(NgcError::BundleError {
-            message: format!("minification parse failed for {filename}"),
+    if parsed.panicked || !parsed.errors.is_empty() {
+        tracing::warn!(
+            filename,
+            "minification skipped: parse errors in bundled output, using unminified code"
+        );
+        return Ok(MinifiedChunk {
+            code: code.to_string(),
+            source_map: bundle_map.cloned(),
         });
     }
 
@@ -58,7 +63,14 @@ pub fn minify_chunk(
 
     // Compose: minified->bundle + bundle->original = minified->original
     let final_map = match (codegen_ret.map, bundle_map) {
-        (Some(minify_map), Some(bmap)) => Some(compose_source_maps(&minify_map, bmap)),
+        (Some(minify_map), Some(bmap)) => {
+            // The compose step can panic inside oxc_sourcemap's generate_lookup_table
+            // if token indices are inconsistent (e.g., with very large npm bundles).
+            // Catch and fall back to the uncomposed minification map.
+            std::panic::catch_unwind(|| compose_source_maps(&minify_map, bmap))
+                .ok()
+                .or(Some(minify_map))
+        }
         _ => None,
     };
 
@@ -98,8 +110,11 @@ fn compose_source_maps(outer: &SourceMap, inner: &SourceMap) -> SourceMap {
         let src_col = token.get_src_col();
 
         if let Some(resolved) = inner.lookup_token(&lookup, src_line, src_col) {
-            let out_source_id = resolved.get_source_id().map(|sid| {
-                *source_id_map.entry(sid).or_insert_with(|| {
+            let out_source_id = resolved.get_source_id().and_then(|sid| {
+                if (sid as usize) >= inner_sources.len() {
+                    return None;
+                }
+                Some(*source_id_map.entry(sid).or_insert_with(|| {
                     let id = sources.len() as u32;
                     sources.push(inner_sources[sid as usize].clone());
                     if (sid as usize) < inner_source_contents.len() {
@@ -108,15 +123,18 @@ fn compose_source_maps(outer: &SourceMap, inner: &SourceMap) -> SourceMap {
                         source_contents.push(None);
                     }
                     id
-                })
+                }))
             });
 
-            let out_name_id = resolved.get_name_id().map(|nid| {
-                *name_id_map.entry(nid).or_insert_with(|| {
+            let out_name_id = resolved.get_name_id().and_then(|nid| {
+                if (nid as usize) >= inner_names.len() {
+                    return None;
+                }
+                Some(*name_id_map.entry(nid).or_insert_with(|| {
                     let id = names.len() as u32;
                     names.push(inner_names[nid as usize].clone());
                     id
-                })
+                }))
             });
 
             tokens.push(oxc_sourcemap::Token::new(

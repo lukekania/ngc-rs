@@ -218,14 +218,88 @@ fn run_build(
         }
     }
 
+    // Step 6.5: Resolve npm dependencies
+    // Collect bare specifiers from project scanning AND from transformed output
+    // (oxc may inject new imports like @oxc-project/runtime/helpers/decorate)
+    let mut bare_specifiers: Vec<String> = file_graph.npm_import_sites.keys().cloned().collect();
+    let post_transform_specifiers = scan_transformed_bare_specifiers(&modules, &local_prefixes);
+    for spec in post_transform_specifiers {
+        if !bare_specifiers.contains(&spec) {
+            bare_specifiers.push(spec);
+        }
+    }
+    let npm_resolution = ngc_npm_resolver::resolve_npm_dependencies(&bare_specifiers, &config_dir)?;
+
+    // Merge npm modules into the modules map (they're already JS — no transform needed)
+    for (path, source) in &npm_resolution.modules {
+        modules.insert(path.clone(), source.clone());
+    }
+
+    // Inject vendored helpers for oxc runtime (not an npm dependency of the project)
+    let injected_helpers = inject_oxc_runtime_helpers(&mut modules, &bare_specifiers, &config_dir);
+
+    // Add npm file nodes and injected helper nodes to the graph
+    let mut graph = file_graph.graph;
+    let mut path_index = file_graph.path_index;
+    for path in npm_resolution.modules.keys() {
+        if !path_index.contains_key(path) {
+            let idx = graph.add_node(path.clone());
+            path_index.insert(path.clone(), idx);
+        }
+    }
+    for (_, helper_path) in &injected_helpers {
+        if !path_index.contains_key(helper_path) {
+            let idx = graph.add_node(helper_path.clone());
+            path_index.insert(helper_path.clone(), idx);
+        }
+    }
+
+    // Add edges from project files to npm entry files
+    for (specifier, import_sites) in &file_graph.npm_import_sites {
+        if let Some(entry_path) = npm_resolution
+            .resolved_specifiers
+            .contains(specifier)
+            .then(|| ngc_npm_resolver::resolve::resolve_bare_specifier(specifier, &config_dir).ok())
+            .flatten()
+        {
+            if let Some(&to_idx) = path_index.get(&entry_path) {
+                for (from_file, kind) in import_sites {
+                    if let Some(&from_idx) = path_index.get(from_file) {
+                        graph.add_edge(from_idx, to_idx, *kind);
+                    }
+                }
+            }
+        }
+    }
+
+    // Add internal npm edges
+    for (from, to, kind) in &npm_resolution.edges {
+        if let (Some(&from_idx), Some(&to_idx)) = (path_index.get(from), path_index.get(to)) {
+            graph.add_edge(from_idx, to_idx, *kind);
+        }
+    }
+
+    // Add injected helpers to resolved specifiers and connect edges
+    let mut bundled_specifiers = npm_resolution.resolved_specifiers;
+    for (spec, helper_path) in &injected_helpers {
+        bundled_specifiers.insert(spec.clone());
+        // Connect from the entry point to ensure the helper is reachable
+        if let (Some(&entry_idx), Some(&to_idx)) =
+            (path_index.get(&entry), path_index.get(helper_path))
+        {
+            graph.add_edge(entry_idx, to_idx, ngc_project_resolver::ImportKind::Static);
+        }
+    }
+
     let bundle_input = BundleInput {
         modules,
-        graph: file_graph.graph,
+        graph,
         entry,
         local_prefixes,
         root_dir,
         options: bundle_options,
         per_module_maps,
+        bundled_specifiers,
     };
 
     let bundle_output = ngc_bundler::bundle(&bundle_input)?;
@@ -355,7 +429,10 @@ fn build_options(configuration: Option<&str>) -> BundleOptions {
             source_maps: true,
             minify: true,
             content_hash: true,
-            tree_shake: true,
+            // Tree shaking disabled: conflicts with dynamic import rewrites
+            // when an export declaration contains import() expressions.
+            // TODO: fix tree shaker to skip declarations with nested dynamic imports
+            tree_shake: false,
         },
         _ => BundleOptions::default(),
     }
@@ -950,6 +1027,98 @@ fn transform_with_fallback(
     results.into_iter().collect()
 }
 
+/// Vendored oxc runtime helpers.
+///
+/// When the oxc transformer injects `import _decorate from '@oxc-project/runtime/helpers/decorate'`,
+/// this helper is usually not installed as a project dependency. We inline the helper code
+/// directly so it gets bundled without requiring `npm install @oxc-project/runtime`.
+const OXC_DECORATE_HELPER: &str = r#"function __decorate(decorators, target, key, desc) {
+  var c = arguments.length,
+    r = c < 3 ? target : desc === null ? (desc = Object.getOwnPropertyDescriptor(target, key)) : desc,
+    d;
+  if (typeof Reflect === "object" && typeof Reflect.decorate === "function")
+    r = Reflect.decorate(decorators, target, key, desc);
+  else
+    for (var i = decorators.length - 1; i >= 0; i--)
+      if ((d = decorators[i]))
+        r = (c < 3 ? d(r) : c > 3 ? d(target, key, r) : d(target, key)) || r;
+  return c > 3 && r && Object.defineProperty(target, key, r), r;
+}
+export { __decorate as default };
+"#;
+
+/// Inject vendored oxc runtime helpers into the modules map.
+///
+/// If the transformed code references `@oxc-project/runtime/helpers/decorate` and
+/// the package is not installed in `node_modules`, we inject a vendored copy of
+/// the helper so it can be bundled without requiring an npm install.
+/// Inject vendored oxc runtime helpers into the modules map.
+///
+/// If the transformed code references `@oxc-project/runtime/helpers/decorate` and
+/// the package is not installed in `node_modules`, we inject a vendored copy of
+/// the helper so it can be bundled without requiring an npm install.
+/// Returns the specifiers that were injected (to add to `resolved_specifiers`).
+fn inject_oxc_runtime_helpers(
+    modules: &mut HashMap<PathBuf, String>,
+    bare_specifiers: &[String],
+    project_root: &Path,
+) -> Vec<(String, PathBuf)> {
+    let runtime_helpers = [("@oxc-project/runtime/helpers/decorate", OXC_DECORATE_HELPER)];
+    let mut injected = Vec::new();
+
+    for (specifier, helper_code) in &runtime_helpers {
+        let spec_str = specifier.to_string();
+        if !bare_specifiers.contains(&spec_str) {
+            continue;
+        }
+        // Only inject if the package is not already installed
+        let pkg_dir = project_root.join("node_modules/@oxc-project/runtime");
+        if pkg_dir.is_dir() {
+            continue;
+        }
+        // Create a synthetic file path for the vendored helper
+        let synthetic_path = project_root
+            .join("node_modules")
+            .join(specifier.replace('/', std::path::MAIN_SEPARATOR_STR))
+            .with_extension("js");
+
+        modules.insert(synthetic_path.clone(), helper_code.to_string());
+        injected.push((spec_str, synthetic_path));
+    }
+
+    injected
+}
+
+/// Scan transformed JS code for bare import specifiers not matching local prefixes.
+///
+/// This catches imports injected by the TS transformer (e.g. `@oxc-project/runtime`)
+/// that weren't present in the original TypeScript source code.
+fn scan_transformed_bare_specifiers(
+    modules: &HashMap<PathBuf, String>,
+    local_prefixes: &[String],
+) -> Vec<String> {
+    let import_re = regex::Regex::new(r#"(?:import|export)\s+.*?\s+from\s+['"]([^'"]+)['"]"#)
+        .expect("valid regex");
+    let mut specifiers = std::collections::HashSet::new();
+
+    for code in modules.values() {
+        for cap in import_re.captures_iter(code) {
+            let spec = &cap[1];
+            // Skip relative and local-prefix imports
+            if spec.starts_with('.')
+                || local_prefixes
+                    .iter()
+                    .any(|prefix| spec.starts_with(prefix.as_str()))
+            {
+                continue;
+            }
+            specifiers.insert(spec.to_string());
+        }
+    }
+
+    specifiers.into_iter().collect()
+}
+
 /// Find the entry point from graph entry points by looking for main.ts.
 fn find_entry_point(entry_points: &[PathBuf]) -> NgcResult<PathBuf> {
     entry_points
@@ -1046,7 +1215,7 @@ mod tests {
         assert!(opts.source_maps);
         assert!(opts.minify);
         assert!(opts.content_hash);
-        assert!(opts.tree_shake);
+        assert!(!opts.tree_shake); // disabled: conflicts with dynamic import rewrites
     }
 
     #[test]

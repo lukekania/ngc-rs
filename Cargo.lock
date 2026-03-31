@@ -680,10 +680,11 @@ dependencies = [
 
 [[package]]
 name = "ngc-bundler"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "insta",
  "ngc-diagnostics",
+ "ngc-npm-resolver",
  "ngc-project-resolver",
  "ngc-template-compiler",
  "ngc-ts-transform",
@@ -695,21 +696,36 @@ dependencies = [
  "oxc_sourcemap",
  "oxc_span",
  "petgraph",
+ "regex",
  "sha2",
  "tracing",
 ]
 
 [[package]]
 name = "ngc-diagnostics"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "serde_json",
  "thiserror",
 ]
 
 [[package]]
+name = "ngc-npm-resolver"
+version = "0.7.1"
+dependencies = [
+ "ngc-diagnostics",
+ "ngc-project-resolver",
+ "rayon",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "ngc-project-resolver"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "criterion",
  "glob",
@@ -726,13 +742,14 @@ dependencies = [
 
 [[package]]
 name = "ngc-rs"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "clap",
  "colored",
  "glob",
  "ngc-bundler",
  "ngc-diagnostics",
+ "ngc-npm-resolver",
  "ngc-project-resolver",
  "ngc-template-compiler",
  "ngc-ts-transform",
@@ -747,7 +764,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-template-compiler"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "insta",
  "ngc-diagnostics",
@@ -765,7 +782,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-ts-transform"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "insta",
  "ngc-diagnostics",

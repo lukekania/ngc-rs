@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/cli", "crates/diagnostics", "crates/project-resolver", "crates/ts-transform", "crates/bundler", "crates/template-compiler"]
+members = ["crates/cli", "crates/diagnostics", "crates/project-resolver", "crates/ts-transform", "crates/bundler", "crates/template-compiler", "crates/npm-resolver"]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 license = "MIT"
 authors = ["lukekania"]

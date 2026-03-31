@@ -253,25 +253,53 @@ fn toposort_all_reachable(
 /// Topological sort of a subset of nodes within the graph.
 ///
 /// Returns nodes in dependency-first order (leaves before roots).
+/// Handles cycles gracefully by using DFS post-order (nodes in cycles
+/// are still included in an arbitrary but valid order).
 fn toposort_subset(
     graph: &DiGraph<PathBuf, ImportKind>,
     _start: NodeIndex,
     subset: &HashSet<NodeIndex>,
 ) -> NgcResult<Vec<NodeIndex>> {
-    let topo = petgraph::algo::toposort(graph, None).map_err(|cycle| {
-        let cycle_node = &graph[cycle.node_id()];
-        NgcError::CircularDependency {
-            cycle: vec![cycle_node.clone()],
+    // Try strict toposort first
+    match petgraph::algo::toposort(graph, None) {
+        Ok(topo) => {
+            let mut ordered: Vec<NodeIndex> = topo
+                .into_iter()
+                .filter(|idx| subset.contains(idx))
+                .collect();
+            ordered.reverse();
+            Ok(ordered)
         }
-    })?;
+        Err(_) => {
+            // Graph has cycles (common with npm packages) — use DFS post-order
+            // which gives a valid ordering even with cycles
+            let mut visited = HashSet::new();
+            let mut order = Vec::new();
+            for &node in subset {
+                dfs_postorder(graph, node, subset, &mut visited, &mut order);
+            }
+            Ok(order)
+        }
+    }
+}
 
-    let mut ordered: Vec<NodeIndex> = topo
-        .into_iter()
-        .filter(|idx| subset.contains(idx))
-        .collect();
-    ordered.reverse();
-
-    Ok(ordered)
+/// DFS post-order traversal for cycle-tolerant topological sorting.
+fn dfs_postorder(
+    graph: &DiGraph<PathBuf, ImportKind>,
+    node: NodeIndex,
+    subset: &HashSet<NodeIndex>,
+    visited: &mut HashSet<NodeIndex>,
+    order: &mut Vec<NodeIndex>,
+) {
+    if !visited.insert(node) {
+        return;
+    }
+    for neighbor in graph.neighbors(node) {
+        if subset.contains(&neighbor) {
+            dfs_postorder(graph, neighbor, subset, visited, order);
+        }
+    }
+    order.push(node);
 }
 
 /// Derive a chunk filename from a split point's file path.
