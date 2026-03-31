@@ -5,13 +5,13 @@ use ngc_diagnostics::NgcResult;
 use crate::ast::*;
 use crate::extract::ExtractedComponent;
 
-/// Generated Ivy output for a component.
+/// Generated Ivy output for any Angular decorator.
 #[derive(Debug, Clone)]
 pub struct IvyOutput {
     /// The `static ɵfac = ...` field code.
     pub factory_code: String,
-    /// The `static ɵcmp = ɵɵdefineComponent({...})` field code.
-    pub define_component_code: String,
+    /// Static definition fields (e.g. ɵcmp, ɵprov, ɵdir, ɵpipe, ɵmod + ɵinj).
+    pub static_fields: Vec<String>,
     /// Child template functions (for @if, @for, @switch blocks).
     pub child_template_functions: Vec<String>,
     /// Set of Ivy runtime symbols needed from `@angular/core`.
@@ -124,7 +124,7 @@ pub fn generate_ivy(
 
     Ok(IvyOutput {
         factory_code,
-        define_component_code: dc,
+        static_fields: vec![dc],
         child_template_functions: child_fns,
         ivy_imports: gen.ivy_imports,
     })
