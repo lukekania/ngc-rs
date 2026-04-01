@@ -120,6 +120,9 @@ where
                 ModuleDeclaration::ExportNamedDeclaration(export) => {
                     if export.source.is_some() {
                         // Re-export: export { X } from './other'
+                        // In ESM, re-exports do NOT create local bindings. We must
+                        // assign directly to __exports to avoid shadowing imports
+                        // that use the same local name.
                         let source = export
                             .source
                             .as_ref()
@@ -130,9 +133,11 @@ where
                         for spec in &export.specifiers {
                             let exported = spec.exported.name().to_string();
                             let local = spec.local.name().to_string();
-                            exported_names.push(exported.clone());
+                            // Don't add to exported_names — we handle the export inline
                             if let Some(ref ns) = target_ns {
-                                replacements.push(format!("var {exported} = {ns}.{local};"));
+                                replacements.push(format!("__exports.{exported} = {ns}.{local};"));
+                            } else {
+                                exported_names.push(exported.clone());
                             }
                         }
                         let replacement = if replacements.is_empty() {
