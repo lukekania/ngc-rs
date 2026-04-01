@@ -545,13 +545,12 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<ChunkBundleResult> {
                         // Relative import from project module — resolve from this module's directory
                         let resolved = module_dir.and_then(|dir| {
                             let candidate = dir.join(&ext.source);
-                            for c in &[
-                                candidate.clone(),
-                                candidate.with_extension("ts"),
-                                candidate.with_extension("js"),
-                                candidate.with_extension("mjs"),
-                            ] {
-                                if let Ok(canon) = c.canonicalize() {
+                            let candidate_str = candidate.to_string_lossy().to_string();
+                            // Append extensions (not replace) to handle paths like
+                            // ./logto-auth.service where .service is NOT an extension.
+                            for suffix in &["", ".ts", ".js", ".mjs"] {
+                                let full = PathBuf::from(format!("{candidate_str}{suffix}"));
+                                if let Ok(canon) = full.canonicalize() {
                                     return Some(canon);
                                 }
                             }
