@@ -34,6 +34,8 @@ struct IvyCodegen {
     let_declarations: Vec<(String, u32)>,
     /// Local variable names that should NOT get `ctx.` prefix in expressions.
     local_vars: BTreeSet<String>,
+    /// Last slot index emitted in the update block (for computing `ɵɵadvance` deltas).
+    last_update_slot: u32,
 }
 
 struct ChildTemplate {
@@ -61,6 +63,7 @@ pub fn generate_ivy(
         consts: Vec::new(),
         let_declarations: Vec::new(),
         local_vars: BTreeSet::new(),
+        last_update_slot: 0,
     };
 
     gen.ivy_imports
@@ -222,21 +225,11 @@ impl IvyCodegen {
 
         let is_ng_container = el.tag == "ng-container";
 
-        // Collect event and update bindings
+        // Check for event bindings (used for listener creation)
         let _has_events = el
             .attributes
             .iter()
             .any(|a| matches!(a, TemplateAttribute::Event { .. }));
-        let has_bindings = el.attributes.iter().any(|a| {
-            matches!(
-                a,
-                TemplateAttribute::Property { .. }
-                    | TemplateAttribute::ClassBinding { .. }
-                    | TemplateAttribute::StyleBinding { .. }
-                    | TemplateAttribute::AttrBinding { .. }
-                    | TemplateAttribute::TwoWayBinding { .. }
-            )
-        });
 
         // Static attributes for consts
         let static_attrs: Vec<(&str, &str)> = el
@@ -266,6 +259,9 @@ impl IvyCodegen {
                 self.creation
                     .push(format!("{instr}({slot}, '{}', {const_idx});", el.tag));
             }
+
+            // Bindings for void elements
+            self.emit_element_bindings(el, slot);
         } else {
             let (start_instr, end_instr) = if is_ng_container {
                 (
@@ -326,68 +322,9 @@ impl IvyCodegen {
                         .push(format!("\u{0275}\u{0275}reference({ref_slot});"));
                 }
             }
-        }
 
-        // Property bindings in update block
-        if has_bindings {
-            self.add_advance(slot);
-        }
-        for attr in &el.attributes {
-            match attr {
-                TemplateAttribute::Property { name, expression } => {
-                    self.ivy_imports
-                        .insert("\u{0275}\u{0275}property".to_string());
-                    let compiled = self.compile_binding_expr(expression);
-                    self.update
-                        .push(format!("\u{0275}\u{0275}property('{}', {compiled});", name,));
-                    self.var_count += 1;
-                }
-                TemplateAttribute::TwoWayBinding { name, expression } => {
-                    self.ivy_imports
-                        .insert("\u{0275}\u{0275}property".to_string());
-                    let compiled = self.compile_binding_expr(expression);
-                    self.update
-                        .push(format!("\u{0275}\u{0275}property('{}', {compiled});", name,));
-                    self.var_count += 1;
-                }
-                TemplateAttribute::ClassBinding {
-                    class_name,
-                    expression,
-                } => {
-                    self.ivy_imports
-                        .insert("\u{0275}\u{0275}classProp".to_string());
-                    let compiled = self.compile_binding_expr(expression);
-                    self.update.push(format!(
-                        "\u{0275}\u{0275}classProp('{}', {compiled});",
-                        class_name,
-                    ));
-                    self.var_count += 1;
-                }
-                TemplateAttribute::StyleBinding {
-                    property,
-                    expression,
-                } => {
-                    self.ivy_imports
-                        .insert("\u{0275}\u{0275}styleProp".to_string());
-                    let compiled = self.compile_binding_expr(expression);
-                    self.update.push(format!(
-                        "\u{0275}\u{0275}styleProp('{}', {compiled});",
-                        property,
-                    ));
-                    self.var_count += 1;
-                }
-                TemplateAttribute::AttrBinding { name, expression } => {
-                    self.ivy_imports
-                        .insert("\u{0275}\u{0275}attribute".to_string());
-                    let compiled = self.compile_binding_expr(expression);
-                    self.update.push(format!(
-                        "\u{0275}\u{0275}attribute('{}', {compiled});",
-                        name,
-                    ));
-                    self.var_count += 1;
-                }
-                _ => {}
-            }
+            // Property bindings in update block
+            self.emit_element_bindings(el, slot);
         }
     }
 
@@ -469,6 +406,7 @@ impl IvyCodegen {
     ) -> ChildTemplate {
         let parent_slot = self.slot_index;
         let parent_var = self.var_count;
+        let parent_last_update = self.last_update_slot;
         let parent_creation = std::mem::take(&mut self.creation);
         let parent_update = std::mem::take(&mut self.update);
         let parent_consts = std::mem::take(&mut self.consts);
@@ -476,6 +414,7 @@ impl IvyCodegen {
 
         self.slot_index = 0;
         self.var_count = 0;
+        self.last_update_slot = 0;
 
         self.generate_element(el);
 
@@ -512,6 +451,7 @@ impl IvyCodegen {
 
         self.slot_index = parent_slot;
         self.var_count = parent_var;
+        self.last_update_slot = parent_last_update;
         self.creation = parent_creation;
         self.update = parent_update;
         self.consts = parent_consts;
@@ -766,6 +706,7 @@ impl IvyCodegen {
         // Save parent state
         let parent_slot = self.slot_index;
         let parent_var = self.var_count;
+        let parent_last_update = self.last_update_slot;
         let parent_creation = std::mem::take(&mut self.creation);
         let parent_update = std::mem::take(&mut self.update);
         let parent_consts = std::mem::take(&mut self.consts);
@@ -773,6 +714,7 @@ impl IvyCodegen {
 
         self.slot_index = 0;
         self.var_count = 0;
+        self.last_update_slot = 0;
         // Don't clear let_declarations or local_vars — children inherit parent scope
 
         self.generate_nodes(children);
@@ -812,6 +754,7 @@ impl IvyCodegen {
         // Restore parent state
         self.slot_index = parent_slot;
         self.var_count = parent_var;
+        self.last_update_slot = parent_last_update;
         self.creation = parent_creation;
         self.update = parent_update;
         self.consts = parent_consts;
@@ -834,6 +777,7 @@ impl IvyCodegen {
         // Save parent state
         let parent_slot = self.slot_index;
         let parent_var = self.var_count;
+        let parent_last_update = self.last_update_slot;
         let parent_creation = std::mem::take(&mut self.creation);
         let parent_update = std::mem::take(&mut self.update);
         let parent_consts = std::mem::take(&mut self.consts);
@@ -841,6 +785,7 @@ impl IvyCodegen {
 
         self.slot_index = 0;
         self.var_count = 0;
+        self.last_update_slot = 0;
 
         self.generate_nodes(children);
 
@@ -879,6 +824,7 @@ impl IvyCodegen {
         // Restore parent state
         self.slot_index = parent_slot;
         self.var_count = parent_var;
+        self.last_update_slot = parent_last_update;
         self.creation = parent_creation;
         self.update = parent_update;
         self.consts = parent_consts;
@@ -1020,13 +966,85 @@ impl IvyCodegen {
         idx
     }
 
-    /// Add an `ɵɵadvance()` instruction to the update block if needed.
+    /// Add an `ɵɵadvance()` instruction to the update block.
     fn add_advance(&mut self, _target_slot: u32) {
         self.ivy_imports
             .insert("\u{0275}\u{0275}advance".to_string());
-        // For simplicity, always emit advance() (delta = 1)
-        // A more sophisticated implementation would compute exact deltas
         self.update.push("\u{0275}\u{0275}advance();".to_string());
+    }
+
+    /// Emit property/class/style/attr bindings for an element in the update block.
+    fn emit_element_bindings(&mut self, el: &ElementNode, slot: u32) {
+        let has_bindings = el.attributes.iter().any(|a| {
+            matches!(
+                a,
+                TemplateAttribute::Property { .. }
+                    | TemplateAttribute::ClassBinding { .. }
+                    | TemplateAttribute::StyleBinding { .. }
+                    | TemplateAttribute::AttrBinding { .. }
+                    | TemplateAttribute::TwoWayBinding { .. }
+            )
+        });
+        if has_bindings {
+            self.add_advance(slot);
+        }
+        for attr in &el.attributes {
+            match attr {
+                TemplateAttribute::Property { name, expression } => {
+                    self.ivy_imports
+                        .insert("\u{0275}\u{0275}property".to_string());
+                    let compiled = self.compile_binding_expr(expression);
+                    self.update
+                        .push(format!("\u{0275}\u{0275}property('{}', {compiled});", name,));
+                    self.var_count += 1;
+                }
+                TemplateAttribute::TwoWayBinding { name, expression } => {
+                    self.ivy_imports
+                        .insert("\u{0275}\u{0275}property".to_string());
+                    let compiled = self.compile_binding_expr(expression);
+                    self.update
+                        .push(format!("\u{0275}\u{0275}property('{}', {compiled});", name,));
+                    self.var_count += 1;
+                }
+                TemplateAttribute::ClassBinding {
+                    class_name,
+                    expression,
+                } => {
+                    self.ivy_imports
+                        .insert("\u{0275}\u{0275}classProp".to_string());
+                    let compiled = self.compile_binding_expr(expression);
+                    self.update.push(format!(
+                        "\u{0275}\u{0275}classProp('{}', {compiled});",
+                        class_name,
+                    ));
+                    self.var_count += 1;
+                }
+                TemplateAttribute::StyleBinding {
+                    property,
+                    expression,
+                } => {
+                    self.ivy_imports
+                        .insert("\u{0275}\u{0275}styleProp".to_string());
+                    let compiled = self.compile_binding_expr(expression);
+                    self.update.push(format!(
+                        "\u{0275}\u{0275}styleProp('{}', {compiled});",
+                        property,
+                    ));
+                    self.var_count += 1;
+                }
+                TemplateAttribute::AttrBinding { name, expression } => {
+                    self.ivy_imports
+                        .insert("\u{0275}\u{0275}attribute".to_string());
+                    let compiled = self.compile_binding_expr(expression);
+                    self.update.push(format!(
+                        "\u{0275}\u{0275}attribute('{}', {compiled});",
+                        name,
+                    ));
+                    self.var_count += 1;
+                }
+                _ => {}
+            }
+        }
     }
 }
 
