@@ -30,6 +30,10 @@ struct IvyCodegen {
     child_counter: u32,
     /// Collected static attribute arrays for the `consts` field.
     consts: Vec<String>,
+    /// Active `@let` declarations: maps variable name to slot index.
+    let_declarations: Vec<(String, u32)>,
+    /// Local variable names that should NOT get `ctx.` prefix in expressions.
+    local_vars: BTreeSet<String>,
 }
 
 struct ChildTemplate {
@@ -55,6 +59,8 @@ pub fn generate_ivy(
         ivy_imports: BTreeSet::new(),
         child_counter: 0,
         consts: Vec::new(),
+        let_declarations: Vec::new(),
+        local_vars: BTreeSet::new(),
     };
 
     gen.ivy_imports
@@ -162,6 +168,7 @@ impl IvyCodegen {
             TemplateNode::IfBlock(block) => self.generate_if_block(block),
             TemplateNode::ForBlock(block) => self.generate_for_block(block),
             TemplateNode::SwitchBlock(block) => self.generate_switch_block(block),
+            TemplateNode::LetDeclaration(decl) => self.generate_let_declaration(decl),
         }
     }
 
@@ -465,6 +472,7 @@ impl IvyCodegen {
         let parent_creation = std::mem::take(&mut self.creation);
         let parent_update = std::mem::take(&mut self.update);
         let parent_consts = std::mem::take(&mut self.consts);
+        let parent_lets = self.let_declarations.clone();
 
         self.slot_index = 0;
         self.var_count = 0;
@@ -472,9 +480,9 @@ impl IvyCodegen {
         self.generate_element(el);
 
         let decls = self.slot_index;
-        let vars = self.var_count;
+        let vars = self.var_count + parent_lets.len() as u32;
 
-        let mut code = format!("function {fn_name}(rf: number, ctx: any) {{\n");
+        let mut code = format!("function {fn_name}(rf, ctx) {{\n");
         if !self.creation.is_empty() {
             code.push_str("  if (rf & 1) {\n");
             for instr in &self.creation {
@@ -484,8 +492,15 @@ impl IvyCodegen {
             }
             code.push_str("  }\n");
         }
-        if !self.update.is_empty() {
+        if !self.update.is_empty() || !parent_lets.is_empty() {
             code.push_str("  if (rf & 2) {\n");
+            for (name, slot) in &parent_lets {
+                self.ivy_imports
+                    .insert("\u{0275}\u{0275}readContextLet".to_string());
+                code.push_str(&format!(
+                    "    const {name} = \u{0275}\u{0275}readContextLet({slot});\n"
+                ));
+            }
             for instr in &self.update {
                 code.push_str("    ");
                 code.push_str(instr);
@@ -500,6 +515,7 @@ impl IvyCodegen {
         self.creation = parent_creation;
         self.update = parent_update;
         self.consts = parent_consts;
+        self.let_declarations = parent_lets;
 
         ChildTemplate {
             function_name: fn_name.to_string(),
@@ -602,7 +618,12 @@ impl IvyCodegen {
 
         // Update block: conditional
         self.add_advance(slot);
-        let cond_expr = build_conditional_expr(&block.condition, &else_if_fns, &else_fn_name);
+        let cond_expr = build_conditional_expr(
+            &block.condition,
+            &else_if_fns,
+            &else_fn_name,
+            &self.local_vars,
+        );
         self.update
             .push(format!("\u{0275}\u{0275}conditional({cond_expr});"));
         self.var_count += 1;
@@ -627,8 +648,27 @@ impl IvyCodegen {
 
         let child =
             self.generate_for_child_template(&child_fn_name, &block.item_name, &block.children);
+        // Build the track-by function from the track expression.
+        // Angular expects: (index, item) => item.id
+        let track_expr = ctx_expr(&block.track_expression);
+        let track_fn = if track_expr.contains("ctx.$index") || track_expr == "ctx.$index" {
+            // track $index → identity by index
+            self.ivy_imports
+                .insert("\u{0275}\u{0275}repeaterTrackByIndex".to_string());
+            "\u{0275}\u{0275}repeaterTrackByIndex".to_string()
+        } else if track_expr == format!("ctx.{}", block.item_name) || track_expr == block.item_name
+        {
+            // track item → identity by reference
+            self.ivy_imports
+                .insert("\u{0275}\u{0275}repeaterTrackByIdentity".to_string());
+            "\u{0275}\u{0275}repeaterTrackByIdentity".to_string()
+        } else {
+            // Custom track expression → wrap in arrow function
+            let item = &block.item_name;
+            format!("(i, {item}) => {track_expr}")
+        };
         self.creation.push(format!(
-            "\u{0275}\u{0275}repeaterCreate({slot}, {child_fn_name}, {}, {});",
+            "\u{0275}\u{0275}repeaterCreate({slot}, {child_fn_name}, {}, {}, {track_fn});",
             child.decls, child.vars
         ));
         self.child_templates.push(child);
@@ -729,16 +769,18 @@ impl IvyCodegen {
         let parent_creation = std::mem::take(&mut self.creation);
         let parent_update = std::mem::take(&mut self.update);
         let parent_consts = std::mem::take(&mut self.consts);
+        let parent_lets = self.let_declarations.clone();
 
         self.slot_index = 0;
         self.var_count = 0;
+        // Don't clear let_declarations or local_vars — children inherit parent scope
 
         self.generate_nodes(children);
 
         let decls = self.slot_index;
-        let vars = self.var_count;
+        let vars = self.var_count + parent_lets.len() as u32;
 
-        let mut code = format!("function {fn_name}(rf: number, ctx: any) {{\n");
+        let mut code = format!("function {fn_name}(rf, ctx) {{\n");
         if !self.creation.is_empty() {
             code.push_str("  if (rf & 1) {\n");
             for instr in &self.creation {
@@ -748,8 +790,16 @@ impl IvyCodegen {
             }
             code.push_str("  }\n");
         }
-        if !self.update.is_empty() {
+        if !self.update.is_empty() || !parent_lets.is_empty() {
             code.push_str("  if (rf & 2) {\n");
+            // Inject @let variable reads from parent context
+            for (name, slot) in &parent_lets {
+                self.ivy_imports
+                    .insert("\u{0275}\u{0275}readContextLet".to_string());
+                code.push_str(&format!(
+                    "    const {name} = \u{0275}\u{0275}readContextLet({slot});\n"
+                ));
+            }
             for instr in &self.update {
                 code.push_str("    ");
                 code.push_str(instr);
@@ -765,6 +815,7 @@ impl IvyCodegen {
         self.creation = parent_creation;
         self.update = parent_update;
         self.consts = parent_consts;
+        self.let_declarations = parent_lets;
 
         ChildTemplate {
             function_name: fn_name.to_string(),
@@ -786,6 +837,7 @@ impl IvyCodegen {
         let parent_creation = std::mem::take(&mut self.creation);
         let parent_update = std::mem::take(&mut self.update);
         let parent_consts = std::mem::take(&mut self.consts);
+        let parent_lets = self.let_declarations.clone();
 
         self.slot_index = 0;
         self.var_count = 0;
@@ -793,9 +845,9 @@ impl IvyCodegen {
         self.generate_nodes(children);
 
         let decls = self.slot_index;
-        let vars = self.var_count;
+        let vars = self.var_count + parent_lets.len() as u32;
 
-        let mut code = format!("function {fn_name}(rf: number, ctx: any) {{\n");
+        let mut code = format!("function {fn_name}(rf, ctx) {{\n");
         if !self.creation.is_empty() {
             code.push_str("  if (rf & 1) {\n");
             for instr in &self.creation {
@@ -805,9 +857,16 @@ impl IvyCodegen {
             }
             code.push_str("  }\n");
         }
-        if !self.update.is_empty() {
+        if !self.update.is_empty() || !parent_lets.is_empty() {
             code.push_str("  if (rf & 2) {\n");
             code.push_str(&format!("    const {item_name} = ctx.$implicit;\n"));
+            for (name, slot) in &parent_lets {
+                self.ivy_imports
+                    .insert("\u{0275}\u{0275}readContextLet".to_string());
+                code.push_str(&format!(
+                    "    const {name} = \u{0275}\u{0275}readContextLet({slot});\n"
+                ));
+            }
             for instr in &self.update {
                 code.push_str("    ");
                 code.push_str(instr);
@@ -823,6 +882,7 @@ impl IvyCodegen {
         self.creation = parent_creation;
         self.update = parent_update;
         self.consts = parent_consts;
+        self.let_declarations = parent_lets;
 
         ChildTemplate {
             function_name: fn_name.to_string(),
@@ -868,11 +928,40 @@ impl IvyCodegen {
     ///
     /// Scans for `expr | pipeName` patterns (Angular pipe syntax) anywhere in the
     /// expression, compiles each to a `ɵɵpipeBind*` call, and applies `ctx.` prefixes.
+    /// Generate an `@let` variable declaration.
+    fn generate_let_declaration(&mut self, decl: &LetDeclarationNode) {
+        let slot = self.slot_index;
+        self.slot_index += 1;
+
+        self.ivy_imports
+            .insert("\u{0275}\u{0275}declareLet".to_string());
+        self.ivy_imports
+            .insert("\u{0275}\u{0275}storeLet".to_string());
+
+        // Creation mode: allocate the let slot
+        self.creation
+            .push(format!("\u{0275}\u{0275}declareLet({slot});"));
+
+        // Update mode: evaluate expression and store the value
+        let compiled_expr = self.compile_binding_expr(&decl.expression);
+        self.update.push(format!(
+            "const {} = \u{0275}\u{0275}storeLet({compiled_expr});",
+            decl.name
+        ));
+
+        // Track for child templates and ctx. prefix exclusion
+        self.let_declarations.push((decl.name.clone(), slot));
+        self.local_vars.insert(decl.name.clone());
+
+        // storeLet counts as one binding var
+        self.var_count += 1;
+    }
+
     fn compile_binding_expr(&mut self, expression: &str) -> String {
         let segments = extract_all_pipe_segments(expression);
         if segments.is_empty() {
             // No pipes found — just compile with ctx. prefix
-            return ctx_expr(expression);
+            return ctx_expr_with_locals(expression, &self.local_vars);
         }
 
         // First segment is the base expression, rest are pipe names
@@ -1235,13 +1324,24 @@ fn replace_nested_pipe_parens(expr: &str, gen: &mut IvyCodegen) -> String {
 /// Uses oxc to parse the expression AST and walk it, ensuring all standalone
 /// identifiers (not member properties, not builtins) get the `ctx.` prefix.
 fn ctx_expr(expr: &str) -> String {
+    ctx_expr_with_locals(expr, &BTreeSet::new())
+}
+
+/// Rewrite an expression by adding `ctx.` prefix to top-level identifiers,
+/// except for builtins and local variables (like `@let` declarations).
+fn ctx_expr_with_locals(expr: &str, locals: &BTreeSet<String>) -> String {
     let trimmed = expr.trim();
     if trimmed.is_empty() {
         return String::new();
     }
 
-    // Fast path for simple property paths
+    // Fast path for simple property paths (skip if it's a local var)
     if is_simple_property_path(trimmed) {
+        if locals.contains(trimmed)
+            || trimmed.contains('.') && locals.contains(trimmed.split('.').next().unwrap_or(""))
+        {
+            return trimmed.to_string();
+        }
         return format!("ctx.{trimmed}");
     }
 
@@ -1271,7 +1371,13 @@ fn ctx_expr(expr: &str) -> String {
     // Collect positions of identifiers that need `ctx.` prefix and `!` to remove
     let mut ctx_inserts: Vec<u32> = Vec::new();
     let mut remove_ranges: Vec<(u32, u32)> = Vec::new();
-    collect_ctx_rewrites(init_expr, &mut ctx_inserts, &mut remove_ranges, false);
+    collect_ctx_rewrites(
+        init_expr,
+        &mut ctx_inserts,
+        &mut remove_ranges,
+        false,
+        locals,
+    );
 
     // Map wrapper byte offsets back to expression byte offsets
     let expr_offset = "var __expr = ".len() as u32;
@@ -1349,9 +1455,12 @@ fn collect_ctx_rewrites(
     ctx_inserts: &mut Vec<u32>,
     remove_ranges: &mut Vec<(u32, u32)>,
     is_member_property: bool,
+    locals: &BTreeSet<String>,
 ) {
     use oxc_ast::ast::*;
     use oxc_span::GetSpan;
+
+    let is_local = |name: &str| -> bool { locals.contains(name) };
 
     fn is_builtin(name: &str) -> bool {
         // Angular runtime symbols (ɵɵ-prefixed) are not component properties
@@ -1390,45 +1499,63 @@ fn collect_ctx_rewrites(
 
     match expr {
         Expression::Identifier(id) => {
-            if !is_member_property && !is_builtin(&id.name) {
+            if !is_member_property && !is_builtin(&id.name) && !is_local(&id.name) {
                 ctx_inserts.push(id.span.start);
             }
         }
         Expression::CallExpression(call) => {
-            collect_ctx_rewrites(&call.callee, ctx_inserts, remove_ranges, false);
+            collect_ctx_rewrites(&call.callee, ctx_inserts, remove_ranges, false, locals);
             for arg in &call.arguments {
                 if let Argument::SpreadElement(spread) = arg {
-                    collect_ctx_rewrites(&spread.argument, ctx_inserts, remove_ranges, false);
+                    collect_ctx_rewrites(
+                        &spread.argument,
+                        ctx_inserts,
+                        remove_ranges,
+                        false,
+                        locals,
+                    );
                 } else {
-                    collect_ctx_rewrites(arg.to_expression(), ctx_inserts, remove_ranges, false);
+                    collect_ctx_rewrites(
+                        arg.to_expression(),
+                        ctx_inserts,
+                        remove_ranges,
+                        false,
+                        locals,
+                    );
                 }
             }
         }
         Expression::StaticMemberExpression(member) => {
-            collect_ctx_rewrites(&member.object, ctx_inserts, remove_ranges, false);
+            collect_ctx_rewrites(&member.object, ctx_inserts, remove_ranges, false, locals);
         }
         Expression::ComputedMemberExpression(member) => {
-            collect_ctx_rewrites(&member.object, ctx_inserts, remove_ranges, false);
-            collect_ctx_rewrites(&member.expression, ctx_inserts, remove_ranges, false);
+            collect_ctx_rewrites(&member.object, ctx_inserts, remove_ranges, false, locals);
+            collect_ctx_rewrites(
+                &member.expression,
+                ctx_inserts,
+                remove_ranges,
+                false,
+                locals,
+            );
         }
         Expression::UnaryExpression(unary) => {
-            collect_ctx_rewrites(&unary.argument, ctx_inserts, remove_ranges, false);
+            collect_ctx_rewrites(&unary.argument, ctx_inserts, remove_ranges, false, locals);
         }
         Expression::BinaryExpression(binary) => {
-            collect_ctx_rewrites(&binary.left, ctx_inserts, remove_ranges, false);
-            collect_ctx_rewrites(&binary.right, ctx_inserts, remove_ranges, false);
+            collect_ctx_rewrites(&binary.left, ctx_inserts, remove_ranges, false, locals);
+            collect_ctx_rewrites(&binary.right, ctx_inserts, remove_ranges, false, locals);
         }
         Expression::LogicalExpression(logical) => {
-            collect_ctx_rewrites(&logical.left, ctx_inserts, remove_ranges, false);
-            collect_ctx_rewrites(&logical.right, ctx_inserts, remove_ranges, false);
+            collect_ctx_rewrites(&logical.left, ctx_inserts, remove_ranges, false, locals);
+            collect_ctx_rewrites(&logical.right, ctx_inserts, remove_ranges, false, locals);
         }
         Expression::ConditionalExpression(cond) => {
-            collect_ctx_rewrites(&cond.test, ctx_inserts, remove_ranges, false);
-            collect_ctx_rewrites(&cond.consequent, ctx_inserts, remove_ranges, false);
-            collect_ctx_rewrites(&cond.alternate, ctx_inserts, remove_ranges, false);
+            collect_ctx_rewrites(&cond.test, ctx_inserts, remove_ranges, false, locals);
+            collect_ctx_rewrites(&cond.consequent, ctx_inserts, remove_ranges, false, locals);
+            collect_ctx_rewrites(&cond.alternate, ctx_inserts, remove_ranges, false, locals);
         }
         Expression::ParenthesizedExpression(paren) => {
-            collect_ctx_rewrites(&paren.expression, ctx_inserts, remove_ranges, false);
+            collect_ctx_rewrites(&paren.expression, ctx_inserts, remove_ranges, false, locals);
         }
         Expression::AssignmentExpression(assign) => {
             if let AssignmentTarget::AssignmentTargetIdentifier(id) = &assign.left {
@@ -1436,7 +1563,7 @@ fn collect_ctx_rewrites(
                     ctx_inserts.push(id.span.start);
                 }
             }
-            collect_ctx_rewrites(&assign.right, ctx_inserts, remove_ranges, false);
+            collect_ctx_rewrites(&assign.right, ctx_inserts, remove_ranges, false, locals);
         }
         Expression::TSNonNullExpression(non_null) => {
             collect_ctx_rewrites(
@@ -1444,6 +1571,7 @@ fn collect_ctx_rewrites(
                 ctx_inserts,
                 remove_ranges,
                 is_member_property,
+                locals,
             );
             let inner_end = non_null.expression.span().end;
             let outer_end = non_null.span.end;
@@ -1454,22 +1582,34 @@ fn collect_ctx_rewrites(
         Expression::ObjectExpression(obj) => {
             for prop in &obj.properties {
                 if let ObjectPropertyKind::ObjectProperty(p) = prop {
-                    collect_ctx_rewrites(&p.value, ctx_inserts, remove_ranges, false);
+                    collect_ctx_rewrites(&p.value, ctx_inserts, remove_ranges, false, locals);
                 }
             }
         }
         Expression::ArrayExpression(arr) => {
             for elem in &arr.elements {
                 if let ArrayExpressionElement::SpreadElement(spread) = elem {
-                    collect_ctx_rewrites(&spread.argument, ctx_inserts, remove_ranges, false);
+                    collect_ctx_rewrites(
+                        &spread.argument,
+                        ctx_inserts,
+                        remove_ranges,
+                        false,
+                        locals,
+                    );
                 } else if !elem.is_elision() {
-                    collect_ctx_rewrites(elem.to_expression(), ctx_inserts, remove_ranges, false);
+                    collect_ctx_rewrites(
+                        elem.to_expression(),
+                        ctx_inserts,
+                        remove_ranges,
+                        false,
+                        locals,
+                    );
                 }
             }
         }
         Expression::TemplateLiteral(tpl) => {
             for expr in &tpl.expressions {
-                collect_ctx_rewrites(expr, ctx_inserts, remove_ranges, false);
+                collect_ctx_rewrites(expr, ctx_inserts, remove_ranges, false, locals);
             }
         }
         _ => {}
@@ -1481,11 +1621,16 @@ fn build_conditional_expr(
     condition: &str,
     else_ifs: &[(String, String)],
     else_fn: &Option<String>,
+    locals: &BTreeSet<String>,
 ) -> String {
-    let mut expr = format!("{} ? 0 : ", ctx_expr(condition));
+    let mut expr = format!("{} ? 0 : ", ctx_expr_with_locals(condition, locals));
 
     for (i, (cond, _fn_name)) in else_ifs.iter().enumerate() {
-        expr.push_str(&format!("{} ? {} : ", ctx_expr(cond), i + 1));
+        expr.push_str(&format!(
+            "{} ? {} : ",
+            ctx_expr_with_locals(cond, locals),
+            i + 1
+        ));
     }
 
     if else_fn.is_some() {
