@@ -73,9 +73,17 @@ pub fn transform(
     }
 
     // Template compilation
+    let mut child_fns_code: Vec<String> = Vec::new();
+    let mut extra_ivy_imports: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
     if let Some(template_str) = metadata::get_string_prop(obj, "template") {
         let template_ok = match compile_template(&template_str, &type_name, file_path) {
-            Ok((template_fn, decls, vars, _child_fns)) => {
+            Ok(tpl) => {
+                let template_fn = tpl.template_function;
+                let decls = tpl.decls;
+                let vars = tpl.vars;
+                let child_fns = tpl.child_template_functions;
+                let ivy_imports = tpl.ivy_imports;
                 // Validate that the compiled template is valid JavaScript
                 // (the template parser may "succeed" on unsupported syntax like @let
                 // but produce output with literal newlines inside string literals)
@@ -83,6 +91,8 @@ pub fn transform(
                     props.push(format!("decls: {decls}"));
                     props.push(format!("vars: {vars}"));
                     props.push(format!("template: {template_fn}"));
+                    child_fns_code = child_fns;
+                    extra_ivy_imports = ivy_imports;
                     true
                 } else {
                     tracing::warn!(
@@ -152,7 +162,26 @@ pub fn transform(
         props.push(format!("changeDetection: {cd}"));
     }
 
-    Ok(format!("{define_fn}({{ {} }})", props.join(", ")))
+    let define_call = format!("{define_fn}({{ {} }})", props.join(", "));
+
+    // If the template produced child template functions (e.g. for @if/@for blocks),
+    // wrap everything in an IIFE so the functions are in scope when the template runs.
+    if child_fns_code.is_empty() && extra_ivy_imports.is_empty() {
+        Ok(define_call)
+    } else {
+        let fns = child_fns_code.join("\n");
+        // Add var declarations for new Ivy symbols (e.g. ɵɵdeclareLet, ɵɵstoreLet)
+        // that weren't in the original npm source. Use the ng_import prefix (e.g. i0).
+        let mut var_decls = String::new();
+        if !ng_import.is_empty() {
+            for sym in &extra_ivy_imports {
+                var_decls.push_str(&format!("var {sym} = {ng_import}.{sym};\n"));
+            }
+        }
+        Ok(format!(
+            "(function() {{ {var_decls}{fns}\nreturn {define_call}; }})()"
+        ))
+    }
 }
 
 /// Validate that a generated template function is valid JavaScript.
@@ -169,12 +198,12 @@ fn is_valid_js_function(code: &str) -> bool {
 
 /// Compile a template string into a template function using the template compiler.
 ///
-/// Returns `(template_function_code, decls, vars, child_template_functions)`.
+/// Compile a template and return the template function output.
 fn compile_template(
     template: &str,
     component_name: &str,
     file_path: &Path,
-) -> NgcResult<(String, u32, u32, Vec<String>)> {
+) -> NgcResult<ngc_template_compiler::TemplateFnOutput> {
     use ngc_template_compiler::{generate_template_fn, TemplateMetadata};
 
     let meta = TemplateMetadata {
@@ -185,14 +214,7 @@ fn compile_template(
         styles_source: None,
     };
 
-    let result = generate_template_fn(template, &meta, file_path)?;
-
-    Ok((
-        result.template_function,
-        result.decls,
-        result.vars,
-        result.child_template_functions,
-    ))
+    generate_template_fn(template, &meta, file_path)
 }
 
 /// Build the `dependencies` array from the declare format.

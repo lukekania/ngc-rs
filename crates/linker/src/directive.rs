@@ -253,9 +253,9 @@ pub fn build_host_bindings(
                 let key = prop_key_text(&p.key, source);
                 if let Expression::StringLiteral(s) = &p.value {
                     let prop_fn = if ng_import.is_empty() {
-                        "\u{0275}\u{0275}hostProperty".to_string()
+                        "\u{0275}\u{0275}property".to_string()
                     } else {
-                        format!("{ng_import}.\u{0275}\u{0275}hostProperty")
+                        format!("{ng_import}.\u{0275}\u{0275}property")
                     };
                     let expr = compile_host_expression(&s.value);
                     binding_stmts.push(format!("{prop_fn}(\"{key}\", {expr})"));
