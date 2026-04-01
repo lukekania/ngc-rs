@@ -2,13 +2,13 @@
 
 template = { SOI ~ node* ~ EOI }
 
-node = _{ control_flow | html_comment | element | interpolation | text }
+node = _{ control_flow | let_block | html_comment | element | interpolation | text }
 
 // HTML comments: <!-- ... -->
 html_comment = { "<!--" ~ (!"-->" ~ ANY)* ~ "-->" }
 
 // Text: anything not starting a tag, interpolation, or control flow keyword
-text = @{ (!("<" | "{{" | "}" | "@if" | "@for" | "@switch" | "@else" | "@case" | "@default" | "@empty") ~ ANY)+ }
+text = @{ (!("<" | "{{" | "}" | "@if" | "@for" | "@switch" | "@else" | "@case" | "@default" | "@empty" | "@let") ~ ANY)+ }
 
 // Text interpolation: {{ expression | pipe }}
 // Handles || (logical OR), balanced parens, and | only as top-level pipe separator
@@ -57,6 +57,10 @@ inner_value = @{ (!("\"") ~ ANY)* }
 inner_value_sq = @{ (!("'") ~ ANY)* }
 
 identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+
+// @let variable declaration
+let_block = { "@let" ~ identifier ~ "=" ~ let_expression ~ ";" }
+let_expression = @{ (!";" ~ ANY)+ }
 
 // Control flow blocks
 control_flow = _{ if_block | for_block | switch_block }
