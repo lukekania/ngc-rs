@@ -52,6 +52,8 @@ pub struct TemplateFnOutput {
     pub vars: u32,
     /// Child template functions (for @if, @for, @switch blocks).
     pub child_template_functions: Vec<String>,
+    /// Set of Ivy runtime symbols needed from `@angular/core`.
+    pub ivy_imports: std::collections::BTreeSet<String>,
 }
 
 /// Compile a template string into a standalone template function.
@@ -108,6 +110,7 @@ pub fn generate_template_fn(
         decls,
         vars,
         child_template_functions: child_fns,
+        ivy_imports: ivy_output.ivy_imports,
     })
 }
 

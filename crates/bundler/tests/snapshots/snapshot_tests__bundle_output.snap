@@ -46,7 +46,7 @@ class AppComponent {
 				ɵɵelement(2, 'router-outlet');
 			}
 			if (rf & 2) {
-				ɵɵadvance();
+				ɵɵadvance(2);
 				ɵɵtextInterpolate(ctx.title);
 			}
 		},
