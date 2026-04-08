@@ -7,7 +7,7 @@ use oxc_sourcemap::{ConcatSourceMapBuilder, SourceMap};
 use petgraph::graph::DiGraph;
 use tracing::debug;
 
-use crate::chunk::build_chunk_graph;
+use crate::chunk::{build_chunk_graph, ChunkKind};
 use crate::minify;
 use crate::rewrite::{self, ExternalImport};
 use crate::shake;
@@ -90,8 +90,47 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
     let mut output_chunks: HashMap<String, String> = HashMap::new();
     let mut chunk_source_maps: HashMap<String, SourceMap> = HashMap::new();
 
-    for chunk in &chunk_graph.chunks {
-        // Run tree shaking analysis for this chunk if enabled
+    // Process main chunk first to get specifier→namespace mapping
+    let main_chunk = &chunk_graph.chunks[0];
+    let main_unused = if input.options.tree_shake {
+        shake::analyze_unused_exports(
+            &main_chunk.modules,
+            &input.modules,
+            &main_chunk.entry,
+            &prefix_refs,
+        )?
+    } else {
+        HashMap::new()
+    };
+
+    let main_module_set: HashSet<PathBuf> = main_chunk.modules.iter().cloned().collect();
+    let main_result = bundle_chunk(&ChunkBundleParams {
+        module_paths: &main_chunk.modules,
+        all_modules: &input.modules,
+        root_dir: &input.root_dir,
+        prefix_refs: &prefix_refs,
+        specifier_rewrites: &specifier_rewrites,
+        per_module_maps: &input.per_module_maps,
+        generate_source_maps: input.options.source_maps,
+        unused_exports: &main_unused,
+        bundled_specifiers: &input.bundled_specifiers,
+        chunk_entry: &main_chunk.entry,
+        chunk_kind: &main_chunk.kind,
+        chunk_module_set: &main_module_set,
+        main_file_to_ns: &HashMap::new(),
+        main_chunk_module_set: &main_module_set,
+    })?;
+    let main_spec_to_ns = main_result.specifier_to_namespace;
+    let main_file_to_ns = main_result.file_to_namespace;
+    output_chunks.insert(main_chunk.filename.clone(), main_result.code);
+    if let Some(map) = main_result.source_map {
+        chunk_source_maps.insert(main_chunk.filename.clone(), map);
+    }
+
+    // Process lazy/shared chunks, collecting symbols they need from main
+    let mut all_needed_npm: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let mut all_needed_project: BTreeSet<String> = BTreeSet::new();
+    for chunk in &chunk_graph.chunks[1..] {
         let unused_exports = if input.options.tree_shake {
             shake::analyze_unused_exports(
                 &chunk.modules,
@@ -103,7 +142,8 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
             HashMap::new()
         };
 
-        let (chunk_code, chunk_map) = bundle_chunk(&ChunkBundleParams {
+        let lazy_module_set: HashSet<PathBuf> = chunk.modules.iter().cloned().collect();
+        let result = bundle_chunk(&ChunkBundleParams {
             module_paths: &chunk.modules,
             all_modules: &input.modules,
             root_dir: &input.root_dir,
@@ -114,10 +154,43 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
             unused_exports: &unused_exports,
             bundled_specifiers: &input.bundled_specifiers,
             chunk_entry: &chunk.entry,
+            chunk_kind: &chunk.kind,
+            chunk_module_set: &lazy_module_set,
+            main_file_to_ns: &main_file_to_ns,
+            main_chunk_module_set: &main_module_set,
         })?;
-        output_chunks.insert(chunk.filename.clone(), chunk_code);
-        if let Some(map) = chunk_map {
+
+        // Collect npm symbols this chunk needs.
+        // Namespace imports ("* as X") are stored with the local name only.
+        for ext in &result.npm_externals {
+            let entry = all_needed_npm.entry(ext.source.clone()).or_default();
+            for name in &ext.named_imports {
+                if let Some(local) = name.strip_prefix("* as ") {
+                    entry.insert(format!("__ns_import__{local}"));
+                } else {
+                    entry.insert(name.clone());
+                }
+            }
+            if let Some(ref default) = ext.default_import {
+                entry.insert(default.clone());
+            }
+        }
+
+        // Collect project symbols this chunk needs from main
+        all_needed_project.extend(result.project_cross_chunk_symbols);
+
+        output_chunks.insert(chunk.filename.clone(), result.code);
+        if let Some(map) = result.source_map {
             chunk_source_maps.insert(chunk.filename.clone(), map);
+        }
+    }
+
+    // Append re-exports to main chunk for symbols that lazy chunks need.
+    if !all_needed_npm.is_empty() || !all_needed_project.is_empty() {
+        let reexport_code =
+            generate_cross_chunk_exports(&all_needed_npm, &main_spec_to_ns, &all_needed_project);
+        if let Some(main_code) = output_chunks.get_mut("main.js") {
+            main_code.push_str(&reexport_code);
         }
     }
 
@@ -251,58 +324,87 @@ struct ChunkBundleParams<'a> {
     bundled_specifiers: &'a HashSet<String>,
     /// The chunk's entry module — exports from this module are preserved.
     chunk_entry: &'a Path,
+    /// The kind of chunk being bundled (Main, Lazy, or Shared).
+    chunk_kind: &'a ChunkKind,
+    /// Set of canonical module paths in this chunk (for cross-chunk import detection).
+    chunk_module_set: &'a HashSet<PathBuf>,
+    /// Main chunk's file path → namespace mapping (for resolving npm cross-chunk imports).
+    main_file_to_ns: &'a HashMap<PathBuf, String>,
+    /// Set of canonical module paths in the main chunk.
+    main_chunk_module_set: &'a HashSet<PathBuf>,
+}
+
+/// Result of bundling a single chunk, including cross-chunk dependency info.
+struct ChunkBundleResult {
+    /// The bundled chunk code.
+    code: String,
+    /// Optional source map for the chunk.
+    source_map: Option<SourceMap>,
+    /// For lazy/shared chunks: npm external imports that need re-exporting from main.
+    npm_externals: Vec<ExternalImport>,
+    /// For lazy/shared chunks: project symbols imported from main chunk modules.
+    project_cross_chunk_symbols: BTreeSet<String>,
+    /// For main chunk: bare specifier → namespace variable name mapping.
+    specifier_to_namespace: HashMap<String, String>,
+    /// For main chunk: canonical file path → namespace variable name mapping.
+    file_to_namespace: HashMap<PathBuf, String>,
 }
 
 /// Bundle a single chunk's modules into an ESM string, optionally with a source map.
-fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<(String, Option<SourceMap>)> {
+fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<ChunkBundleResult> {
+    let is_lazy = *p.chunk_kind != ChunkKind::Main;
+
     let mut all_externals: Vec<ExternalImport> = Vec::new();
     let mut sections: Vec<ModuleSection> = Vec::new();
 
     // Build namespace map: npm file path → namespace variable name
-    // and specifier → namespace for project code imports
+    // and specifier → namespace for project code imports.
+    // Only needed for the main chunk — lazy chunks import npm symbols from main.
     let node_modules_dir = p.root_dir.join("node_modules");
     let mut file_to_namespace: HashMap<PathBuf, String> = HashMap::new();
     let mut specifier_to_namespace: HashMap<String, String> = HashMap::new();
 
-    // First pass: assign namespaces to all npm modules in this chunk
-    for module_path in p.module_paths {
-        let is_npm = module_path
-            .components()
-            .any(|c| c.as_os_str() == "node_modules");
-        if is_npm {
-            let ns = crate::npm_wrap::namespace_from_path(module_path, &node_modules_dir);
-            debug!(path = %module_path.display(), namespace = %ns, "assigned npm namespace");
-            file_to_namespace.insert(module_path.clone(), ns);
-        }
-    }
-    debug!(
-        npm_module_count = file_to_namespace.len(),
-        total_modules = p.module_paths.len(),
-        "npm namespace assignment complete"
-    );
-
-    // Build specifier → namespace mapping for project code and npm cross-references.
-    // Resolve each bare specifier to its actual entry file path and look up the namespace.
-    for spec in p.bundled_specifiers.iter() {
-        // Try to resolve the specifier to its entry file using the npm resolver
-        if let Ok(entry_path) = ngc_npm_resolver::resolve::resolve_bare_specifier(
-            spec,
-            node_modules_dir.parent().unwrap_or(&node_modules_dir),
-        ) {
-            let canonical = entry_path.canonicalize().unwrap_or(entry_path);
-            if let Some(ns) = file_to_namespace.get(&canonical) {
-                specifier_to_namespace.insert(spec.clone(), ns.clone());
-                continue;
+    if !is_lazy {
+        // First pass: assign namespaces to all npm modules in this chunk
+        for module_path in p.module_paths {
+            let is_npm = module_path
+                .components()
+                .any(|c| c.as_os_str() == "node_modules");
+            if is_npm {
+                let ns = crate::npm_wrap::namespace_from_path(module_path, &node_modules_dir);
+                debug!(path = %module_path.display(), namespace = %ns, "assigned npm namespace");
+                file_to_namespace.insert(module_path.clone(), ns);
             }
         }
-        // Fallback: for vendored/synthetic modules (e.g., @oxc-project/runtime/helpers/decorate)
-        // that don't have a package.json, match by path suffix in the file_to_namespace map.
-        let spec_path_suffix = spec.replace('/', std::path::MAIN_SEPARATOR_STR);
-        for (path, ns) in &file_to_namespace {
-            let path_str = path.to_string_lossy();
-            if path_str.contains(&spec_path_suffix) {
-                specifier_to_namespace.insert(spec.clone(), ns.clone());
-                break;
+        debug!(
+            npm_module_count = file_to_namespace.len(),
+            total_modules = p.module_paths.len(),
+            "npm namespace assignment complete"
+        );
+
+        // Build specifier → namespace mapping for project code and npm cross-references.
+        // Resolve each bare specifier to its actual entry file path and look up the namespace.
+        for spec in p.bundled_specifiers.iter() {
+            // Try to resolve the specifier to its entry file using the npm resolver
+            if let Ok(entry_path) = ngc_npm_resolver::resolve::resolve_bare_specifier(
+                spec,
+                node_modules_dir.parent().unwrap_or(&node_modules_dir),
+            ) {
+                let canonical = entry_path.canonicalize().unwrap_or(entry_path);
+                if let Some(ns) = file_to_namespace.get(&canonical) {
+                    specifier_to_namespace.insert(spec.clone(), ns.clone());
+                    continue;
+                }
+            }
+            // Fallback: for vendored/synthetic modules (e.g., @oxc-project/runtime/helpers/decorate)
+            // that don't have a package.json, match by path suffix in the file_to_namespace map.
+            let spec_path_suffix = spec.replace('/', std::path::MAIN_SEPARATOR_STR);
+            for (path, ns) in &file_to_namespace {
+                let path_str = path.to_string_lossy();
+                if path_str.contains(&spec_path_suffix) {
+                    specifier_to_namespace.insert(spec.clone(), ns.clone());
+                    break;
+                }
             }
         }
     }
@@ -374,21 +476,111 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<(String, Option<SourceMa
                 });
             }
         } else {
-            // Project module: use existing rewriter with namespace map
+            // Project module: use existing rewriter with namespace map.
+            // For lazy/shared chunks, pass empty prefixes and bundled_specifiers
+            // so ALL imports are collected as external (for cross-chunk resolution).
+            let empty_specifiers = HashSet::new();
+            let empty_ns_map = HashMap::new();
+            let empty_prefixes: Vec<&str> = Vec::new();
+            let (effective_prefixes, effective_bundled, effective_ns_map) = if is_lazy {
+                (empty_prefixes.as_slice(), &empty_specifiers, &empty_ns_map)
+            } else {
+                (p.prefix_refs, p.bundled_specifiers, &specifier_to_namespace)
+            };
+
             let module_unused = p.unused_exports.get(module_path);
             let is_chunk_entry = module_path == p.chunk_entry;
             let rewritten = rewrite::rewrite_module_with_shaking(
                 js_code,
                 &file_name,
-                p.prefix_refs,
+                effective_prefixes,
                 p.specifier_rewrites,
                 module_unused,
-                p.bundled_specifiers,
-                &specifier_to_namespace,
+                effective_bundled,
+                effective_ns_map,
                 is_chunk_entry,
             )?;
 
-            all_externals.extend(rewritten.external_imports);
+            if is_lazy {
+                // For lazy chunks, classify each external import per-module
+                // so relative paths can be resolved from the correct source.
+                let module_dir = module_path.parent();
+                let is_npm_module = module_path
+                    .components()
+                    .any(|c| c.as_os_str() == "node_modules");
+                for ext in rewritten.external_imports {
+                    if p.bundled_specifiers.contains(&ext.source) {
+                        // npm bare specifier → cross-chunk from main
+                        all_externals.push(ext);
+                    } else if ext.source.starts_with('.') {
+                        if is_npm_module {
+                            // Relative import from an npm module to another npm module.
+                            // Resolve to find the target's namespace in the main chunk.
+                            let mut resolved_ext = ext.clone();
+                            if let Some(dir) = module_dir {
+                                let target = dir.join(&ext.source);
+                                for c in &[
+                                    target.clone(),
+                                    target.with_extension("js"),
+                                    target.with_extension("mjs"),
+                                    target.join("index.js"),
+                                    target.join("index.mjs"),
+                                ] {
+                                    if let Ok(canon) = c.canonicalize() {
+                                        if let Some(ns) = p.main_file_to_ns.get(&canon) {
+                                            resolved_ext.source = format!("__resolved_ns__{ns}");
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            // If resolution failed, still mark as npm-sourced so it
+                            // doesn't get misclassified as a project symbol
+                            if !resolved_ext.source.starts_with("__resolved_ns__") {
+                                resolved_ext.source = "__npm_unresolved__".to_string();
+                            }
+                            all_externals.push(resolved_ext);
+                            continue;
+                        }
+                        // Relative import from project module — resolve from this module's directory
+                        let resolved = module_dir.and_then(|dir| {
+                            let candidate = dir.join(&ext.source);
+                            let candidate_str = candidate.to_string_lossy().to_string();
+                            // Append extensions (not replace) to handle paths like
+                            // ./logto-auth.service where .service is NOT an extension.
+                            for suffix in &["", ".ts", ".js", ".mjs"] {
+                                let full = PathBuf::from(format!("{candidate_str}{suffix}"));
+                                if let Ok(canon) = full.canonicalize() {
+                                    return Some(canon);
+                                }
+                            }
+                            None
+                        });
+                        match resolved {
+                            Some(ref resolved_path) => {
+                                if p.chunk_module_set.contains(resolved_path) {
+                                    continue; // Same chunk — discard
+                                }
+                                if p.main_chunk_module_set.contains(resolved_path) {
+                                    all_externals.push(ext); // Verified in main
+                                }
+                                // else: in another lazy/shared chunk — discard
+                            }
+                            None => {
+                                // Unresolved relative import — discard (can't verify main)
+                            }
+                        }
+                    } else if p.prefix_refs.iter().any(|pfx| ext.source.starts_with(pfx)) {
+                        // Path alias import — cross-chunk from main
+                        all_externals.push(ext);
+                    } else {
+                        // Unknown bare specifier — treat as npm
+                        all_externals.push(ext);
+                    }
+                }
+            } else {
+                all_externals.extend(rewritten.external_imports);
+            }
 
             let trimmed = rewritten.code.trim();
             if !trimmed.is_empty() {
@@ -402,6 +594,63 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<(String, Option<SourceMa
                     source_path: module_path.clone(),
                 });
             }
+        }
+    }
+
+    // For lazy/shared chunks, all remaining externals are cross-chunk imports
+    // (same-chunk imports were already filtered in the per-module loop above).
+    // Merge them all into a single import from ./main.js.
+    let mut npm_externals: Vec<ExternalImport> = Vec::new();
+    let mut project_cross_chunk_symbols: BTreeSet<String> = BTreeSet::new();
+    if is_lazy {
+        let mut main_js_named = BTreeSet::new();
+        let mut main_js_default = None;
+
+        for ext in all_externals {
+            // Classify: npm externals go through namespace lookup, project externals
+            // are already top-level declarations in main.js.
+            let is_from_npm = ext.source.starts_with("__resolved_ns__")
+                || ext.source.starts_with("__npm_")
+                || p.bundled_specifiers.contains(&ext.source)
+                || (!ext.source.starts_with('.')
+                    && !p.prefix_refs.iter().any(|pfx| ext.source.starts_with(pfx)));
+
+            if is_from_npm {
+                npm_externals.push(ext.clone());
+            } else {
+                // Project symbol — already in main chunk scope
+                for name in &ext.named_imports {
+                    let local = name.strip_prefix("* as ").unwrap_or(name);
+                    project_cross_chunk_symbols.insert(local.to_string());
+                }
+                if let Some(ref default) = ext.default_import {
+                    project_cross_chunk_symbols.insert(default.clone());
+                }
+            }
+
+            // Collect all symbols for the ./main.js import
+            for name in &ext.named_imports {
+                if let Some(local) = name.strip_prefix("* as ") {
+                    main_js_named.insert(local.to_string());
+                } else {
+                    main_js_named.insert(name.clone());
+                }
+            }
+            if main_js_default.is_none() {
+                main_js_default.clone_from(&ext.default_import);
+            }
+        }
+
+        all_externals = Vec::new();
+
+        // Merge all cross-chunk imports into a single import from ./main.js
+        if !main_js_named.is_empty() || main_js_default.is_some() {
+            all_externals.push(ExternalImport {
+                source: "./main.js".to_string(),
+                default_import: main_js_default,
+                named_imports: main_js_named,
+                is_side_effect: false,
+            });
         }
     }
 
@@ -464,7 +713,66 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<(String, Option<SourceMa
         None
     };
 
-    Ok((output, combined_map))
+    Ok(ChunkBundleResult {
+        code: output,
+        source_map: combined_map,
+        npm_externals,
+        project_cross_chunk_symbols,
+        specifier_to_namespace,
+        file_to_namespace,
+    })
+}
+
+/// Generate export statements on the main chunk for symbols that lazy chunks need.
+///
+/// For npm symbols, emits `var` declarations from IIFE namespaces.
+/// For project symbols, they're already in scope as top-level declarations.
+/// Both are exported via a single `export { ... }` statement.
+fn generate_cross_chunk_exports(
+    needed_npm: &HashMap<String, BTreeSet<String>>,
+    specifier_to_ns: &HashMap<String, String>,
+    needed_project: &BTreeSet<String>,
+) -> String {
+    let mut all_symbols: BTreeSet<String> = BTreeSet::new();
+    let mut var_lines: Vec<String> = Vec::new();
+
+    for (specifier, symbols) in needed_npm {
+        // Look up namespace: first by specifier, then by resolved namespace key
+        let resolved_ns_key = specifier.strip_prefix("__resolved_ns__").map(String::from);
+        let ns = specifier_to_ns.get(specifier).or(resolved_ns_key.as_ref());
+        // Skip symbols without a namespace mapping — they come from npm modules
+        // in non-main chunks and can't be exported from main.js.
+        let Some(ns) = ns else {
+            continue;
+        };
+        for sym in symbols {
+            if let Some(local) = sym.strip_prefix("__ns_import__") {
+                if all_symbols.insert(local.to_string()) {
+                    var_lines.push(format!("var {local} = {ns};"));
+                }
+            } else if all_symbols.insert(sym.clone()) {
+                var_lines.push(format!("var {sym} = {ns}.{sym};"));
+            }
+        }
+    }
+
+    // Additional project symbols from the needed_project set.
+    for sym in needed_project {
+        all_symbols.insert(sym.clone());
+    }
+
+    if all_symbols.is_empty() {
+        return String::new();
+    }
+
+    let mut code = String::from("\n// Cross-chunk exports for lazy-loaded chunks\n");
+    for line in &var_lines {
+        code.push_str(line);
+        code.push('\n');
+    }
+    let syms: Vec<&str> = all_symbols.iter().map(|s| s.as_str()).collect();
+    code.push_str(&format!("export {{ {} }};\n", syms.join(", ")));
+    code
 }
 
 /// Compute a truncated SHA-256 content hash (8 hex characters).
@@ -515,7 +823,14 @@ fn apply_content_hashes(
     if let Some(main_code) = chunks.get("main.js") {
         let hash = content_hash(main_code);
         let hashed_main = insert_hash_in_filename("main.js", &hash);
-        rename_map.insert("main.js".to_string(), hashed_main);
+        rename_map.insert("main.js".to_string(), hashed_main.clone());
+
+        // Replace main.js references in lazy/shared chunks (they import from ./main.js)
+        for (filename, code) in chunks.iter_mut() {
+            if filename != "main.js" {
+                *code = code.replace("./main.js", &format!("./{hashed_main}"));
+            }
+        }
     }
 
     // Apply renames to the chunks and source_maps HashMaps
