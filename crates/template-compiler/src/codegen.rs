@@ -559,7 +559,13 @@ impl IvyCodegen {
         }
 
         // Update block: conditional
-        self.add_advance(slot);
+        // Angular's ɵɵconditional uses getSelectedIndex() + 1 + branchIndex to
+        // locate the template container, so selectedIndex must be one before
+        // the first template slot.  When slot == 0, selectedIndex already
+        // starts at -1, so no advance is needed.
+        if slot > 0 {
+            self.add_advance(slot - 1);
+        }
         let cond_expr = build_conditional_expr(
             &block.condition,
             &else_if_fns,
@@ -676,7 +682,11 @@ impl IvyCodegen {
             self.child_templates.push(child);
         }
 
-        self.add_advance(slot);
+        // Angular's ɵɵconditional uses getSelectedIndex() + 1 + branchIndex,
+        // so advance to one before the first template slot.
+        if slot > 0 {
+            self.add_advance(slot - 1);
+        }
         // Build switch conditional expression
         let mut cond = String::new();
         for (i, (expr, idx)) in case_fns.iter().enumerate() {
@@ -1946,5 +1956,81 @@ mod tests {
         );
         assert!(output.ivy_imports.contains("\u{0275}\u{0275}pipe"));
         assert!(output.ivy_imports.contains("\u{0275}\u{0275}pipeBind1"));
+    }
+
+    #[test]
+    fn test_if_block_advance_after_element() {
+        // When @if appears after elements, ɵɵconditional must use
+        // selectedIndex = firstTemplateSlot - 1 so that branchIndex 0
+        // maps to the correct LContainer.
+        let comp = test_component();
+        let nodes = vec![
+            TemplateNode::Element(ElementNode {
+                tag: "h1".to_string(),
+                attributes: Vec::new(),
+                children: vec![TemplateNode::Text(TextNode {
+                    value: "Title".to_string(),
+                })],
+                is_void: false,
+            }),
+            TemplateNode::IfBlock(IfBlockNode {
+                condition: "show".to_string(),
+                children: vec![TemplateNode::Text(TextNode {
+                    value: "Yes".to_string(),
+                })],
+                else_if_branches: Vec::new(),
+                else_branch: Some(vec![TemplateNode::Text(TextNode {
+                    value: "No".to_string(),
+                })]),
+            }),
+        ];
+        let output = generate_ivy(&comp, &nodes).expect("should generate");
+        let dc = &output.static_fields[0];
+        // h1 at slot 0, text at slot 1 → @if template at slot 2, @else at slot 3
+        assert!(
+            dc.contains("\u{0275}\u{0275}template(2,"),
+            "if template at slot 2: {dc}"
+        );
+        assert!(
+            dc.contains("\u{0275}\u{0275}template(3,"),
+            "else template at slot 3: {dc}"
+        );
+        // Advance should go to slot 1 (= 2 - 1), not slot 2.
+        // From -1, delta = 1 + 1 = 2 → ɵɵadvance(2)
+        assert!(
+            dc.contains("\u{0275}\u{0275}advance(2)"),
+            "should advance by 2 (to selectedIndex 1): {dc}"
+        );
+        // Branch indices should be 0-based (correct as-is)
+        assert!(
+            dc.contains("conditional(ctx.show ? 0 : 1)"),
+            "conditional should use 0-based branch indices: {dc}"
+        );
+    }
+
+    #[test]
+    fn test_if_block_at_slot_zero_no_advance() {
+        // When @if is the first node, no advance should be emitted
+        // because selectedIndex already starts at -1 = (0 - 1).
+        let comp = test_component();
+        let nodes = vec![TemplateNode::IfBlock(IfBlockNode {
+            condition: "visible".to_string(),
+            children: vec![TemplateNode::Text(TextNode {
+                value: "A".to_string(),
+            })],
+            else_if_branches: Vec::new(),
+            else_branch: None,
+        })];
+        let output = generate_ivy(&comp, &nodes).expect("should generate");
+        let dc = &output.static_fields[0];
+        // Template at slot 0, no elements before it → no advance needed
+        assert!(
+            dc.contains("\u{0275}\u{0275}template(0,"),
+            "if template at slot 0: {dc}"
+        );
+        assert!(
+            !dc.contains("\u{0275}\u{0275}advance"),
+            "should not emit advance when @if is at slot 0: {dc}"
+        );
     }
 }
