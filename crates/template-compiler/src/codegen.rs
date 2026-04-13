@@ -289,17 +289,25 @@ impl IvyCodegen {
                     TemplateAttribute::Event { name, handler } => {
                         self.ivy_imports
                             .insert("\u{0275}\u{0275}listener".to_string());
+                        self.ivy_imports
+                            .insert("\u{0275}\u{0275}restoreView".to_string());
+                        self.ivy_imports
+                            .insert("\u{0275}\u{0275}nextContext".to_string());
                         let compiled_handler = compile_event_handler(handler);
                         self.creation.push(format!(
-                            "\u{0275}\u{0275}listener('{}', function($event) {{ {compiled_handler} }});",
+                            "\u{0275}\u{0275}listener('{}', function($event) {{ \u{0275}\u{0275}restoreView(_r); const ctx = \u{0275}\u{0275}nextContext(); {compiled_handler} }});",
                             name,
                         ));
                     }
                     TemplateAttribute::TwoWayBinding { name, expression } => {
                         self.ivy_imports
                             .insert("\u{0275}\u{0275}listener".to_string());
+                        self.ivy_imports
+                            .insert("\u{0275}\u{0275}restoreView".to_string());
+                        self.ivy_imports
+                            .insert("\u{0275}\u{0275}nextContext".to_string());
                         self.creation.push(format!(
-                            "\u{0275}\u{0275}listener('{}Change', function($event) {{ return {} = $event; }});",
+                            "\u{0275}\u{0275}listener('{}Change', function($event) {{ \u{0275}\u{0275}restoreView(_r); const ctx = \u{0275}\u{0275}nextContext(); return {} = $event; }});",
                             name, ctx_expr(expression)
                         ));
                     }
@@ -743,9 +751,19 @@ impl IvyCodegen {
         let decls = self.slot_index;
         let vars = self.var_count + parent_lets.len() as u32;
 
+        // Embedded views (conditional / repeater child templates) do not
+        // receive the parent component as `ctx`.  We must use ɵɵnextContext()
+        // in the update block and ɵɵrestoreView + ɵɵnextContext in listeners.
+        let has_listeners = self.creation.iter().any(|s| s.contains("listener"));
+
         let mut code = format!("function {fn_name}(rf, ctx) {{\n");
         if !self.creation.is_empty() {
             code.push_str("  if (rf & 1) {\n");
+            if has_listeners {
+                self.ivy_imports
+                    .insert("\u{0275}\u{0275}getCurrentView".to_string());
+                code.push_str("    const _r = \u{0275}\u{0275}getCurrentView();\n");
+            }
             for instr in &self.creation {
                 code.push_str("    ");
                 code.push_str(instr);
@@ -755,6 +773,10 @@ impl IvyCodegen {
         }
         if !self.update.is_empty() || !parent_lets.is_empty() {
             code.push_str("  if (rf & 2) {\n");
+            // Get parent component context for embedded views
+            self.ivy_imports
+                .insert("\u{0275}\u{0275}nextContext".to_string());
+            code.push_str("    const ctx = \u{0275}\u{0275}nextContext();\n");
             // Inject @let variable reads from parent context
             for (name, slot) in &parent_lets {
                 self.ivy_imports
