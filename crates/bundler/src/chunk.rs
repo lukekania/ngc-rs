@@ -294,24 +294,11 @@ fn toposort_subset(
     _start: NodeIndex,
     subset: &HashSet<NodeIndex>,
 ) -> NgcResult<Vec<NodeIndex>> {
-    // Try strict toposort first (works when the full graph is acyclic)
-    match petgraph::algo::toposort(graph, None) {
-        Ok(topo) => {
-            let mut ordered: Vec<NodeIndex> = topo
-                .into_iter()
-                .filter(|idx| subset.contains(idx))
-                .collect();
-            ordered.reverse();
-            Ok(ordered)
-        }
-        Err(_) => {
-            // Graph has cycles (common with npm packages).  Build a subgraph
-            // of only the subset nodes and toposort that.  If the subgraph is
-            // still cyclic, condense SCCs into single nodes to get a DAG and
-            // toposort the condensation.
-            toposort_subset_with_cycles(graph, subset)
-        }
-    }
+    // Always build a subgraph of the subset nodes and sort that.
+    // Filtering a global toposort is incorrect: the global order may
+    // interleave non-subset nodes that cause two subset nodes to appear
+    // in the wrong relative order.
+    toposort_subset_with_cycles(graph, subset)
 }
 
 /// Topological sort of a subset that may contain cycles.
