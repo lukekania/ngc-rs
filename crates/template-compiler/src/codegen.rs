@@ -506,7 +506,7 @@ impl IvyCodegen {
         self.slot_index += 1;
 
         self.ivy_imports
-            .insert("\u{0275}\u{0275}template".to_string());
+            .insert("\u{0275}\u{0275}conditionalCreate".to_string());
         self.ivy_imports
             .insert("\u{0275}\u{0275}conditional".to_string());
         self.ivy_imports
@@ -521,49 +521,54 @@ impl IvyCodegen {
 
         let child = self.generate_child_template(&child_fn_name, &block.children);
         self.creation.push(format!(
-            "\u{0275}\u{0275}template({slot}, {child_fn_name}, {}, {});",
+            "\u{0275}\u{0275}conditionalCreate({slot}, {child_fn_name}, {}, {});",
             child.decls, child.vars
         ));
         self.child_templates.push(child);
 
         // Generate else-if and else child templates
-        let mut else_if_fns = Vec::new();
+        let mut else_if_slots = Vec::new();
         for (i, branch) in block.else_if_branches.iter().enumerate() {
             let fn_name = format!(
                 "{}_ConditionalElseIf_{}_{}_Template",
                 self.component_name, slot, i
             );
+            self.ivy_imports
+                .insert("\u{0275}\u{0275}conditionalBranchCreate".to_string());
             let ei_slot = self.slot_index;
             self.slot_index += 1;
             let child = self.generate_child_template(&fn_name, &branch.children);
             self.creation.push(format!(
-                "\u{0275}\u{0275}template({ei_slot}, {fn_name}, {}, {});",
+                "\u{0275}\u{0275}conditionalBranchCreate({ei_slot}, {fn_name}, {}, {});",
                 child.decls, child.vars
             ));
-            else_if_fns.push((branch.condition.clone(), fn_name.clone()));
+            else_if_slots.push((branch.condition.clone(), fn_name.clone(), ei_slot));
             self.child_templates.push(child);
         }
 
-        let mut else_fn_name = None;
+        let mut else_slot_info = None;
         if let Some(ref else_children) = block.else_branch {
             let fn_name = format!("{}_ConditionalElse_{}_Template", self.component_name, slot);
+            self.ivy_imports
+                .insert("\u{0275}\u{0275}conditionalBranchCreate".to_string());
             let else_slot = self.slot_index;
             self.slot_index += 1;
             let child = self.generate_child_template(&fn_name, else_children);
             self.creation.push(format!(
-                "\u{0275}\u{0275}template({else_slot}, {fn_name}, {}, {});",
+                "\u{0275}\u{0275}conditionalBranchCreate({else_slot}, {fn_name}, {}, {});",
                 child.decls, child.vars
             ));
-            else_fn_name = Some(fn_name.clone());
+            else_slot_info = Some((fn_name.clone(), else_slot));
             self.child_templates.push(child);
         }
 
-        // Update block: conditional
+        // Update block: conditional with absolute slot indices
         self.add_advance(slot);
         let cond_expr = build_conditional_expr(
             &block.condition,
-            &else_if_fns,
-            &else_fn_name,
+            slot,
+            &else_if_slots,
+            &else_slot_info,
             &self.local_vars,
         );
         self.update
@@ -573,7 +578,10 @@ impl IvyCodegen {
 
     fn generate_for_block(&mut self, block: &ForBlockNode) {
         let slot = self.slot_index;
-        self.slot_index += 1;
+        // ɵɵrepeaterCreate internally uses: slot for metadata, slot+1 for template,
+        // and slot+2 for @empty template (if present).  Reserve all needed slots.
+        let has_empty = block.empty_children.is_some();
+        self.slot_index += if has_empty { 3 } else { 2 };
 
         self.ivy_imports
             .insert("\u{0275}\u{0275}repeaterCreate".to_string());
@@ -609,24 +617,23 @@ impl IvyCodegen {
             let item = &block.item_name;
             format!("(i, {item}) => {track_expr}")
         };
-        self.creation.push(format!(
-            "\u{0275}\u{0275}repeaterCreate({slot}, {child_fn_name}, {}, {}, {track_fn});",
-            child.decls, child.vars
-        ));
-        self.child_templates.push(child);
 
-        // @empty block
+        // @empty block — passed as extra args to ɵɵrepeaterCreate
         if let Some(ref empty_children) = block.empty_children {
             let empty_fn_name = format!("{}_ForEmpty_{}_Template", self.component_name, slot);
-            let empty_slot = self.slot_index;
-            self.slot_index += 1;
             let empty_child = self.generate_child_template(&empty_fn_name, empty_children);
             self.creation.push(format!(
-                "\u{0275}\u{0275}template({empty_slot}, {empty_fn_name}, {}, {});",
-                empty_child.decls, empty_child.vars
+                "\u{0275}\u{0275}repeaterCreate({slot}, {child_fn_name}, {}, {}, null, null, {track_fn}, false, {empty_fn_name}, {}, {});",
+                child.decls, child.vars, empty_child.decls, empty_child.vars
             ));
             self.child_templates.push(empty_child);
+        } else {
+            self.creation.push(format!(
+                "\u{0275}\u{0275}repeaterCreate({slot}, {child_fn_name}, {}, {}, null, null, {track_fn});",
+                child.decls, child.vars
+            ));
         }
+        self.child_templates.push(child);
 
         self.add_advance(slot);
         self.update.push(format!(
@@ -642,44 +649,56 @@ impl IvyCodegen {
         self.slot_index += 1;
 
         self.ivy_imports
-            .insert("\u{0275}\u{0275}template".to_string());
+            .insert("\u{0275}\u{0275}conditionalCreate".to_string());
         self.ivy_imports
             .insert("\u{0275}\u{0275}conditional".to_string());
         self.ivy_imports
             .insert("\u{0275}\u{0275}advance".to_string());
 
-        let mut case_fns = Vec::new();
+        let mut case_slots = Vec::new();
+        let is_first_case = true;
         for (i, case) in block.cases.iter().enumerate() {
             let fn_name = format!("{}_SwitchCase_{}_{}_Template", self.component_name, slot, i);
             let case_slot = self.slot_index;
             self.slot_index += 1;
             let child = self.generate_child_template(&fn_name, &case.children);
-            self.creation.push(format!(
-                "\u{0275}\u{0275}template({case_slot}, {fn_name}, {}, {});",
-                child.decls, child.vars
-            ));
-            case_fns.push((case.expression.clone(), i));
+            if i == 0 && is_first_case {
+                self.creation.push(format!(
+                    "\u{0275}\u{0275}conditionalCreate({case_slot}, {fn_name}, {}, {});",
+                    child.decls, child.vars
+                ));
+            } else {
+                self.ivy_imports
+                    .insert("\u{0275}\u{0275}conditionalBranchCreate".to_string());
+                self.creation.push(format!(
+                    "\u{0275}\u{0275}conditionalBranchCreate({case_slot}, {fn_name}, {}, {});",
+                    child.decls, child.vars
+                ));
+            }
+            case_slots.push((case.expression.clone(), case_slot));
             self.child_templates.push(child);
         }
 
-        let mut default_fn = None;
+        let mut default_slot_val = None;
         if let Some(ref default_children) = block.default_branch {
             let fn_name = format!("{}_SwitchDefault_{}_Template", self.component_name, slot);
+            self.ivy_imports
+                .insert("\u{0275}\u{0275}conditionalBranchCreate".to_string());
             let default_slot = self.slot_index;
             self.slot_index += 1;
             let child = self.generate_child_template(&fn_name, default_children);
             self.creation.push(format!(
-                "\u{0275}\u{0275}template({default_slot}, {fn_name}, {}, {});",
+                "\u{0275}\u{0275}conditionalBranchCreate({default_slot}, {fn_name}, {}, {});",
                 child.decls, child.vars
             ));
-            default_fn = Some(case_fns.len());
+            default_slot_val = Some(default_slot);
             self.child_templates.push(child);
         }
 
         self.add_advance(slot);
-        // Build switch conditional expression
+        // Build switch conditional expression with absolute slot indices
         let mut cond = String::new();
-        for (i, (expr, idx)) in case_fns.iter().enumerate() {
+        for (i, (expr, case_slot)) in case_slots.iter().enumerate() {
             if i > 0 {
                 cond.push_str(" : ");
             }
@@ -687,11 +706,11 @@ impl IvyCodegen {
                 "{} === {} ? {}",
                 ctx_expr(&block.expression),
                 expr,
-                idx
+                case_slot
             ));
         }
-        if let Some(default_idx) = default_fn {
-            cond.push_str(&format!(" : {default_idx}"));
+        if let Some(ds) = default_slot_val {
+            cond.push_str(&format!(" : {ds}"));
         } else {
             cond.push_str(" : -1");
         }
@@ -970,10 +989,12 @@ impl IvyCodegen {
 
     /// Add an `ɵɵadvance()` instruction to the update block.
     fn add_advance(&mut self, target_slot: u32) {
-        // Angular's runtime starts with selectedIndex = -1 before the update block.
-        // The first ɵɵadvance() must advance from -1 to the target slot (delta = target + 1).
+        // Angular's executeTemplate() sets selectedIndex = HEADER_OFFSET before the
+        // update phase.  ɵɵadvance(delta) adds delta to that base, so the first call
+        // must use delta = target_slot (not target_slot + 1) to reach
+        // HEADER_OFFSET + target_slot, which is the correct LView index.
         let delta = match self.last_update_slot {
-            None => target_slot + 1, // First advance: from -1 to target
+            None => target_slot,
             Some(last) => target_slot.saturating_sub(last),
         };
         if delta > 0 {
@@ -1650,25 +1671,26 @@ fn collect_ctx_rewrites(
     }
 }
 
-/// Build a conditional expression for @if chains.
+/// Build a conditional expression for @if chains using absolute slot indices.
 fn build_conditional_expr(
     condition: &str,
-    else_ifs: &[(String, String)],
-    else_fn: &Option<String>,
+    if_slot: u32,
+    else_ifs: &[(String, String, u32)],
+    else_info: &Option<(String, u32)>,
     locals: &BTreeSet<String>,
 ) -> String {
-    let mut expr = format!("{} ? 0 : ", ctx_expr_with_locals(condition, locals));
+    let mut expr = format!("{} ? {} : ", ctx_expr_with_locals(condition, locals), if_slot);
 
-    for (i, (cond, _fn_name)) in else_ifs.iter().enumerate() {
+    for (cond, _fn_name, slot) in else_ifs {
         expr.push_str(&format!(
             "{} ? {} : ",
             ctx_expr_with_locals(cond, locals),
-            i + 1
+            slot
         ));
     }
 
-    if else_fn.is_some() {
-        expr.push_str(&format!("{}", else_ifs.len() + 1));
+    if let Some((_fn, slot)) = else_info {
+        expr.push_str(&format!("{}", slot));
     } else {
         expr.push_str("-1");
     }
