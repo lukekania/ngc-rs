@@ -96,11 +96,15 @@ pub fn build_chunk_graph(
     // Step 2: Compute static-only reachability from main entry
     let mut main_reachable = static_reachable(graph, *entry_idx);
 
-    // Force all npm modules into the main chunk.  The bundler's IIFE wrapping
-    // and namespace system only operates on the main chunk — npm modules that
-    // end up in lazy/shared chunks would be silently omitted, producing missing
-    // cross-chunk exports at runtime.
-    for idx in graph.node_indices() {
+    // Force npm modules that are reachable from ANY entry point (main or split)
+    // into the main chunk.  The bundler's IIFE wrapping and namespace system
+    // only operates on the main chunk — npm modules that end up in lazy/shared
+    // chunks would be silently omitted, producing missing cross-chunk exports.
+    // We compute full reachability (all edge types) from the main entry to find
+    // all npm modules the app actually uses, excluding unreachable npm modules
+    // (e.g. test-only packages discovered by scanning non-entry files).
+    let all_reachable = all_reachable(graph, *entry_idx);
+    for idx in all_reachable {
         if graph[idx]
             .components()
             .any(|c| c.as_os_str() == "node_modules")
@@ -228,6 +232,23 @@ pub fn build_chunk_graph(
         chunks,
         dynamic_import_map,
     })
+}
+
+/// Compute the set of nodes reachable from `start` following all edge types.
+fn all_reachable(graph: &DiGraph<PathBuf, ImportKind>, start: NodeIndex) -> HashSet<NodeIndex> {
+    let mut visited = HashSet::new();
+    let mut stack = vec![start];
+
+    while let Some(node) = stack.pop() {
+        if !visited.insert(node) {
+            continue;
+        }
+        for neighbor in graph.neighbors(node) {
+            stack.push(neighbor);
+        }
+    }
+
+    visited
 }
 
 /// Compute the set of nodes reachable from `start` following only static edges.
