@@ -94,7 +94,20 @@ pub fn build_chunk_graph(
     }
 
     // Step 2: Compute static-only reachability from main entry
-    let main_reachable = static_reachable(graph, *entry_idx);
+    let mut main_reachable = static_reachable(graph, *entry_idx);
+
+    // Force all npm modules into the main chunk.  The bundler's IIFE wrapping
+    // and namespace system only operates on the main chunk — npm modules that
+    // end up in lazy/shared chunks would be silently omitted, producing missing
+    // cross-chunk exports at runtime.
+    for idx in graph.node_indices() {
+        if graph[idx]
+            .components()
+            .any(|c| c.as_os_str() == "node_modules")
+        {
+            main_reachable.insert(idx);
+        }
+    }
 
     // Step 3: Compute static-only reachability from each split point
     let mut split_reachable: HashMap<NodeIndex, HashSet<NodeIndex>> = HashMap::new();
@@ -526,5 +539,49 @@ mod tests {
             .modules
             .iter()
             .any(|m| m.to_str().unwrap_or("").contains("admin")));
+    }
+
+    #[test]
+    fn test_npm_modules_forced_to_main_chunk() {
+        // main --dynamic--> lazy_component --static--> node_modules/cdk/overlay.mjs
+        // The npm module is only reachable via a dynamic import, but it must
+        // still end up in the main chunk for IIFE wrapping and cross-chunk exports.
+        let mut graph = DiGraph::new();
+        let npm_mod = graph.add_node(make_path(
+            "/root/node_modules/@angular/cdk/fesm2022/overlay.mjs",
+        ));
+        let lazy = graph.add_node(make_path("/root/src/dialog/dialog.component.ts"));
+        let entry = graph.add_node(make_path("/root/src/main.ts"));
+
+        graph.add_edge(entry, lazy, ImportKind::Dynamic);
+        graph.add_edge(lazy, npm_mod, ImportKind::Static);
+
+        let result = build_chunk_graph(
+            &graph,
+            &make_path("/root/src/main.ts"),
+            Path::new("/root/src"),
+        )
+        .expect("should build chunk graph");
+
+        // npm module must be in the main chunk
+        let main_chunk = &result.chunks[0];
+        assert!(
+            main_chunk
+                .modules
+                .iter()
+                .any(|m| m.to_string_lossy().contains("node_modules")),
+            "npm module should be in main chunk"
+        );
+
+        // Lazy chunk must NOT contain the npm module
+        for chunk in result.chunks.iter().filter(|c| c.kind == ChunkKind::Lazy) {
+            assert!(
+                !chunk
+                    .modules
+                    .iter()
+                    .any(|m| m.to_string_lossy().contains("node_modules")),
+                "npm module should NOT be in lazy chunk"
+            );
+        }
     }
 }
