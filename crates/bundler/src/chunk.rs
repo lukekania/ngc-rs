@@ -273,7 +273,7 @@ fn toposort_subset(
     _start: NodeIndex,
     subset: &HashSet<NodeIndex>,
 ) -> NgcResult<Vec<NodeIndex>> {
-    // Try strict toposort first
+    // Try strict toposort first (works when the full graph is acyclic)
     match petgraph::algo::toposort(graph, None) {
         Ok(topo) => {
             let mut ordered: Vec<NodeIndex> = topo
@@ -284,35 +284,144 @@ fn toposort_subset(
             Ok(ordered)
         }
         Err(_) => {
-            // Graph has cycles (common with npm packages) — use DFS post-order
-            // which gives a valid ordering even with cycles
-            let mut visited = HashSet::new();
-            let mut order = Vec::new();
-            for &node in subset {
-                dfs_postorder(graph, node, subset, &mut visited, &mut order);
-            }
-            Ok(order)
+            // Graph has cycles (common with npm packages).  Build a subgraph
+            // of only the subset nodes and toposort that.  If the subgraph is
+            // still cyclic, condense SCCs into single nodes to get a DAG and
+            // toposort the condensation.
+            toposort_subset_with_cycles(graph, subset)
         }
     }
 }
 
-/// DFS post-order traversal for cycle-tolerant topological sorting.
-fn dfs_postorder(
+/// Topological sort of a subset that may contain cycles.
+///
+/// Builds a subgraph of the subset nodes, condenses SCCs into single nodes
+/// (creating a DAG), toposorts the DAG, then expands SCCs back into their
+/// constituent nodes.  Within each SCC, nodes are ordered by DFS post-order.
+fn toposort_subset_with_cycles(
     graph: &DiGraph<PathBuf, ImportKind>,
-    node: NodeIndex,
     subset: &HashSet<NodeIndex>,
-    visited: &mut HashSet<NodeIndex>,
-    order: &mut Vec<NodeIndex>,
-) {
-    if !visited.insert(node) {
-        return;
+) -> NgcResult<Vec<NodeIndex>> {
+    use petgraph::algo::kosaraju_scc;
+
+    // Build a subgraph containing only subset nodes
+    let mut sub = DiGraph::<NodeIndex, ()>::new();
+    let mut orig_to_sub: HashMap<NodeIndex, NodeIndex> = HashMap::new();
+
+    for &node in subset {
+        let sub_node = sub.add_node(node);
+        orig_to_sub.insert(node, sub_node);
     }
-    for neighbor in graph.neighbors(node) {
-        if subset.contains(&neighbor) {
-            dfs_postorder(graph, neighbor, subset, visited, order);
+    for &node in subset {
+        let sub_from = orig_to_sub[&node];
+        for neighbor in graph.neighbors(node) {
+            if let Some(&sub_to) = orig_to_sub.get(&neighbor) {
+                sub.add_edge(sub_from, sub_to, ());
+            }
         }
     }
-    order.push(node);
+
+    // Find SCCs using Kosaraju's algorithm
+    let sccs = kosaraju_scc(&sub);
+
+    // Map each sub-node to its SCC index
+    let mut node_to_scc: HashMap<NodeIndex, usize> = HashMap::new();
+    for (scc_idx, scc) in sccs.iter().enumerate() {
+        for &sub_node in scc {
+            node_to_scc.insert(sub_node, scc_idx);
+        }
+    }
+
+    // Build condensation DAG: each SCC becomes a single node
+    let mut cond = DiGraph::<usize, ()>::new();
+    let mut scc_to_cond: HashMap<usize, NodeIndex> = HashMap::new();
+    for i in 0..sccs.len() {
+        let cond_node = cond.add_node(i);
+        scc_to_cond.insert(i, cond_node);
+    }
+    let mut cond_edges_seen: HashSet<(usize, usize)> = HashSet::new();
+    for edge in sub.edge_indices() {
+        if let Some((from, to)) = sub.edge_endpoints(edge) {
+            let scc_from = node_to_scc[&from];
+            let scc_to = node_to_scc[&to];
+            if scc_from != scc_to && cond_edges_seen.insert((scc_from, scc_to)) {
+                let cf = scc_to_cond[&scc_from];
+                let ct = scc_to_cond[&scc_to];
+                cond.add_edge(cf, ct, ());
+            }
+        }
+    }
+
+    // Toposort the condensation (guaranteed to be a DAG)
+    let cond_order = petgraph::algo::toposort(&cond, None).map_err(|_| NgcError::ChunkError {
+        message: "condensation graph has a cycle (should be impossible)".into(),
+    })?;
+
+    // Expand: for each SCC in reverse toposort order (dependencies first),
+    // emit the nodes within the SCC.  Within each SCC, use DFS post-order
+    // on the subgraph to get the best possible internal ordering.
+    let mut result = Vec::with_capacity(subset.len());
+    for cond_node in cond_order.into_iter().rev() {
+        let scc_idx = cond[cond_node];
+        let scc = &sccs[scc_idx];
+        if scc.len() == 1 {
+            result.push(sub[scc[0]]);
+        } else {
+            // For multi-node SCCs, do a local DFS post-order within the SCC
+            // so that within-SCC dependencies are ordered as well as possible.
+            let scc_set: HashSet<NodeIndex> = scc.iter().copied().collect();
+            let mut emitted = HashSet::new();
+            let mut in_progress = HashSet::new();
+            let mut local_order = Vec::new();
+            for &scc_node in scc {
+                scc_emit_deps_first(
+                    &sub,
+                    scc_node,
+                    &scc_set,
+                    &mut emitted,
+                    &mut in_progress,
+                    &mut local_order,
+                );
+            }
+            for sub_node in local_order {
+                result.push(sub[sub_node]);
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/// Emit SCC nodes in dependency-first order (best-effort for cycles).
+///
+/// For each unfinished node, first recursively emit all its unfinished
+/// in-SCC dependencies.  Back edges (cycles) are detected by tracking
+/// nodes currently on the recursion path.
+fn scc_emit_deps_first(
+    sub: &DiGraph<NodeIndex, ()>,
+    node: NodeIndex,
+    scc_set: &HashSet<NodeIndex>,
+    emitted: &mut HashSet<NodeIndex>,
+    in_progress: &mut HashSet<NodeIndex>,
+    order: &mut Vec<NodeIndex>,
+) {
+    if emitted.contains(&node) {
+        return;
+    }
+    if !in_progress.insert(node) {
+        // Cycle detected — break it by skipping
+        return;
+    }
+    // Emit all in-SCC dependencies first
+    for neighbor in sub.neighbors(node) {
+        if scc_set.contains(&neighbor) && !emitted.contains(&neighbor) {
+            scc_emit_deps_first(sub, neighbor, scc_set, emitted, in_progress, order);
+        }
+    }
+    in_progress.remove(&node);
+    if emitted.insert(node) {
+        order.push(node);
+    }
 }
 
 /// Derive a chunk filename from a split point's file path.
