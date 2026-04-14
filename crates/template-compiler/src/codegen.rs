@@ -761,7 +761,9 @@ impl IvyCodegen {
         // in the update block and ɵɵrestoreView + ɵɵnextContext in listeners.
         let has_listeners = self.creation.iter().any(|s| s.contains("listener"));
 
-        let mut code = format!("function {fn_name}(rf, ctx) {{\n");
+        // Use `_ctx` as parameter name since we rebind `ctx` via ɵɵnextContext()
+        // in the update block.  Using `ctx` for both would be a const redeclaration.
+        let mut code = format!("function {fn_name}(rf, _ctx) {{\n");
         if !self.creation.is_empty() {
             code.push_str("  if (rf & 1) {\n");
             if has_listeners {
@@ -850,6 +852,8 @@ impl IvyCodegen {
         }
         if !self.update.is_empty() || !parent_lets.is_empty() {
             code.push_str("  if (rf & 2) {\n");
+            // @for child templates receive RepeaterContext as ctx with $implicit and $index.
+            // The item variable comes from ctx.$implicit directly — no nextContext needed.
             code.push_str(&format!("    const {item_name} = ctx.$implicit;\n"));
             for (name, slot) in &parent_lets {
                 self.ivy_imports

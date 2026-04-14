@@ -86,7 +86,9 @@ pub fn rewrite_module_with_shaking(
     preserve_exports: bool,
 ) -> NgcResult<RewrittenModule> {
     let allocator = Allocator::new();
-    let source_type = SourceType::mjs();
+    // Use tsx() which is a superset of mjs — handles both JS and TS sources.
+    // Files that failed the TS→JS transform step may still have TS annotations.
+    let source_type = SourceType::tsx();
     let parsed = Parser::new(&allocator, js_code, source_type).parse();
 
     if parsed.panicked {

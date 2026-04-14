@@ -71,9 +71,15 @@ pub fn extract_component(source: &str, file_path: &Path) -> NgcResult<Option<Ext
 
     let parsed = Parser::new(&allocator, source, source_type).parse();
     if parsed.panicked {
+        let error_msgs: Vec<String> = parsed.errors.iter().map(|e| format!("{e}")).collect();
+        let detail = if error_msgs.is_empty() {
+            "parser panicked (no details)".to_string()
+        } else {
+            format!("parser panicked: {}", error_msgs.join("; "))
+        };
         return Err(NgcError::TemplateCompileError {
             path: file_path.to_path_buf(),
-            message: "parser panicked".to_string(),
+            message: detail,
         });
     }
 

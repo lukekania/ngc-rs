@@ -989,6 +989,129 @@ fn find_css_in_exports(
 }
 
 /// Format byte count as human-readable string.
+/// Extract the Angular component class name from a file path.
+fn extract_class_name_from_path(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    // Convert kebab-case filename to PascalCase class name
+    // e.g. "portfolio.component" → "PortfolioComponent"
+    let parts: Vec<&str> = stem.split('.').collect();
+    let name: String = parts
+        .iter()
+        .map(|part| {
+            part.split('-')
+                .map(|word| {
+                    let mut chars = word.chars();
+                    match chars.next() {
+                        Some(first) => {
+                            first.to_uppercase().to_string() + &chars.collect::<String>()
+                        }
+                        None => String::new(),
+                    }
+                })
+                .collect::<String>()
+        })
+        .collect();
+    Some(name)
+}
+
+/// Inject compiled AOT metadata (ɵfac, ɵcmp, child templates) from the compiled
+/// source into the transformed JS code.
+fn inject_compiled_metadata(code: &mut String, compiled_source: &str, class_name: &str) {
+    // Find the static ɵfac and ɵcmp fields in the compiled source
+    let fac_marker = format!("static \u{0275}fac = ");
+    let cmp_marker = format!("static \u{0275}cmp = ");
+
+    // Extract ɵfac
+    if let Some(fac_start) = compiled_source.find(&fac_marker) {
+        // Find the end of the ɵfac assignment (next `static` or class closing brace)
+        let fac_end = compiled_source[fac_start..]
+            .find(&cmp_marker)
+            .map(|i| fac_start + i)
+            .unwrap_or(fac_start + 200);
+        let fac_code = compiled_source[fac_start..fac_end].trim_end().trim_end_matches(';');
+
+        // Find the class closing brace to inject the static fields
+        let class_pattern = format!("class {class_name}");
+        if let Some(class_idx) = code.find(&class_pattern) {
+            // Find the closing brace of the class
+            let mut depth = 0;
+            let mut class_end = class_idx;
+            for (i, ch) in code[class_idx..].char_indices() {
+                if ch == '{' {
+                    depth += 1;
+                }
+                if ch == '}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        class_end = class_idx + i;
+                        break;
+                    }
+                }
+            }
+
+            // Extract ɵcmp (everything from cmp_marker to the end of the defineComponent)
+            let cmp_code = if let Some(cmp_start) = compiled_source.find(&cmp_marker) {
+                // Find matching closing paren + semicolon for defineComponent
+                // This is a rough extraction — find the `;` after the field
+                let rest = &compiled_source[cmp_start..];
+                // The ɵcmp field ends before the next class field or method
+                let field_end = rest
+                    .find("\n    ngOnInit")
+                    .or_else(|| rest.find("\n    constructor"))
+                    .or_else(|| rest.find("\n    ng"))
+                    .unwrap_or(rest.len());
+                let cmp = rest[..field_end].trim_end().trim_end_matches(';');
+                Some(cmp.to_string())
+            } else {
+                None
+            };
+
+            // Also extract child template functions that precede the class
+            let mut child_fns = String::new();
+            let compiled_class_idx = compiled_source
+                .find(&format!("class {class_name}"))
+                .unwrap_or(0);
+            // Look for function declarations before the class
+            for line in compiled_source[..compiled_class_idx].lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("function ") && trimmed.contains("_Template(") {
+                    child_fns.push_str(trimmed);
+                    child_fns.push('\n');
+                }
+            }
+
+            // Inject before the closing brace of the class.
+            // Strip TypeScript annotations from the compiled output.
+            let strip_ts = |s: &str| -> String {
+                use regex::Regex;
+                let s = s
+                    .replace(&format!("rf: number, ctx: {class_name}"), "rf, ctx")
+                    .replace("rf: number, ctx: any", "rf, ctx")
+                    .replace("(t: any)", "(t)");
+                // Remove remaining TS type annotations from function parameters
+                // e.g. (param: Type) → (param)
+                let param_type_re =
+                    Regex::new(r"(\w+)\s*:\s*(?:any|number|string|boolean|void)\b").unwrap();
+                param_type_re.replace_all(&s, "$1").to_string()
+            };
+
+            let mut injection = String::new();
+            if !child_fns.is_empty() {
+                let stripped_fns = strip_ts(&child_fns);
+                code.insert_str(class_idx, &format!("{stripped_fns}\n"));
+                class_end += stripped_fns.len() + 1;
+            }
+            injection.push_str(&strip_ts(fac_code));
+            injection.push_str(";\n");
+            if let Some(cmp) = cmp_code {
+                injection.push_str(&strip_ts(&cmp));
+                injection.push_str(";\n");
+            }
+            code.insert_str(class_end, &injection);
+        }
+    }
+}
+
 fn format_bytes(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
@@ -1026,19 +1149,14 @@ fn transform_with_fallback(
                         path.display(),
                         e
                     );
-                    let original = std::fs::read_to_string(path).map_err(|e| NgcError::Io {
-                        path: path.clone(),
-                        source: e,
-                    })?;
-                    let (code, source_map) = ngc_ts_transform::transform_source_with_map(
-                        &original,
-                        &file_name,
-                        generate_source_maps,
-                    )?;
+                    // The compiled source (with AOT ɵcmp metadata) failed to
+                    // transform. Emit it as-is — the bundler uses SourceType::tsx()
+                    // and can handle remaining TS annotations. Preserving the AOT
+                    // metadata is critical to avoid JIT compilation at runtime.
                     Ok(ngc_ts_transform::TransformedModule {
                         source_path: path.clone(),
-                        code,
-                        source_map,
+                        code: source.clone(),
+                        source_map: None,
                     })
                 }
             }
