@@ -84,10 +84,14 @@ pub fn transform(
                 let vars = tpl.vars;
                 let child_fns = tpl.child_template_functions;
                 let ivy_imports = tpl.ivy_imports;
+                let consts = tpl.consts;
                 // Validate that the compiled template is valid JavaScript
                 // (the template parser may "succeed" on unsupported syntax like @let
                 // but produce output with literal newlines inside string literals)
                 if is_valid_js_function(&template_fn) {
+                    if !consts.is_empty() {
+                        props.push(format!("consts: [{}]", consts.join(", ")));
+                    }
                     props.push(format!("decls: {decls}"));
                     props.push(format!("vars: {vars}"));
                     props.push(format!("template: {template_fn}"));
