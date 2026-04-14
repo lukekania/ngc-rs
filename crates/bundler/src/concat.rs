@@ -172,7 +172,9 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
                 }
             }
             if let Some(ref default) = ext.default_import {
-                entry.insert(default.clone());
+                // Tag default imports so the export generator uses `ns.default`
+                // instead of `ns.symbolName`.
+                entry.insert(format!("__default__{default}"));
             }
         }
 
@@ -754,6 +756,12 @@ fn generate_cross_chunk_exports(
             if let Some(local) = sym.strip_prefix("__ns_import__") {
                 if all_symbols.insert(local.to_string()) {
                     var_lines.push(format!("var {local} = {ns};"));
+                }
+            } else if let Some(local) = sym.strip_prefix("__default__") {
+                // Default import: the binding name is `local` but the
+                // namespace property is `default`.
+                if all_symbols.insert(local.to_string()) {
+                    var_lines.push(format!("var {local} = {ns}.default;"));
                 }
             } else if all_symbols.insert(sym.clone()) {
                 var_lines.push(format!("var {sym} = {ns}.{sym};"));
