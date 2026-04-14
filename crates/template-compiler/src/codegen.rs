@@ -999,7 +999,10 @@ impl IvyCodegen {
         for pipe in pipes {
             let pipe_slot = self.slot_index;
             self.slot_index += 1;
-            self.var_count += 1 + pipe.args.len() as u32;
+            // Capture binding start BEFORE incrementing
+            let pipe_var_slot = self.var_count;
+            // Each pipe uses 2 + args binding slots: input + pure cache + extra args
+            self.var_count += 2 + pipe.args.len() as u32;
 
             self.ivy_imports.insert("\u{0275}\u{0275}pipe".to_string());
             self.creation.push(format!(
@@ -1014,8 +1017,6 @@ impl IvyCodegen {
                 _ => "\u{0275}\u{0275}pipeBindV".to_string(),
             };
             self.ivy_imports.insert(bind_fn.clone());
-
-            let pipe_var_slot = self.var_count;
             if pipe.args.is_empty() {
                 expr = format!("{bind_fn}({pipe_slot}, {pipe_var_slot}, {expr})");
             } else {
@@ -1082,7 +1083,10 @@ impl IvyCodegen {
             let compiled_base = self.replace_pipes_in_expr(&base);
             let pipe_slot = self.slot_index;
             self.slot_index += 1;
-            self.var_count += 1 + args.len() as u32;
+            // Capture binding start BEFORE incrementing
+            let pipe_var_slot = self.var_count;
+            // Each pipe uses 2 + args binding slots: input + pure cache + extra args
+            self.var_count += 2 + args.len() as u32;
             self.ivy_imports.insert("\u{0275}\u{0275}pipe".to_string());
 
             let bind_fn = match args.len() {
@@ -1096,7 +1100,6 @@ impl IvyCodegen {
                 "\u{0275}\u{0275}pipe({pipe_slot}, '{}');",
                 pipe_name
             ));
-            let pipe_var_slot = self.var_count;
             if args.is_empty() {
                 return format!("{bind_fn}({pipe_slot}, {pipe_var_slot}, {compiled_base})");
             }
@@ -1443,6 +1446,7 @@ fn replace_nested_pipe_parens(expr: &str, gen: &mut IvyCodegen) -> String {
 
                 let pipe_slot = gen.slot_index;
                 gen.slot_index += 1;
+                let pipe_var_slot = gen.var_count;
                 gen.var_count += 2 + args.len() as u32;
                 gen.ivy_imports.insert("\u{0275}\u{0275}pipe".to_string());
 
@@ -1455,7 +1459,6 @@ fn replace_nested_pipe_parens(expr: &str, gen: &mut IvyCodegen) -> String {
                 gen.ivy_imports.insert(bind_fn.to_string());
                 gen.creation
                     .push(format!("\u{0275}\u{0275}pipe({pipe_slot}, '{pipe_name}');"));
-                let pipe_var_slot = gen.var_count;
                 if args.is_empty() {
                     result.push_str(&format!(
                         "{bind_fn}({pipe_slot}, {pipe_var_slot}, {compiled_base})"
