@@ -735,19 +735,21 @@ impl IvyCodegen {
         fn_name: &str,
         children: &[TemplateNode],
     ) -> ChildTemplate {
-        // Save parent state
+        // Save parent state.  Note: self.consts is NOT saved/restored — all
+        // templates within a component share one consts array (tView.consts),
+        // so child template entries must accumulate in the same vec.
         let parent_slot = self.slot_index;
         let parent_var = self.var_count;
         let parent_last_update: Option<u32> = self.last_update_slot;
         let parent_creation = std::mem::take(&mut self.creation);
         let parent_update = std::mem::take(&mut self.update);
-        let parent_consts = std::mem::take(&mut self.consts);
         let parent_lets = self.let_declarations.clone();
 
         self.slot_index = 0;
         self.var_count = 0;
         self.last_update_slot = None;
-        // Don't clear let_declarations or local_vars — children inherit parent scope
+        // Don't clear let_declarations, local_vars, or consts — children
+        // inherit parent scope and share the component-level consts array.
 
         self.generate_nodes(children);
 
@@ -797,13 +799,12 @@ impl IvyCodegen {
         }
         code.push('}');
 
-        // Restore parent state
+        // Restore parent state (consts is NOT restored — shared)
         self.slot_index = parent_slot;
         self.var_count = parent_var;
         self.last_update_slot = parent_last_update;
         self.creation = parent_creation;
         self.update = parent_update;
-        self.consts = parent_consts;
         self.let_declarations = parent_lets;
 
         ChildTemplate {
@@ -820,13 +821,12 @@ impl IvyCodegen {
         item_name: &str,
         children: &[TemplateNode],
     ) -> ChildTemplate {
-        // Save parent state
+        // Save parent state (consts is NOT saved — shared component-level array)
         let parent_slot = self.slot_index;
         let parent_var = self.var_count;
         let parent_last_update: Option<u32> = self.last_update_slot;
         let parent_creation = std::mem::take(&mut self.creation);
         let parent_update = std::mem::take(&mut self.update);
-        let parent_consts = std::mem::take(&mut self.consts);
         let parent_lets = self.let_declarations.clone();
 
         self.slot_index = 0;
@@ -867,13 +867,12 @@ impl IvyCodegen {
         }
         code.push('}');
 
-        // Restore parent state
+        // Restore parent state (consts is NOT restored — shared)
         self.slot_index = parent_slot;
         self.var_count = parent_var;
         self.last_update_slot = parent_last_update;
         self.creation = parent_creation;
         self.update = parent_update;
-        self.consts = parent_consts;
         self.let_declarations = parent_lets;
 
         ChildTemplate {
