@@ -539,11 +539,12 @@ impl IvyCodegen {
 
         // Generate else-if and else child templates
         let mut else_if_slots = Vec::new();
-        for (i, branch) in block.else_if_branches.iter().enumerate() {
+        for (_i, branch) in block.else_if_branches.iter().enumerate() {
             let fn_name = format!(
-                "{}_ConditionalElseIf_{}_{}_Template",
-                self.component_name, slot, i
+                "{}_ConditionalElseIf_{}_Template",
+                self.component_name, self.child_counter
             );
+            self.child_counter += 1;
             self.ivy_imports
                 .insert("\u{0275}\u{0275}conditionalBranchCreate".to_string());
             let ei_slot = self.slot_index;
@@ -559,7 +560,11 @@ impl IvyCodegen {
 
         let mut else_slot_info = None;
         if let Some(ref else_children) = block.else_branch {
-            let fn_name = format!("{}_ConditionalElse_{}_Template", self.component_name, slot);
+            let fn_name = format!(
+                "{}_ConditionalElse_{}_Template",
+                self.component_name, self.child_counter
+            );
+            self.child_counter += 1;
             self.ivy_imports
                 .insert("\u{0275}\u{0275}conditionalBranchCreate".to_string());
             let else_slot = self.slot_index;
@@ -669,7 +674,11 @@ impl IvyCodegen {
         let mut case_slots = Vec::new();
         let is_first_case = true;
         for (i, case) in block.cases.iter().enumerate() {
-            let fn_name = format!("{}_SwitchCase_{}_{}_Template", self.component_name, slot, i);
+            let fn_name = format!(
+                "{}_SwitchCase_{}_Template",
+                self.component_name, self.child_counter
+            );
+            self.child_counter += 1;
             let case_slot = self.slot_index;
             self.slot_index += 1;
             let child = self.generate_child_template(&fn_name, &case.children);
@@ -692,7 +701,11 @@ impl IvyCodegen {
 
         let mut default_slot_val = None;
         if let Some(ref default_children) = block.default_branch {
-            let fn_name = format!("{}_SwitchDefault_{}_Template", self.component_name, slot);
+            let fn_name = format!(
+                "{}_SwitchDefault_{}_Template",
+                self.component_name, self.child_counter
+            );
+            self.child_counter += 1;
             self.ivy_imports
                 .insert("\u{0275}\u{0275}conditionalBranchCreate".to_string());
             let default_slot = self.slot_index;
