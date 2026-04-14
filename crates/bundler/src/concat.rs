@@ -643,11 +643,16 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<ChunkBundleResult> {
 
         all_externals = Vec::new();
 
-        // Merge all cross-chunk imports into a single import from ./main.js
-        if !main_js_named.is_empty() || main_js_default.is_some() {
+        // Merge all cross-chunk imports into a single import from ./main.js.
+        // Convert default imports to named imports because main.js uses
+        // `export { sym }` (named), not `export default`.
+        if let Some(default_name) = main_js_default {
+            main_js_named.insert(default_name);
+        }
+        if !main_js_named.is_empty() {
             all_externals.push(ExternalImport {
                 source: "./main.js".to_string(),
-                default_import: main_js_default,
+                default_import: None,
                 named_imports: main_js_named,
                 is_side_effect: false,
             });
