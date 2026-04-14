@@ -17,6 +17,16 @@ ngc-rs replaces it with a Rust binary that uses:
 - Rolldown-style bundling primitives
 - tsc --noEmit as a subprocess for type-checking (we do not reimplement the TS type system)
 
+## Angular Version Compatibility
+
+- ngc-rs was initially designed targeting Angular 17
+- The primary test project runs Angular 21
+- All new features must be verified against Angular 21 behavior
+- Do not assume NgModule-based architecture — test projects use
+  standalone components with bootstrapApplication()
+- Do not assume zone.js is always required
+- Template compiler must handle @if/@for/@switch control flow syntax
+
 ## Milestones
 
 ### v0.1 — Project Resolver ✅
@@ -78,7 +88,7 @@ Goal: support lazy-loaded Angular routes with separate chunk files.
 
 - [x] Dynamic import() detection in bundler
 - [x] Chunk graph construction (main + lazy chunks + shared chunks)
-- [x] Multi-file bundle output (main.js + chunk-*.js)
+- [x] Multi-file bundle output (main.js + chunk-\*.js)
 - [x] Import rewriting for chunk filenames
 
 ### v0.7 — Source Maps & Optimization ✅

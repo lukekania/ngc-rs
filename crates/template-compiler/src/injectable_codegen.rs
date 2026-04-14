@@ -79,6 +79,7 @@ pub fn generate_injectable_ivy(extracted: &ExtractedInjectable) -> NgcResult<Ivy
         static_fields: vec![define_code],
         child_template_functions: Vec::new(),
         ivy_imports,
+        consts: Vec::new(),
     })
 }
 

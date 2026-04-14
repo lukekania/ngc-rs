@@ -54,6 +54,8 @@ pub struct TemplateFnOutput {
     pub child_template_functions: Vec<String>,
     /// Set of Ivy runtime symbols needed from `@angular/core`.
     pub ivy_imports: std::collections::BTreeSet<String>,
+    /// Static attribute arrays for the consts property of defineComponent.
+    pub consts: Vec<String>,
 }
 
 /// Compile a template string into a standalone template function.
@@ -111,6 +113,7 @@ pub fn generate_template_fn(
         vars,
         child_template_functions: child_fns,
         ivy_imports: ivy_output.ivy_imports,
+        consts: ivy_output.consts,
     })
 }
 

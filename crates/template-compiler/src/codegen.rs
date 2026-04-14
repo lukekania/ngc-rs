@@ -16,6 +16,8 @@ pub struct IvyOutput {
     pub child_template_functions: Vec<String>,
     /// Set of Ivy runtime symbols needed from `@angular/core`.
     pub ivy_imports: BTreeSet<String>,
+    /// Static attribute arrays for the `consts` property of defineComponent.
+    pub consts: Vec<String>,
 }
 
 /// Internal codegen state.
@@ -154,6 +156,7 @@ pub fn generate_ivy(
         static_fields: vec![dc],
         child_template_functions: child_fns,
         ivy_imports: gen.ivy_imports,
+        consts: gen.consts,
     })
 }
 
