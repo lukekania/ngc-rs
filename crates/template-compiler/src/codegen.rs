@@ -853,9 +853,16 @@ impl IvyCodegen {
         let decls = self.slot_index;
         let vars = self.var_count + parent_lets.len() as u32;
 
-        let mut code = format!("function {fn_name}(rf, ctx) {{\n");
+        let has_listeners = self.creation.iter().any(|s| s.contains("listener"));
+
+        let mut code = format!("function {fn_name}(rf, _ctx) {{\n");
         if !self.creation.is_empty() {
             code.push_str("  if (rf & 1) {\n");
+            if has_listeners {
+                self.ivy_imports
+                    .insert("\u{0275}\u{0275}getCurrentView".to_string());
+                code.push_str("    const _r = \u{0275}\u{0275}getCurrentView();\n");
+            }
             for instr in &self.creation {
                 code.push_str("    ");
                 code.push_str(instr);
@@ -865,9 +872,13 @@ impl IvyCodegen {
         }
         if !self.update.is_empty() || !parent_lets.is_empty() {
             code.push_str("  if (rf & 2) {\n");
-            // @for child templates receive RepeaterContext as ctx with $implicit and $index.
-            // The item variable comes from ctx.$implicit directly — no nextContext needed.
-            code.push_str(&format!("    const {item_name} = ctx.$implicit;\n"));
+            // @for child templates receive RepeaterContext as _ctx ($implicit, $index).
+            // Rebind `ctx` to the parent component via ɵɵnextContext() so that
+            // ctx_expr()-generated references like `ctx.someMethod()` work.
+            self.ivy_imports
+                .insert("\u{0275}\u{0275}nextContext".to_string());
+            code.push_str("    const ctx = \u{0275}\u{0275}nextContext();\n");
+            code.push_str(&format!("    const {item_name} = _ctx.$implicit;\n"));
             for (name, slot) in &parent_lets {
                 self.ivy_imports
                     .insert("\u{0275}\u{0275}readContextLet".to_string());
