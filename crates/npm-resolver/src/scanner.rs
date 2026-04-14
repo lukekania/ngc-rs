@@ -16,13 +16,15 @@ pub struct ScannedNpmImport {
 }
 
 static FROM_RE: LazyLock<Regex> = LazyLock::new(|| {
-    // [^;]*? matches any character except semicolons (including newlines in
-    // Rust regex) so multi-line imports are detected without crossing
-    // statement boundaries:
-    //   import {
-    //     isLeapYearIndex,
-    //   } from "../utils.js";
-    Regex::new(r#"(?:import|export)\s+[^;]*?\s+from\s+['"]([^'"]+)['"]"#).expect("valid regex")
+    Regex::new(r#"(?:import|export)\s+.*?\s+from\s+['"]([^'"]+)['"]"#).expect("valid regex")
+});
+
+/// Multi-line import pattern: matches imports whose named bindings span
+/// multiple lines (e.g. `import {\n  x,\n  y\n} from "mod"`).
+/// Uses `[^;]*?` which in Rust regex matches newlines, preventing
+/// cross-statement false matches.
+static MULTILINE_FROM_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"\}\s+from\s+['"]([^'"]+)['"]"#).expect("valid regex")
 });
 
 static SIDE_EFFECT_RE: LazyLock<Regex> =
@@ -47,6 +49,18 @@ pub fn scan_npm_imports(source: &str) -> Vec<ScannedNpmImport> {
     let mut seen = std::collections::HashSet::new();
 
     for cap in FROM_RE.captures_iter(source) {
+        let spec = cap[1].to_string();
+        if seen.insert((spec.clone(), false)) {
+            imports.push(ScannedNpmImport {
+                specifier: spec,
+                is_dynamic: false,
+            });
+        }
+    }
+
+    // Catch multi-line imports that FROM_RE misses because `.*?` doesn't
+    // cross newlines.  Matches the closing `} from "specifier"` pattern.
+    for cap in MULTILINE_FROM_RE.captures_iter(source) {
         let spec = cap[1].to_string();
         if seen.insert((spec.clone(), false)) {
             imports.push(ScannedNpmImport {
