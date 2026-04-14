@@ -387,6 +387,8 @@ fn run_build(
     if let Some(ref ap) = angular_project {
         if !ap.styles.is_empty() {
             let path = extract_global_styles(&ap.styles, &out_dir, &config_dir)?;
+            // Step 9b: Compile CSS with PostCSS + Tailwind (if available)
+            compile_css_with_postcss(&path, &config_dir);
             output_files.push(path);
         }
     }
@@ -1108,6 +1110,64 @@ fn inject_compiled_metadata(code: &mut String, compiled_source: &str, class_name
                 injection.push_str(";\n");
             }
             code.insert_str(class_end, &injection);
+        }
+    }
+}
+
+/// Compile CSS with PostCSS + Tailwind CSS if `@tailwindcss/postcss` is installed.
+///
+/// Runs a small Node.js script that loads the PostCSS plugin and processes
+/// the concatenated CSS file in-place. This handles `@import "tailwindcss"`,
+/// `@layer`, `@theme` directives from Tailwind v4.
+fn compile_css_with_postcss(css_path: &Path, project_dir: &Path) {
+    // Check if @tailwindcss/postcss is available
+    let postcss_pkg = project_dir.join("node_modules/@tailwindcss/postcss");
+    if !postcss_pkg.is_dir() {
+        return;
+    }
+
+    let script = format!(
+        r#"
+const postcss = require('postcss');
+const tailwindcss = require('@tailwindcss/postcss');
+const fs = require('fs');
+const css = fs.readFileSync('{}', 'utf8');
+postcss([tailwindcss]).process(css, {{ from: 'src/styles.css' }}).then(result => {{
+    fs.writeFileSync('{}', result.css);
+}}).catch(err => {{
+    console.error('PostCSS error:', err.message);
+    process.exit(1);
+}});
+"#,
+        css_path.display(),
+        css_path.display()
+    );
+
+    let result = std::process::Command::new("node")
+        .arg("-e")
+        .arg(&script)
+        .current_dir(project_dir)
+        .output();
+
+    match result {
+        Ok(output) => {
+            if output.status.success() {
+                tracing::info!("compiled CSS with PostCSS + Tailwind");
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                eprintln!(
+                    "{} PostCSS compilation failed: {}",
+                    "Warning:".yellow().bold(),
+                    stderr.trim()
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "{} could not run node for PostCSS: {}",
+                "Warning:".yellow().bold(),
+                e
+            );
         }
     }
 }
