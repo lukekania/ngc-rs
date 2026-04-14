@@ -39,6 +39,10 @@ struct IvyCodegen {
     /// Nesting depth of embedded views (for `ɵɵnextContext(depth)` calls).
     /// 0 = root template, 1 = inside one @if/@for, 2 = nested @if inside @for, etc.
     embed_depth: u32,
+    /// Stack of @for ancestor item variables with their embed depth.
+    /// Used to generate intermediate ɵɵnextContext() calls in nested templates
+    /// to access @for loop variables (e.g. `h` from `@for (h of holdings)`).
+    for_var_stack: Vec<(String, u32)>,
     /// Last slot index emitted in the update block (for computing `ɵɵadvance` deltas).
     /// `None` means no advance has been emitted yet (runtime starts at selectedIndex=-1).
     last_update_slot: Option<u32>,
@@ -70,6 +74,7 @@ pub fn generate_ivy(
         let_declarations: Vec::new(),
         local_vars: BTreeSet::new(),
         embed_depth: 0,
+        for_var_stack: Vec::new(),
         last_update_slot: None,
     };
 
@@ -281,7 +286,16 @@ impl IvyCodegen {
             };
             self.ivy_imports.insert(start_instr.to_string());
             self.ivy_imports.insert(end_instr.to_string());
-            if static_attrs.is_empty() {
+            if is_ng_container {
+                // ng-container has no DOM tag — only pass slot and optional consts index
+                if static_attrs.is_empty() {
+                    self.creation.push(format!("{start_instr}({slot});"));
+                } else {
+                    let const_idx = self.register_const(&static_attrs);
+                    self.creation
+                        .push(format!("{start_instr}({slot}, {const_idx});"));
+                }
+            } else if static_attrs.is_empty() {
                 self.creation
                     .push(format!("{start_instr}({slot}, '{}');", el.tag));
             } else {
@@ -820,14 +834,36 @@ impl IvyCodegen {
         }
         if !self.update.is_empty() || !parent_lets.is_empty() {
             code.push_str("  if (rf & 2) {\n");
-            // Get parent component context for embedded views.
-            // embed_depth tracks how many nested views we are inside.
-            let depth = self.embed_depth;
             self.ivy_imports
                 .insert("\u{0275}\u{0275}nextContext".to_string());
-            code.push_str(&format!(
-                "    const ctx = \u{0275}\u{0275}nextContext({depth});\n"
-            ));
+            // Navigate up the view tree, extracting @for loop variables along the way.
+            // Each ɵɵnextContext() call is stateful (moves pointer up), so we go
+            // step by step through @for ancestors before reaching the component.
+            let current_depth = self.embed_depth;
+            let mut remaining = current_depth;
+            // Sort for_var_stack by depth descending (closest ancestor first)
+            let mut for_vars: Vec<(String, u32)> = self.for_var_stack.clone();
+            for_vars.sort_by(|a, b| b.1.cmp(&a.1));
+            for (var_name, var_depth) in &for_vars {
+                let steps = remaining - var_depth;
+                if steps > 0 {
+                    code.push_str(&format!(
+                        "    const _{var_name}_ctx = \u{0275}\u{0275}nextContext({steps});\n"
+                    ));
+                    code.push_str(&format!(
+                        "    const {var_name} = _{var_name}_ctx.$implicit;\n"
+                    ));
+                    remaining = *var_depth;
+                }
+            }
+            // Navigate remaining levels to the component
+            if remaining > 0 {
+                code.push_str(&format!(
+                    "    const ctx = \u{0275}\u{0275}nextContext({remaining});\n"
+                ));
+            } else {
+                code.push_str("    const ctx = \u{0275}\u{0275}nextContext();\n");
+            }
             // Inject @let variable reads from parent context
             for (name, slot) in &parent_lets {
                 self.ivy_imports
@@ -885,6 +921,9 @@ impl IvyCodegen {
         // does NOT prefix it with `ctx.`.  e.g. `p.id` stays `p.id`, not `ctx.p.id`.
         let parent_locals = self.local_vars.clone();
         self.local_vars.insert(item_name.to_string());
+        // Track this @for's item variable and its depth for nested templates
+        self.for_var_stack
+            .push((item_name.to_string(), self.embed_depth));
 
         self.generate_nodes(children);
 
@@ -938,6 +977,7 @@ impl IvyCodegen {
 
         // Restore parent state (consts is NOT restored — shared)
         self.embed_depth -= 1;
+        self.for_var_stack.pop();
         self.slot_index = parent_slot;
         self.var_count = parent_var;
         self.last_update_slot = parent_last_update;
