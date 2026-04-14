@@ -1689,6 +1689,65 @@ fn collect_ctx_rewrites(
                 collect_ctx_rewrites(expr, ctx_inserts, remove_ranges, false, locals);
             }
         }
+        Expression::ChainExpression(chain) => {
+            // Optional chaining (a?.b, a?.(), a?.[b]) — recurse into the inner expression
+            match &chain.expression {
+                ChainElement::CallExpression(call) => {
+                    collect_ctx_rewrites(
+                        &call.callee,
+                        ctx_inserts,
+                        remove_ranges,
+                        false,
+                        locals,
+                    );
+                    for arg in &call.arguments {
+                        if let Argument::SpreadElement(spread) = arg {
+                            collect_ctx_rewrites(
+                                &spread.argument,
+                                ctx_inserts,
+                                remove_ranges,
+                                false,
+                                locals,
+                            );
+                        } else {
+                            collect_ctx_rewrites(
+                                arg.to_expression(),
+                                ctx_inserts,
+                                remove_ranges,
+                                false,
+                                locals,
+                            );
+                        }
+                    }
+                }
+                ChainElement::StaticMemberExpression(member) => {
+                    collect_ctx_rewrites(
+                        &member.object,
+                        ctx_inserts,
+                        remove_ranges,
+                        false,
+                        locals,
+                    );
+                }
+                ChainElement::ComputedMemberExpression(member) => {
+                    collect_ctx_rewrites(
+                        &member.object,
+                        ctx_inserts,
+                        remove_ranges,
+                        false,
+                        locals,
+                    );
+                    collect_ctx_rewrites(
+                        &member.expression,
+                        ctx_inserts,
+                        remove_ranges,
+                        false,
+                        locals,
+                    );
+                }
+                _ => {}
+            }
+        }
         _ => {}
     }
 }
