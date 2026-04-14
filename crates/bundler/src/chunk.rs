@@ -361,10 +361,45 @@ fn toposort_subset_with_cycles(
         }
     }
 
-    // Toposort the condensation (guaranteed to be a DAG)
-    let cond_order = petgraph::algo::toposort(&cond, None).map_err(|_| NgcError::ChunkError {
-        message: "condensation graph has a cycle (should be impossible)".into(),
-    })?;
+    // Deterministic toposort of the condensation DAG using Kahn's algorithm
+    // with path-based tie-breaking.  petgraph::algo::toposort uses DFS which
+    // is non-deterministic (depends on node insertion order that can vary
+    // between builds/environments).
+    let cond_order = {
+        use std::collections::BinaryHeap;
+        use std::cmp::Reverse;
+        let mut in_degree: HashMap<NodeIndex, usize> = HashMap::new();
+        for node in cond.node_indices() {
+            in_degree.entry(node).or_insert(0);
+            for neighbor in cond.neighbors(node) {
+                *in_degree.entry(neighbor).or_insert(0) += 1;
+            }
+        }
+        // Min-heap by SCC index (which correlates with graph structure) for determinism
+        let mut queue: BinaryHeap<Reverse<(usize, NodeIndex)>> = BinaryHeap::new();
+        for (&node, &deg) in &in_degree {
+            if deg == 0 {
+                queue.push(Reverse((cond[node], node)));
+            }
+        }
+        let mut order = Vec::new();
+        while let Some(Reverse((_, node))) = queue.pop() {
+            order.push(node);
+            for neighbor in cond.neighbors(node) {
+                let deg = in_degree.get_mut(&neighbor).expect("node in graph");
+                *deg -= 1;
+                if *deg == 0 {
+                    queue.push(Reverse((cond[neighbor], neighbor)));
+                }
+            }
+        }
+        if order.len() != cond.node_count() {
+            return Err(NgcError::ChunkError {
+                message: "condensation graph has a cycle (should be impossible)".into(),
+            });
+        }
+        order
+    };
 
     // Expand: for each SCC in reverse toposort order (dependencies first),
     // emit the nodes within the SCC.  Within each SCC, use DFS post-order
