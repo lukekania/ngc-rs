@@ -143,10 +143,11 @@ pub fn build_chunk_graph(
             let sp = *consumers.iter().next().expect("consumer set is non-empty");
             lazy_exclusive.entry(sp).or_default().push(module);
         } else {
-            shared_groups
-                .entry(consumers.clone())
-                .or_default()
-                .push(module);
+            // Modules needed by multiple lazy chunks go to the main chunk
+            // so they can be exported via `./main.js` cross-chunk imports.
+            // Putting them in separate shared chunks would require cross-chunk
+            // import resolution between non-main chunks, which isn't supported yet.
+            main_reachable.insert(module);
         }
     }
 
