@@ -638,14 +638,18 @@ impl IvyCodegen {
             self.generate_for_child_template(&child_fn_name, &block.item_name, &block.children);
         // Build the track-by function from the track expression.
         // Angular expects: (index, item) => item.id
-        let track_expr = ctx_expr(&block.track_expression);
-        let track_fn = if track_expr.contains("ctx.$index") || track_expr == "ctx.$index" {
+        // The track expression runs in the arrow function `(i, item) => expr`
+        // where `item` is a local parameter — do NOT prefix it with `ctx.`.
+        let mut track_locals = self.local_vars.clone();
+        track_locals.insert(block.item_name.clone());
+        let track_expr = ctx_expr_with_locals(&block.track_expression, &track_locals);
+        let raw_track = &block.track_expression;
+        let track_fn = if raw_track.trim() == "$index" {
             // track $index → identity by index
             self.ivy_imports
                 .insert("\u{0275}\u{0275}repeaterTrackByIndex".to_string());
             "\u{0275}\u{0275}repeaterTrackByIndex".to_string()
-        } else if track_expr == format!("ctx.{}", block.item_name) || track_expr == block.item_name
-        {
+        } else if raw_track.trim() == block.item_name {
             // track item → identity by reference
             self.ivy_imports
                 .insert("\u{0275}\u{0275}repeaterTrackByIdentity".to_string());
@@ -1064,10 +1068,12 @@ impl IvyCodegen {
         }
 
         // No top-level pipe — scan for `(expr | pipe)` sub-expressions and replace them.
-        // Apply ctx_expr after pipe replacement; ɵɵ-prefixed symbols are excluded
-        // from ctx. prefixing by is_builtin().
+        // After pipe replacement, apply ctx_expr with locals that include `ctx` itself
+        // (pipe compilation already prefixed inner values with `ctx.`).
         let result = replace_nested_pipe_parens(trimmed, self);
-        ctx_expr(&result)
+        let mut locals = self.local_vars.clone();
+        locals.insert("ctx".to_string());
+        ctx_expr_with_locals(&result, &locals)
     }
 
     /// Register a static attribute array in the `consts` table and return its index.
