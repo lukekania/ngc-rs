@@ -36,6 +36,9 @@ struct IvyCodegen {
     let_declarations: Vec<(String, u32)>,
     /// Local variable names that should NOT get `ctx.` prefix in expressions.
     local_vars: BTreeSet<String>,
+    /// Nesting depth of embedded views (for `ɵɵnextContext(depth)` calls).
+    /// 0 = root template, 1 = inside one @if/@for, 2 = nested @if inside @for, etc.
+    embed_depth: u32,
     /// Last slot index emitted in the update block (for computing `ɵɵadvance` deltas).
     /// `None` means no advance has been emitted yet (runtime starts at selectedIndex=-1).
     last_update_slot: Option<u32>,
@@ -66,6 +69,7 @@ pub fn generate_ivy(
         consts: Vec::new(),
         let_declarations: Vec::new(),
         local_vars: BTreeSet::new(),
+        embed_depth: 0,
         last_update_slot: None,
     };
 
@@ -292,27 +296,45 @@ impl IvyCodegen {
                     TemplateAttribute::Event { name, handler } => {
                         self.ivy_imports
                             .insert("\u{0275}\u{0275}listener".to_string());
-                        self.ivy_imports
-                            .insert("\u{0275}\u{0275}restoreView".to_string());
-                        self.ivy_imports
-                            .insert("\u{0275}\u{0275}nextContext".to_string());
                         let compiled_handler = compile_event_handler(handler);
-                        self.creation.push(format!(
-                            "\u{0275}\u{0275}listener('{}', function($event) {{ \u{0275}\u{0275}restoreView(_r); const ctx = \u{0275}\u{0275}nextContext(); {compiled_handler} }});",
-                            name,
-                        ));
+                        if self.embed_depth > 0 {
+                            // Inside embedded view: restore view and get component ctx
+                            self.ivy_imports
+                                .insert("\u{0275}\u{0275}restoreView".to_string());
+                            self.ivy_imports
+                                .insert("\u{0275}\u{0275}nextContext".to_string());
+                            let depth = self.embed_depth;
+                            self.creation.push(format!(
+                                "\u{0275}\u{0275}listener('{}', function($event) {{ \u{0275}\u{0275}restoreView(_r); const ctx = \u{0275}\u{0275}nextContext({depth}); {compiled_handler} }});",
+                                name,
+                            ));
+                        } else {
+                            // Root template: ctx is the function parameter
+                            self.creation.push(format!(
+                                "\u{0275}\u{0275}listener('{}', function($event) {{ {compiled_handler} }});",
+                                name,
+                            ));
+                        }
                     }
                     TemplateAttribute::TwoWayBinding { name, expression } => {
                         self.ivy_imports
                             .insert("\u{0275}\u{0275}listener".to_string());
-                        self.ivy_imports
-                            .insert("\u{0275}\u{0275}restoreView".to_string());
-                        self.ivy_imports
-                            .insert("\u{0275}\u{0275}nextContext".to_string());
-                        self.creation.push(format!(
-                            "\u{0275}\u{0275}listener('{}Change', function($event) {{ \u{0275}\u{0275}restoreView(_r); const ctx = \u{0275}\u{0275}nextContext(); return {} = $event; }});",
-                            name, ctx_expr(expression)
-                        ));
+                        if self.embed_depth > 0 {
+                            self.ivy_imports
+                                .insert("\u{0275}\u{0275}restoreView".to_string());
+                            self.ivy_imports
+                                .insert("\u{0275}\u{0275}nextContext".to_string());
+                            let depth = self.embed_depth;
+                            self.creation.push(format!(
+                                "\u{0275}\u{0275}listener('{}Change', function($event) {{ \u{0275}\u{0275}restoreView(_r); const ctx = \u{0275}\u{0275}nextContext({depth}); return {} = $event; }});",
+                                name, ctx_expr(expression)
+                            ));
+                        } else {
+                            self.creation.push(format!(
+                                "\u{0275}\u{0275}listener('{}Change', function($event) {{ return {} = $event; }});",
+                                name, ctx_expr(expression)
+                            ));
+                        }
                     }
                     _ => {}
                 }
@@ -757,6 +779,7 @@ impl IvyCodegen {
         let parent_creation = std::mem::take(&mut self.creation);
         let parent_update = std::mem::take(&mut self.update);
         let parent_lets = self.let_declarations.clone();
+        self.embed_depth += 1;
 
         self.slot_index = 0;
         self.var_count = 0;
@@ -793,10 +816,14 @@ impl IvyCodegen {
         }
         if !self.update.is_empty() || !parent_lets.is_empty() {
             code.push_str("  if (rf & 2) {\n");
-            // Get parent component context for embedded views
+            // Get parent component context for embedded views.
+            // embed_depth tracks how many nested views we are inside.
+            let depth = self.embed_depth;
             self.ivy_imports
                 .insert("\u{0275}\u{0275}nextContext".to_string());
-            code.push_str("    const ctx = \u{0275}\u{0275}nextContext();\n");
+            code.push_str(&format!(
+                "    const ctx = \u{0275}\u{0275}nextContext({depth});\n"
+            ));
             // Inject @let variable reads from parent context
             for (name, slot) in &parent_lets {
                 self.ivy_imports
@@ -815,6 +842,7 @@ impl IvyCodegen {
         code.push('}');
 
         // Restore parent state (consts is NOT restored — shared)
+        self.embed_depth -= 1;
         self.slot_index = parent_slot;
         self.var_count = parent_var;
         self.last_update_slot = parent_last_update;
@@ -843,10 +871,16 @@ impl IvyCodegen {
         let parent_creation = std::mem::take(&mut self.creation);
         let parent_update = std::mem::take(&mut self.update);
         let parent_lets = self.let_declarations.clone();
+        self.embed_depth += 1;
 
         self.slot_index = 0;
         self.var_count = 0;
         self.last_update_slot = None;
+
+        // Register the @for item variable as a local so ctx_expr_with_locals()
+        // does NOT prefix it with `ctx.`.  e.g. `p.id` stays `p.id`, not `ctx.p.id`.
+        let parent_locals = self.local_vars.clone();
+        self.local_vars.insert(item_name.to_string());
 
         self.generate_nodes(children);
 
@@ -873,11 +907,14 @@ impl IvyCodegen {
         if !self.update.is_empty() || !parent_lets.is_empty() {
             code.push_str("  if (rf & 2) {\n");
             // @for child templates receive RepeaterContext as _ctx ($implicit, $index).
-            // Rebind `ctx` to the parent component via ɵɵnextContext() so that
+            // Rebind `ctx` to the parent component via ɵɵnextContext(depth) so that
             // ctx_expr()-generated references like `ctx.someMethod()` work.
+            let depth = self.embed_depth;
             self.ivy_imports
                 .insert("\u{0275}\u{0275}nextContext".to_string());
-            code.push_str("    const ctx = \u{0275}\u{0275}nextContext();\n");
+            code.push_str(&format!(
+                "    const ctx = \u{0275}\u{0275}nextContext({depth});\n"
+            ));
             code.push_str(&format!("    const {item_name} = _ctx.$implicit;\n"));
             for (name, slot) in &parent_lets {
                 self.ivy_imports
@@ -896,12 +933,14 @@ impl IvyCodegen {
         code.push('}');
 
         // Restore parent state (consts is NOT restored — shared)
+        self.embed_depth -= 1;
         self.slot_index = parent_slot;
         self.var_count = parent_var;
         self.last_update_slot = parent_last_update;
         self.creation = parent_creation;
         self.update = parent_update;
         self.let_declarations = parent_lets;
+        self.local_vars = parent_locals;
 
         ChildTemplate {
             function_name: fn_name.to_string(),
