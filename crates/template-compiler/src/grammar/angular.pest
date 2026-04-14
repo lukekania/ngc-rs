@@ -78,12 +78,13 @@ ctrl_char = @{ (!"(" ~ !")" ~ ANY)+ }
 
 // @for / @empty
 for_block = { "@for" ~ "(" ~ for_vars ~ ")" ~ "{" ~ node* ~ "}" ~ empty_block? }
-for_vars = { identifier ~ "of" ~ for_iterable ~ ";" ~ "track" ~ track_expression }
+for_vars = { identifier ~ "of" ~ for_iterable ~ ";" ~ "track" ~ track_expression ~ for_let_vars? }
 for_iterable = @{ (!(";") ~ ANY)+ }
 track_expression = { track_token+ }
 track_token = _{ track_paren_group | track_char }
 track_paren_group = { "(" ~ (track_paren_group | track_char)* ~ ")" }
-track_char = @{ (!"(" ~ !")" ~ ANY)+ }
+track_char = @{ (!("(" | ")" | ";") ~ ANY)+ }
+for_let_vars = { (";" ~ "let" ~ identifier ~ "=" ~ "$" ~ identifier)+ }
 empty_block = { "@empty" ~ "{" ~ node* ~ "}" }
 
 // @switch / @case / @default
