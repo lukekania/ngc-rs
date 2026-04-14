@@ -16,11 +16,13 @@ pub struct ScannedNpmImport {
 }
 
 static FROM_RE: LazyLock<Regex> = LazyLock::new(|| {
-    // (?s) makes `.` match newlines so multi-line imports are detected:
+    // [^;]*? matches any character except semicolons (including newlines in
+    // Rust regex) so multi-line imports are detected without crossing
+    // statement boundaries:
     //   import {
     //     isLeapYearIndex,
     //   } from "../utils.js";
-    Regex::new(r#"(?s)(?:import|export)\s+.*?\s+from\s+['"]([^'"]+)['"]"#).expect("valid regex")
+    Regex::new(r#"(?:import|export)\s+[^;]*?\s+from\s+['"]([^'"]+)['"]"#).expect("valid regex")
 });
 
 static SIDE_EFFECT_RE: LazyLock<Regex> =
