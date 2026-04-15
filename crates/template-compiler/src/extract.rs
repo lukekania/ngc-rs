@@ -43,6 +43,8 @@ pub struct ExtractedComponent {
     pub other_angular_core_imports: Vec<String>,
     /// Raw source text of the `styles` array (e.g. `['\`.sidebar { ... }\`']`).
     pub styles_source: Option<String>,
+    /// Property names decorated with `@Input()`.
+    pub input_properties: Vec<String>,
 }
 
 impl ExtractedComponent {
@@ -147,6 +149,20 @@ pub fn extract_component(source: &str, file_path: &Path) -> NgcResult<Option<Ext
 
         let metadata = extract_decorator_metadata(source, decorator)?;
 
+        // Extract @Input() decorated properties from class body
+        let mut input_properties = Vec::new();
+        for member in &class.body.body {
+            if let oxc_ast::ast::ClassElement::PropertyDefinition(prop) = member {
+                if prop.decorators.iter().any(|d| {
+                    find_decorator_by_name(std::slice::from_ref(d), "Input").is_some()
+                }) {
+                    if let oxc_ast::ast::PropertyKey::StaticIdentifier(id) = &prop.key {
+                        input_properties.push(id.name.to_string());
+                    }
+                }
+            }
+        }
+
         return Ok(Some(ExtractedComponent {
             class_name,
             selector: metadata.selector,
@@ -162,6 +178,7 @@ pub fn extract_component(source: &str, file_path: &Path) -> NgcResult<Option<Ext
             angular_core_import_span,
             other_angular_core_imports,
             styles_source: metadata.styles_source,
+            input_properties,
         }));
     }
 

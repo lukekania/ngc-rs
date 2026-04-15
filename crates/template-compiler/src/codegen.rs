@@ -121,6 +121,15 @@ pub fn generate_ivy(
     if component.standalone {
         dc.push_str("    standalone: true,\n");
     }
+    // Generate inputs property from @Input() decorated properties
+    if !component.input_properties.is_empty() {
+        let inputs: Vec<String> = component
+            .input_properties
+            .iter()
+            .map(|p| format!("{p}: '{p}'"))
+            .collect();
+        dc.push_str(&format!("    inputs: {{ {} }},\n", inputs.join(", ")));
+    }
     if !gen.consts.is_empty() {
         dc.push_str(&format!("    consts: [{}],\n", gen.consts.join(", ")));
     }
