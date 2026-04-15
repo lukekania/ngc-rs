@@ -588,11 +588,31 @@ impl IvyCodegen {
         );
         self.child_counter += 1;
 
+        // Extract root element tag name and attributes for the conditional host element.
+        // Angular 21 passes the first child's tag and consts index to conditionalCreate
+        // so the container is backed by a real DOM element with proper attributes.
+        let (root_tag, root_attrs_idx) = get_root_element_info(&block.children, self);
         let child = self.generate_child_template(&child_fn_name, &block.children);
-        self.creation.push(format!(
-            "{create_fn}({slot}, {child_fn_name}, {}, {});",
-            child.decls, child.vars
-        ));
+        match (root_tag, root_attrs_idx) {
+            (Some(ref tag), Some(idx)) => {
+                self.creation.push(format!(
+                    "{create_fn}({slot}, {child_fn_name}, {}, {}, '{tag}', {idx});",
+                    child.decls, child.vars
+                ));
+            }
+            (Some(ref tag), None) => {
+                self.creation.push(format!(
+                    "{create_fn}({slot}, {child_fn_name}, {}, {}, '{tag}');",
+                    child.decls, child.vars
+                ));
+            }
+            _ => {
+                self.creation.push(format!(
+                    "{create_fn}({slot}, {child_fn_name}, {}, {});",
+                    child.decls, child.vars
+                ));
+            }
+        }
         self.child_templates.push(child);
 
         // Generate else-if and else child templates
@@ -607,11 +627,22 @@ impl IvyCodegen {
                 .insert("\u{0275}\u{0275}conditionalBranchCreate".to_string());
             let ei_slot = self.slot_index;
             self.slot_index += 1;
+            let (ei_tag, ei_attrs) = get_root_element_info(&branch.children, self);
             let child = self.generate_child_template(&fn_name, &branch.children);
-            self.creation.push(format!(
-                "\u{0275}\u{0275}conditionalBranchCreate({ei_slot}, {fn_name}, {}, {});",
-                child.decls, child.vars
-            ));
+            match (ei_tag, ei_attrs) {
+                (Some(ref tag), Some(idx)) => self.creation.push(format!(
+                    "\u{0275}\u{0275}conditionalBranchCreate({ei_slot}, {fn_name}, {}, {}, '{tag}', {idx});",
+                    child.decls, child.vars
+                )),
+                (Some(ref tag), None) => self.creation.push(format!(
+                    "\u{0275}\u{0275}conditionalBranchCreate({ei_slot}, {fn_name}, {}, {}, '{tag}');",
+                    child.decls, child.vars
+                )),
+                _ => self.creation.push(format!(
+                    "\u{0275}\u{0275}conditionalBranchCreate({ei_slot}, {fn_name}, {}, {});",
+                    child.decls, child.vars
+                )),
+            }
             else_if_slots.push((branch.condition.clone(), fn_name.clone(), ei_slot));
             self.child_templates.push(child);
         }
@@ -627,11 +658,22 @@ impl IvyCodegen {
                 .insert("\u{0275}\u{0275}conditionalBranchCreate".to_string());
             let else_slot = self.slot_index;
             self.slot_index += 1;
+            let (else_tag, else_attrs) = get_root_element_info(else_children, self);
             let child = self.generate_child_template(&fn_name, else_children);
-            self.creation.push(format!(
-                "\u{0275}\u{0275}conditionalBranchCreate({else_slot}, {fn_name}, {}, {});",
-                child.decls, child.vars
-            ));
+            match (else_tag, else_attrs) {
+                (Some(ref tag), Some(idx)) => self.creation.push(format!(
+                    "\u{0275}\u{0275}conditionalBranchCreate({else_slot}, {fn_name}, {}, {}, '{tag}', {idx});",
+                    child.decls, child.vars
+                )),
+                (Some(ref tag), None) => self.creation.push(format!(
+                    "\u{0275}\u{0275}conditionalBranchCreate({else_slot}, {fn_name}, {}, {}, '{tag}');",
+                    child.decls, child.vars
+                )),
+                _ => self.creation.push(format!(
+                    "\u{0275}\u{0275}conditionalBranchCreate({else_slot}, {fn_name}, {}, {});",
+                    child.decls, child.vars
+                )),
+            }
             else_slot_info = Some((fn_name.clone(), else_slot));
             self.child_templates.push(child);
         }
@@ -1976,6 +2018,42 @@ fn build_conditional_expr(
 }
 
 /// Format static attributes as an array expression.
+/// Get the tag name and consts index of the first root element in a template block.
+/// Returns (tag, consts_index) for the conditional host element.
+fn get_root_element_info(
+    children: &[TemplateNode],
+    gen: &mut IvyCodegen,
+) -> (Option<String>, Option<usize>) {
+    for child in children {
+        match child {
+            TemplateNode::Element(el) => {
+                let tag = el.tag.clone();
+                // Extract static attributes for the consts array
+                let static_attrs: Vec<(&str, &str)> = el
+                    .attributes
+                    .iter()
+                    .filter_map(|a| match a {
+                        crate::ast::TemplateAttribute::Static {
+                            name,
+                            value: Some(v),
+                        } => Some((name.as_str(), v.as_str())),
+                        _ => None,
+                    })
+                    .collect();
+                let consts_idx = if !static_attrs.is_empty() {
+                    Some(gen.register_const(&static_attrs))
+                } else {
+                    None
+                };
+                return (Some(tag), consts_idx);
+            }
+            TemplateNode::Text(t) if t.value.trim().is_empty() => continue,
+            _ => return (None, None),
+        }
+    }
+    (None, None)
+}
+
 fn format_static_attrs(attrs: &[(&str, &str)]) -> String {
     let pairs: Vec<String> = attrs
         .iter()
