@@ -86,6 +86,7 @@ pub fn generate_template_fn(
         angular_core_import_span: None,
         other_angular_core_imports: Vec::new(),
         styles_source: meta.styles_source.clone(),
+        input_properties: Vec::new(),
     };
 
     let ivy_output = codegen::generate_ivy(&extracted, &template_ast)?;
