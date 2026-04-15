@@ -1020,8 +1020,28 @@ impl IvyCodegen {
             if pipe.args.is_empty() {
                 expr = format!("{bind_fn}({pipe_slot}, {pipe_var_slot}, {expr})");
             } else {
-                let args_str = pipe.args.join(", ");
-                expr = format!("{bind_fn}({pipe_slot}, {pipe_var_slot}, {expr}, {args_str})");
+                let compiled_args: Vec<String> = pipe
+                    .args
+                    .iter()
+                    .map(|a| {
+                        let trimmed = a.trim();
+                        if trimmed.starts_with('{') {
+                            let wrapped = format!("({})", trimmed);
+                            let result = ctx_expr(&wrapped);
+                            result
+                                .strip_prefix('(')
+                                .and_then(|s| s.strip_suffix(')'))
+                                .unwrap_or(&result)
+                                .to_string()
+                        } else {
+                            ctx_expr(a)
+                        }
+                    })
+                    .collect();
+                expr = format!(
+                    "{bind_fn}({pipe_slot}, {pipe_var_slot}, {expr}, {})",
+                    compiled_args.join(", ")
+                );
             }
         }
         expr
@@ -1103,7 +1123,25 @@ impl IvyCodegen {
             if args.is_empty() {
                 return format!("{bind_fn}({pipe_slot}, {pipe_var_slot}, {compiled_base})");
             }
-            let compiled_args: Vec<String> = args.iter().map(|a| ctx_expr(a)).collect();
+            let compiled_args: Vec<String> = args
+                .iter()
+                .map(|a| {
+                    let trimmed = a.trim();
+                    if trimmed.starts_with('{') {
+                        // Wrap object literals in parens so oxc parses them as
+                        // expressions, not block statements.
+                        let wrapped = format!("({})", trimmed);
+                        let result = ctx_expr(&wrapped);
+                        result
+                            .strip_prefix('(')
+                            .and_then(|s| s.strip_suffix(')'))
+                            .unwrap_or(&result)
+                            .to_string()
+                    } else {
+                        ctx_expr(a)
+                    }
+                })
+                .collect();
             return format!(
                 "{bind_fn}({pipe_slot}, {pipe_var_slot}, {compiled_base}, {})",
                 compiled_args.join(", ")
@@ -1464,7 +1502,25 @@ fn replace_nested_pipe_parens(expr: &str, gen: &mut IvyCodegen) -> String {
                         "{bind_fn}({pipe_slot}, {pipe_var_slot}, {compiled_base})"
                     ));
                 } else {
-                    let compiled_args: Vec<String> = args.iter().map(|a| ctx_expr(a)).collect();
+                    let compiled_args: Vec<String> = args
+                .iter()
+                .map(|a| {
+                    let trimmed = a.trim();
+                    if trimmed.starts_with('{') {
+                        // Wrap object literals in parens so oxc parses them as
+                        // expressions, not block statements.
+                        let wrapped = format!("({})", trimmed);
+                        let result = ctx_expr(&wrapped);
+                        result
+                            .strip_prefix('(')
+                            .and_then(|s| s.strip_suffix(')'))
+                            .unwrap_or(&result)
+                            .to_string()
+                    } else {
+                        ctx_expr(a)
+                    }
+                })
+                .collect();
                     result.push_str(&format!(
                         "{bind_fn}({pipe_slot}, {pipe_var_slot}, {compiled_base}, {})",
                         compiled_args.join(", ")
