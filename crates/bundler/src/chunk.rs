@@ -375,11 +375,28 @@ fn toposort_subset_with_cycles(
                 *in_degree.entry(neighbor).or_insert(0) += 1;
             }
         }
-        // Min-heap by SCC index (which correlates with graph structure) for determinism
-        let mut queue: BinaryHeap<Reverse<(usize, NodeIndex)>> = BinaryHeap::new();
+        // Build a stable sort key for each condensation node using the
+        // smallest file path in the SCC. This ensures deterministic ordering
+        // regardless of graph insertion order or SCC numbering.
+        let mut cond_sort_key: HashMap<NodeIndex, String> = HashMap::new();
+        for cond_node in cond.node_indices() {
+            let scc_idx = cond[cond_node];
+            let scc = &sccs[scc_idx];
+            let min_path = scc
+                .iter()
+                .map(|&sub_node| {
+                    let orig_idx = sub[sub_node];
+                    graph[orig_idx].to_string_lossy().to_string()
+                })
+                .min()
+                .unwrap_or_default();
+            cond_sort_key.insert(cond_node, min_path);
+        }
+        let mut queue: BinaryHeap<Reverse<(String, NodeIndex)>> = BinaryHeap::new();
         for (&node, &deg) in &in_degree {
             if deg == 0 {
-                queue.push(Reverse((cond[node], node)));
+                let key = cond_sort_key.get(&node).cloned().unwrap_or_default();
+                queue.push(Reverse((key, node)));
             }
         }
         let mut order = Vec::new();
@@ -389,7 +406,8 @@ fn toposort_subset_with_cycles(
                 let deg = in_degree.get_mut(&neighbor).expect("node in graph");
                 *deg -= 1;
                 if *deg == 0 {
-                    queue.push(Reverse((cond[neighbor], neighbor)));
+                    let key = cond_sort_key.get(&neighbor).cloned().unwrap_or_default();
+                    queue.push(Reverse((key, neighbor)));
                 }
             }
         }

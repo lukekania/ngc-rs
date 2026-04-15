@@ -20,6 +20,15 @@ pub struct IvyOutput {
     pub consts: Vec<String>,
 }
 
+/// A single level in the template scope hierarchy.
+#[derive(Debug, Clone)]
+enum ScopeEntry {
+    /// An `@if`/`@else`/`@switch` embedded view — no local variables.
+    Conditional,
+    /// An `@for` embedded view — declares an item variable from `$implicit`.
+    Repeater { item_name: String },
+}
+
 /// Internal codegen state.
 struct IvyCodegen {
     component_name: String,
@@ -36,13 +45,10 @@ struct IvyCodegen {
     let_declarations: Vec<(String, u32)>,
     /// Local variable names that should NOT get `ctx.` prefix in expressions.
     local_vars: BTreeSet<String>,
-    /// Nesting depth of embedded views (for `ɵɵnextContext(depth)` calls).
-    /// 0 = root template, 1 = inside one @if/@for, 2 = nested @if inside @for, etc.
-    embed_depth: u32,
-    /// Stack of @for ancestor item variables with their embed depth.
-    /// Used to generate intermediate ɵɵnextContext() calls in nested templates
-    /// to access @for loop variables (e.g. `h` from `@for (h of holdings)`).
-    for_var_stack: Vec<(String, u32)>,
+    /// Scope stack tracking the template nesting hierarchy. Each entry records
+    /// what kind of embedded view we're inside and any variables it declares.
+    /// Used to generate correct `ɵɵnextContext()` calls and variable access.
+    scope_stack: Vec<ScopeEntry>,
     /// Last slot index emitted in the update block (for computing `ɵɵadvance` deltas).
     /// `None` means no advance has been emitted yet (runtime starts at selectedIndex=-1).
     last_update_slot: Option<u32>,
@@ -73,8 +79,7 @@ pub fn generate_ivy(
         consts: Vec::new(),
         let_declarations: Vec::new(),
         local_vars: BTreeSet::new(),
-        embed_depth: 0,
-        for_var_stack: Vec::new(),
+        scope_stack: Vec::new(),
         last_update_slot: None,
     };
 
@@ -180,8 +185,38 @@ pub fn generate_ivy(
 
 impl IvyCodegen {
     fn generate_nodes(&mut self, nodes: &[TemplateNode]) {
-        for node in nodes {
-            self.generate_node(node);
+        let mut i = 0;
+        while i < nodes.len() {
+            // Merge [Interpolation, Text] into textInterpolate1 when the text
+            // is a short inline suffix within the same parent element.
+            // This matches Angular's ngtsc which produces
+            // `ɵɵtextInterpolate1("", pipedValue, " @")` instead of
+            // separate text + textInterpolate instructions.
+            if let TemplateNode::Interpolation(interp) = &nodes[i] {
+                if i + 1 < nodes.len() {
+                    if let TemplateNode::Text(t) = &nodes[i + 1] {
+                        let trimmed = t.value.trim();
+                        // Merge if: non-empty suffix, short, no block-level content,
+                        // and the next node after the text is NOT another interpolation
+                        // (which would need its own slot).
+                        let is_last_or_followed_by_element =
+                            i + 2 >= nodes.len() || matches!(&nodes[i + 2], TemplateNode::Element(_));
+                        if !trimmed.is_empty()
+                            && trimmed.len() < 30
+                            && !trimmed.contains('<')
+                            && is_last_or_followed_by_element
+                        {
+                            let suffix = t.value.replace('\n', " ");
+                            let suffix = suffix.trim();
+                            self.generate_interpolation_with_suffix(interp, suffix);
+                            i += 2;
+                            continue;
+                        }
+                    }
+                }
+            }
+            self.generate_node(&nodes[i]);
+            i += 1;
         }
     }
 
@@ -319,20 +354,20 @@ impl IvyCodegen {
                     TemplateAttribute::Event { name, handler } => {
                         self.ivy_imports
                             .insert("\u{0275}\u{0275}listener".to_string());
-                        let compiled_handler = compile_event_handler(handler);
-                        if self.embed_depth > 0 {
-                            // Inside embedded view: restore view and get component ctx
+                        let compiled_handler = compile_event_handler(handler, &self.local_vars);
+                        let depth = self.scope_depth();
+                        if depth > 0 {
                             self.ivy_imports
                                 .insert("\u{0275}\u{0275}restoreView".to_string());
                             self.ivy_imports
                                 .insert("\u{0275}\u{0275}nextContext".to_string());
-                            let depth = self.embed_depth;
+                            let listener_preamble =
+                                self.generate_listener_preamble();
                             self.creation.push(format!(
-                                "\u{0275}\u{0275}listener('{}', function($event) {{ \u{0275}\u{0275}restoreView(_r); const ctx = \u{0275}\u{0275}nextContext({depth}); {compiled_handler} }});",
+                                "\u{0275}\u{0275}listener('{}', function($event) {{ {listener_preamble}{compiled_handler} }});",
                                 name,
                             ));
                         } else {
-                            // Root template: ctx is the function parameter
                             self.creation.push(format!(
                                 "\u{0275}\u{0275}listener('{}', function($event) {{ {compiled_handler} }});",
                                 name,
@@ -342,14 +377,16 @@ impl IvyCodegen {
                     TemplateAttribute::TwoWayBinding { name, expression } => {
                         self.ivy_imports
                             .insert("\u{0275}\u{0275}listener".to_string());
-                        if self.embed_depth > 0 {
+                        let depth = self.scope_depth();
+                        if depth > 0 {
                             self.ivy_imports
                                 .insert("\u{0275}\u{0275}restoreView".to_string());
                             self.ivy_imports
                                 .insert("\u{0275}\u{0275}nextContext".to_string());
-                            let depth = self.embed_depth;
+                            let listener_preamble =
+                                self.generate_listener_preamble();
                             self.creation.push(format!(
-                                "\u{0275}\u{0275}listener('{}Change', function($event) {{ \u{0275}\u{0275}restoreView(_r); const ctx = \u{0275}\u{0275}nextContext({depth}); return {} = $event; }});",
+                                "\u{0275}\u{0275}listener('{}Change', function($event) {{ {listener_preamble}return {} = $event; }});",
                                 name, ctx_expr(expression)
                             ));
                         } else {
@@ -533,6 +570,36 @@ impl IvyCodegen {
             .push(format!("\u{0275}\u{0275}text({slot}, '{escaped}');"));
     }
 
+    fn generate_interpolation_with_suffix(
+        &mut self,
+        interp: &InterpolationNode,
+        suffix: &str,
+    ) {
+        let slot = self.slot_index;
+        self.slot_index += 1;
+        self.ivy_imports.insert("\u{0275}\u{0275}text".to_string());
+        self.ivy_imports
+            .insert("\u{0275}\u{0275}textInterpolate1".to_string());
+        self.ivy_imports
+            .insert("\u{0275}\u{0275}advance".to_string());
+
+        self.creation.push(format!("\u{0275}\u{0275}text({slot});"));
+
+        let expr = if interp.pipes.is_empty() {
+            self.compile_binding_expr(&interp.expression)
+        } else {
+            self.wrap_with_pipes(&interp.expression, &interp.pipes)
+        };
+
+        let escaped_suffix = escape_js_string(suffix);
+        self.add_advance(slot);
+        self.update.push(format!(
+            "\u{0275}\u{0275}textInterpolate1('', {expr}, '{escaped_suffix}');",
+        ));
+        // textInterpolate1 uses 1 binding slot
+        self.var_count += 1;
+    }
+
     fn generate_interpolation(&mut self, interp: &InterpolationNode) {
         let slot = self.slot_index;
         self.slot_index += 1;
@@ -566,20 +633,12 @@ impl IvyCodegen {
         self.ivy_imports
             .insert("\u{0275}\u{0275}advance".to_string());
 
-        // First @if in a scope uses conditionalCreate; subsequent ones use
-        // conditionalBranchCreate (Angular 21 chains: conditionalCreate returns
-        // conditionalBranchCreate, so consecutive @if blocks in the same scope
-        // use the chained function).
-        let is_first = !self.creation.iter().any(|s| s.contains("conditionalCreate"));
-        let create_fn = if is_first {
-            self.ivy_imports
-                .insert("\u{0275}\u{0275}conditionalCreate".to_string());
-            "\u{0275}\u{0275}conditionalCreate"
-        } else {
-            self.ivy_imports
-                .insert("\u{0275}\u{0275}conditionalBranchCreate".to_string());
-            "\u{0275}\u{0275}conditionalBranchCreate"
-        };
+        // Each independent @if block uses conditionalCreate.
+        // Only @else-if and @else branches (within the SAME @if construct)
+        // use conditionalCreate.
+        self.ivy_imports
+            .insert("\u{0275}\u{0275}conditionalCreate".to_string());
+        let create_fn = "\u{0275}\u{0275}conditionalCreate";
 
         // Generate child template for the @if body
         let child_fn_name = format!(
@@ -624,22 +683,22 @@ impl IvyCodegen {
             );
             self.child_counter += 1;
             self.ivy_imports
-                .insert("\u{0275}\u{0275}conditionalBranchCreate".to_string());
+                .insert("\u{0275}\u{0275}conditionalCreate".to_string());
             let ei_slot = self.slot_index;
             self.slot_index += 1;
             let (ei_tag, ei_attrs) = get_root_element_info(&branch.children, self);
             let child = self.generate_child_template(&fn_name, &branch.children);
             match (ei_tag, ei_attrs) {
                 (Some(ref tag), Some(idx)) => self.creation.push(format!(
-                    "\u{0275}\u{0275}conditionalBranchCreate({ei_slot}, {fn_name}, {}, {}, '{tag}', {idx});",
+                    "\u{0275}\u{0275}conditionalCreate({ei_slot}, {fn_name}, {}, {}, '{tag}', {idx});",
                     child.decls, child.vars
                 )),
                 (Some(ref tag), None) => self.creation.push(format!(
-                    "\u{0275}\u{0275}conditionalBranchCreate({ei_slot}, {fn_name}, {}, {}, '{tag}');",
+                    "\u{0275}\u{0275}conditionalCreate({ei_slot}, {fn_name}, {}, {}, '{tag}');",
                     child.decls, child.vars
                 )),
                 _ => self.creation.push(format!(
-                    "\u{0275}\u{0275}conditionalBranchCreate({ei_slot}, {fn_name}, {}, {});",
+                    "\u{0275}\u{0275}conditionalCreate({ei_slot}, {fn_name}, {}, {});",
                     child.decls, child.vars
                 )),
             }
@@ -655,22 +714,22 @@ impl IvyCodegen {
             );
             self.child_counter += 1;
             self.ivy_imports
-                .insert("\u{0275}\u{0275}conditionalBranchCreate".to_string());
+                .insert("\u{0275}\u{0275}conditionalCreate".to_string());
             let else_slot = self.slot_index;
             self.slot_index += 1;
             let (else_tag, else_attrs) = get_root_element_info(else_children, self);
             let child = self.generate_child_template(&fn_name, else_children);
             match (else_tag, else_attrs) {
                 (Some(ref tag), Some(idx)) => self.creation.push(format!(
-                    "\u{0275}\u{0275}conditionalBranchCreate({else_slot}, {fn_name}, {}, {}, '{tag}', {idx});",
+                    "\u{0275}\u{0275}conditionalCreate({else_slot}, {fn_name}, {}, {}, '{tag}', {idx});",
                     child.decls, child.vars
                 )),
                 (Some(ref tag), None) => self.creation.push(format!(
-                    "\u{0275}\u{0275}conditionalBranchCreate({else_slot}, {fn_name}, {}, {}, '{tag}');",
+                    "\u{0275}\u{0275}conditionalCreate({else_slot}, {fn_name}, {}, {}, '{tag}');",
                     child.decls, child.vars
                 )),
                 _ => self.creation.push(format!(
-                    "\u{0275}\u{0275}conditionalBranchCreate({else_slot}, {fn_name}, {}, {});",
+                    "\u{0275}\u{0275}conditionalCreate({else_slot}, {fn_name}, {}, {});",
                     child.decls, child.vars
                 )),
             }
@@ -738,18 +797,28 @@ impl IvyCodegen {
             format!("(i, {item}) => {track_expr}")
         };
 
+        // Extract root element tag and consts index for the @for host element.
+        let (for_tag, for_attrs_idx) = get_root_element_info(&block.children, self);
+        let tag_arg = for_tag
+            .as_ref()
+            .map(|t| format!("'{t}'"))
+            .unwrap_or_else(|| "null".to_string());
+        let attrs_arg = for_attrs_idx
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| "null".to_string());
+
         // @empty block — passed as extra args to ɵɵrepeaterCreate
         if let Some(ref empty_children) = block.empty_children {
             let empty_fn_name = format!("{}_ForEmpty_{}_Template", self.component_name, slot);
             let empty_child = self.generate_child_template(&empty_fn_name, empty_children);
             self.creation.push(format!(
-                "\u{0275}\u{0275}repeaterCreate({slot}, {child_fn_name}, {}, {}, null, null, {track_fn}, false, {empty_fn_name}, {}, {});",
+                "\u{0275}\u{0275}repeaterCreate({slot}, {child_fn_name}, {}, {}, {tag_arg}, {attrs_arg}, {track_fn}, false, {empty_fn_name}, {}, {});",
                 child.decls, child.vars, empty_child.decls, empty_child.vars
             ));
             self.child_templates.push(empty_child);
         } else {
             self.creation.push(format!(
-                "\u{0275}\u{0275}repeaterCreate({slot}, {child_fn_name}, {}, {}, null, null, {track_fn});",
+                "\u{0275}\u{0275}repeaterCreate({slot}, {child_fn_name}, {}, {}, {tag_arg}, {attrs_arg}, {track_fn});",
                 child.decls, child.vars
             ));
         }
@@ -793,9 +862,9 @@ impl IvyCodegen {
                 ));
             } else {
                 self.ivy_imports
-                    .insert("\u{0275}\u{0275}conditionalBranchCreate".to_string());
+                    .insert("\u{0275}\u{0275}conditionalCreate".to_string());
                 self.creation.push(format!(
-                    "\u{0275}\u{0275}conditionalBranchCreate({case_slot}, {fn_name}, {}, {});",
+                    "\u{0275}\u{0275}conditionalCreate({case_slot}, {fn_name}, {}, {});",
                     child.decls, child.vars
                 ));
             }
@@ -811,12 +880,12 @@ impl IvyCodegen {
             );
             self.child_counter += 1;
             self.ivy_imports
-                .insert("\u{0275}\u{0275}conditionalBranchCreate".to_string());
+                .insert("\u{0275}\u{0275}conditionalCreate".to_string());
             let default_slot = self.slot_index;
             self.slot_index += 1;
             let child = self.generate_child_template(&fn_name, default_children);
             self.creation.push(format!(
-                "\u{0275}\u{0275}conditionalBranchCreate({default_slot}, {fn_name}, {}, {});",
+                "\u{0275}\u{0275}conditionalCreate({default_slot}, {fn_name}, {}, {});",
                 child.decls, child.vars
             ));
             default_slot_val = Some(default_slot);
@@ -861,7 +930,7 @@ impl IvyCodegen {
         let parent_creation = std::mem::take(&mut self.creation);
         let parent_update = std::mem::take(&mut self.update);
         let parent_lets = self.let_declarations.clone();
-        self.embed_depth += 1;
+        self.scope_stack.push(ScopeEntry::Conditional);
 
         self.slot_index = 0;
         self.var_count = 0;
@@ -900,34 +969,8 @@ impl IvyCodegen {
             code.push_str("  if (rf & 2) {\n");
             self.ivy_imports
                 .insert("\u{0275}\u{0275}nextContext".to_string());
-            // Navigate up the view tree, extracting @for loop variables along the way.
-            // Each ɵɵnextContext() call is stateful (moves pointer up), so we go
-            // step by step through @for ancestors before reaching the component.
-            let current_depth = self.embed_depth;
-            let mut remaining = current_depth;
-            // Sort for_var_stack by depth descending (closest ancestor first)
-            let mut for_vars: Vec<(String, u32)> = self.for_var_stack.clone();
-            for_vars.sort_by(|a, b| b.1.cmp(&a.1));
-            for (var_name, var_depth) in &for_vars {
-                let steps = remaining - var_depth;
-                if steps > 0 {
-                    code.push_str(&format!(
-                        "    const _{var_name}_ctx = \u{0275}\u{0275}nextContext({steps});\n"
-                    ));
-                    code.push_str(&format!(
-                        "    const {var_name} = _{var_name}_ctx.$implicit;\n"
-                    ));
-                    remaining = *var_depth;
-                }
-            }
-            // Navigate remaining levels to the component
-            if remaining > 0 {
-                code.push_str(&format!(
-                    "    const ctx = \u{0275}\u{0275}nextContext({remaining});\n"
-                ));
-            } else {
-                code.push_str("    const ctx = \u{0275}\u{0275}nextContext();\n");
-            }
+            // Use the scope stack to generate context navigation
+            code.push_str(&self.generate_context_navigation());
             // Inject @let variable reads from parent context
             for (name, slot) in &parent_lets {
                 self.ivy_imports
@@ -946,7 +989,7 @@ impl IvyCodegen {
         code.push('}');
 
         // Restore parent state (consts is NOT restored — shared)
-        self.embed_depth -= 1;
+        self.scope_stack.pop();
         self.slot_index = parent_slot;
         self.var_count = parent_var;
         self.last_update_slot = parent_last_update;
@@ -975,7 +1018,7 @@ impl IvyCodegen {
         let parent_creation = std::mem::take(&mut self.creation);
         let parent_update = std::mem::take(&mut self.update);
         let parent_lets = self.let_declarations.clone();
-        self.embed_depth += 1;
+        
 
         self.slot_index = 0;
         self.var_count = 0;
@@ -986,8 +1029,8 @@ impl IvyCodegen {
         let parent_locals = self.local_vars.clone();
         self.local_vars.insert(item_name.to_string());
         // Track this @for's item variable and its depth for nested templates
-        self.for_var_stack
-            .push((item_name.to_string(), self.embed_depth));
+        self.scope_stack
+            .push(ScopeEntry::Repeater { item_name: item_name.to_string() });
 
         self.generate_nodes(children);
 
@@ -1013,16 +1056,19 @@ impl IvyCodegen {
         }
         if !self.update.is_empty() || !parent_lets.is_empty() {
             code.push_str("  if (rf & 2) {\n");
-            // @for child templates receive RepeaterContext as _ctx ($implicit, $index).
-            // Rebind `ctx` to the parent component via ɵɵnextContext(depth) so that
-            // ctx_expr()-generated references like `ctx.someMethod()` work.
-            let depth = self.embed_depth;
+            // Extract item from _ctx and component context.
+            // Order matches ng build: item first, then nextContext.
+            code.push_str(&format!("    const {item_name} = _ctx.$implicit;\n"));
+            let comp_depth = self.scope_stack.len() as u32;
             self.ivy_imports
                 .insert("\u{0275}\u{0275}nextContext".to_string());
-            code.push_str(&format!(
-                "    const ctx = \u{0275}\u{0275}nextContext({depth});\n"
-            ));
-            code.push_str(&format!("    const {item_name} = _ctx.$implicit;\n"));
+            if comp_depth > 0 {
+                code.push_str(&format!(
+                    "    const ctx = \u{0275}\u{0275}nextContext({comp_depth});\n"
+                ));
+            } else {
+                code.push_str("    const ctx = \u{0275}\u{0275}nextContext();\n");
+            }
             for (name, slot) in &parent_lets {
                 self.ivy_imports
                     .insert("\u{0275}\u{0275}readContextLet".to_string());
@@ -1040,8 +1086,8 @@ impl IvyCodegen {
         code.push('}');
 
         // Restore parent state (consts is NOT restored — shared)
-        self.embed_depth -= 1;
-        self.for_var_stack.pop();
+        
+        self.scope_stack.pop();
         self.slot_index = parent_slot;
         self.var_count = parent_var;
         self.last_update_slot = parent_last_update;
@@ -1230,6 +1276,99 @@ impl IvyCodegen {
     }
 
     /// Add an `ɵɵadvance()` instruction to the update block.
+    /// Generate context navigation code for a child template's update block.
+    ///
+    /// Walks the scope stack from the current scope up to the component,
+    /// extracting @for item variables along the way and binding `ctx` to
+    /// the component context. Returns the code to inject at the top of
+    /// the `if (rf & 2)` block.
+    fn generate_context_navigation(&self) -> String {
+        if self.scope_stack.is_empty() {
+            return String::new(); // root template — ctx is the function parameter
+        }
+
+        self.ivy_imports.clone(); // can't mutate, but we need imports
+        let mut code = String::new();
+        let depth = self.scope_stack.len();
+        let mut levels_consumed = 0;
+
+        // Walk the scope stack from innermost (current) to outermost.
+        // The stack represents [outermost, ..., innermost], so we iterate in reverse.
+        // i=0 is the innermost scope (the one we're currently IN).
+        // To reach scope at reverse-index i, we need i navigation steps
+        // (minus any already consumed).
+        for (i, entry) in self.scope_stack.iter().rev().enumerate() {
+            match entry {
+                ScopeEntry::Repeater { item_name } if i > 0 => {
+                    // This ANCESTOR is a @for — extract its item variable.
+                    // (i=0 would be the current @for, handled by _ctx.$implicit)
+                    let steps = i - levels_consumed;
+                    if steps == 1 {
+                        code.push_str(&format!(
+                            "    const _{item_name}_ctx = \u{0275}\u{0275}nextContext();\n"
+                        ));
+                    } else if steps > 1 {
+                        code.push_str(&format!(
+                            "    const _{item_name}_ctx = \u{0275}\u{0275}nextContext({steps});\n"
+                        ));
+                    }
+                    if steps > 0 {
+                        code.push_str(&format!(
+                            "    const {item_name} = _{item_name}_ctx.$implicit;\n"
+                        ));
+                    }
+                    levels_consumed = i;
+                }
+                ScopeEntry::Repeater { .. } => {
+                    // i=0: this is the current @for scope — item accessed via _ctx.$implicit
+                }
+                ScopeEntry::Conditional => {
+                    // Skip — no variables to extract from conditional scopes
+                }
+            }
+        }
+
+        // Navigate remaining levels to the component
+        let remaining = depth - levels_consumed;
+        if remaining == 0 {
+            code.push_str("    const ctx = \u{0275}\u{0275}nextContext();\n");
+        } else if remaining == 1 {
+            code.push_str("    const ctx = \u{0275}\u{0275}nextContext();\n");
+        } else {
+            code.push_str(&format!(
+                "    const ctx = \u{0275}\u{0275}nextContext({remaining});\n"
+            ));
+        }
+
+        code
+    }
+
+    /// Get the total scope depth (for listener closures that need `nextContext(N)`).
+    fn scope_depth(&self) -> u32 {
+        self.scope_stack.len() as u32
+    }
+
+    /// Generate the preamble code for a listener closure inside an embedded view.
+    ///
+    /// Produces: `ɵɵrestoreView(_r); const h = _r.$implicit; const ctx = ɵɵnextContext(N);`
+    /// where `h` is extracted from the innermost @for scope and `ctx` is the component.
+    fn generate_listener_preamble(&self) -> String {
+        let depth = self.scope_stack.len();
+        let mut code = String::from("\u{0275}\u{0275}restoreView(_r); ");
+
+        // If the innermost scope is a @for, extract the item from the restored view
+        if let Some(ScopeEntry::Repeater { item_name }) = self.scope_stack.last() {
+            code.push_str(&format!("const {item_name} = _r.$implicit; "));
+        }
+
+        // Navigate to the component context
+        code.push_str(&format!(
+            "const ctx = \u{0275}\u{0275}nextContext({depth}); "
+        ));
+
+        code
+    }
+
     fn add_advance(&mut self, target_slot: u32) {
         // Angular's executeTemplate() sets selectedIndex = HEADER_OFFSET before the
         // update phase.  ɵɵadvance(delta) adds delta to that base, so the first call
@@ -2072,7 +2211,7 @@ fn format_static_attrs(attrs: &[(&str, &str)]) -> String {
 /// Handles multi-statement handlers like `$event.stopPropagation(); doSomething()`
 /// by splitting on `;`, applying `ctx.` to each statement, and adding `return` to
 /// the last statement.
-fn compile_event_handler(handler: &str) -> String {
+fn compile_event_handler(handler: &str, locals: &BTreeSet<String>) -> String {
     let trimmed = handler.trim();
     // Split on semicolons (respecting strings and parens)
     let statements: Vec<&str> = trimmed
@@ -2087,7 +2226,7 @@ fn compile_event_handler(handler: &str) -> String {
 
     let mut parts = Vec::new();
     for (i, stmt) in statements.iter().enumerate() {
-        let compiled = ctx_expr(stmt);
+        let compiled = ctx_expr_with_locals(stmt, locals);
         if i == statements.len() - 1 {
             parts.push(format!("return {compiled};"));
         } else {
