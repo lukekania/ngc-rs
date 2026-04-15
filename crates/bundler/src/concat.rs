@@ -187,14 +187,17 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
         }
     }
 
-    // Append re-exports to main chunk for symbols that lazy chunks need.
-    if !all_needed_npm.is_empty() || !all_needed_project.is_empty() {
-        let reexport_code =
-            generate_cross_chunk_exports(&all_needed_npm, &main_spec_to_ns, &all_needed_project);
-        if let Some(main_code) = output_chunks.get_mut("main.js") {
-            main_code.push_str(&reexport_code);
-        }
-    }
+    // Generate cross-chunk export code (appended AFTER minification to avoid
+    // the minifier stripping the `export { ... }` statement).
+    let reexport_code = if !all_needed_npm.is_empty() || !all_needed_project.is_empty() {
+        Some(generate_cross_chunk_exports(
+            &all_needed_npm,
+            &main_spec_to_ns,
+            &all_needed_project,
+        ))
+    } else {
+        None
+    };
 
     // Minification pass
     if input.options.minify {
@@ -212,6 +215,13 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
 
         output_chunks = minified_chunks;
         chunk_source_maps = minified_maps;
+    }
+
+    // Append cross-chunk exports after minification
+    if let Some(reexport_code) = reexport_code {
+        if let Some(main_code) = output_chunks.get_mut("main.js") {
+            main_code.push_str(&reexport_code);
+        }
     }
 
     // Content-hash filenames
