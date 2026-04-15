@@ -562,11 +562,24 @@ impl IvyCodegen {
         self.slot_index += 1;
 
         self.ivy_imports
-            .insert("\u{0275}\u{0275}conditionalCreate".to_string());
-        self.ivy_imports
             .insert("\u{0275}\u{0275}conditional".to_string());
         self.ivy_imports
             .insert("\u{0275}\u{0275}advance".to_string());
+
+        // First @if in a scope uses conditionalCreate; subsequent ones use
+        // conditionalBranchCreate (Angular 21 chains: conditionalCreate returns
+        // conditionalBranchCreate, so consecutive @if blocks in the same scope
+        // use the chained function).
+        let is_first = !self.creation.iter().any(|s| s.contains("conditionalCreate"));
+        let create_fn = if is_first {
+            self.ivy_imports
+                .insert("\u{0275}\u{0275}conditionalCreate".to_string());
+            "\u{0275}\u{0275}conditionalCreate"
+        } else {
+            self.ivy_imports
+                .insert("\u{0275}\u{0275}conditionalBranchCreate".to_string());
+            "\u{0275}\u{0275}conditionalBranchCreate"
+        };
 
         // Generate child template for the @if body
         let child_fn_name = format!(
@@ -577,7 +590,7 @@ impl IvyCodegen {
 
         let child = self.generate_child_template(&child_fn_name, &block.children);
         self.creation.push(format!(
-            "\u{0275}\u{0275}conditionalCreate({slot}, {child_fn_name}, {}, {});",
+            "{create_fn}({slot}, {child_fn_name}, {}, {});",
             child.decls, child.vars
         ));
         self.child_templates.push(child);
