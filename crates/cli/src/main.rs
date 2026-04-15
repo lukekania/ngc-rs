@@ -628,9 +628,10 @@ fn resolve_css_imports(css: &str, project_root: &Path) -> String {
             }
         }
 
-        // Lines starting with @config or other directives we can't resolve: skip them
+        // Preserve @config directives — PostCSS/Tailwind needs them
         if trimmed.starts_with("@config") {
-            result.push_str(&format!("/* {trimmed} (skipped) */\n"));
+            result.push_str(line);
+            result.push('\n');
             continue;
         }
 
