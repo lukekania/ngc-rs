@@ -163,7 +163,10 @@ pub fn generate_ivy(
         }
     }
     if let Some(ref styles_src) = component.styles_source {
-        dc.push_str(&format!(",\n    styles: {styles_src}"));
+        // Pre-scope CSS with %COMP% placeholders for Angular's emulated ViewEncapsulation.
+        // The runtime replaces %COMP% with the component's unique ID.
+        let scoped = scope_component_styles(styles_src);
+        dc.push_str(&format!(",\n    styles: {scoped}"));
     }
     dc.push_str("\n  })");
 
@@ -2157,6 +2160,134 @@ fn build_conditional_expr(
 }
 
 /// Format static attributes as an array expression.
+/// Pre-scope component CSS with `%COMP%` placeholders for Angular's emulated ViewEncapsulation.
+///
+/// Transforms:
+/// - `.class { ... }` → `.class[_ngcontent-%COMP%] { ... }`
+/// - `:host { ... }` → `[_nghost-%COMP%] { ... }`
+/// - `:host-context(X) .class { ... }` → `X[_nghost-%COMP%] .class[_ngcontent-%COMP%], X [_nghost-%COMP%] .class[_ngcontent-%COMP%] { ... }`
+fn scope_component_styles(styles_src: &str) -> String {
+
+    // The styles_src is a JavaScript array like [`...css...`]
+    // We need to transform the CSS content inside the backticks.
+    // Extract the CSS content between the first ` and last `
+    let css_start = styles_src.find('`').unwrap_or(0) + 1;
+    let css_end = styles_src.rfind('`').unwrap_or(styles_src.len());
+    if css_start >= css_end {
+        return styles_src.to_string();
+    }
+
+    let css = &styles_src[css_start..css_end];
+    let content_attr = "[_ngcontent-%COMP%]";
+    let host_attr = "[_nghost-%COMP%]";
+
+    let mut result = String::new();
+
+    // Simple CSS rule parser: split on { and }
+    // Simple string-based matching instead of regex
+
+    let mut chars = css.chars().peekable();
+    let mut selector = String::new();
+    let mut in_block = false;
+    let mut brace_depth = 0;
+
+    while let Some(ch) = chars.next() {
+        if in_block {
+            result.push(ch);
+            if ch == '{' {
+                brace_depth += 1;
+            }
+            if ch == '}' {
+                brace_depth -= 1;
+                if brace_depth == 0 {
+                    in_block = false;
+                }
+            }
+        } else if ch == '{' {
+            // Process the selector
+            let sel = selector.trim().to_string();
+            if sel.is_empty() {
+                result.push('{');
+                in_block = true;
+                brace_depth = 1;
+                selector.clear();
+                continue;
+            }
+
+            // Transform selector
+            if sel.contains(":host-context(") {
+                // :host-context(X) .rest → X[_nghost-%COMP%] .rest[_ngcontent-%COMP%], X [_nghost-%COMP%] .rest[_ngcontent-%COMP%]
+                let after_hc = sel
+                    .find(":host-context(")
+                    .map(|i| &sel[i + ":host-context(".len()..])
+                    .unwrap_or("");
+                // Find matching )
+                let close = after_hc.find(')').unwrap_or(after_hc.len());
+                let context = after_hc[..close].trim();
+                let rest = after_hc[close + 1..].trim();
+                let scoped_rest = if rest.is_empty() {
+                    String::new()
+                } else {
+                    scope_simple_selector(rest, content_attr)
+                };
+                result.push_str(&format!(
+                    "{context}{host_attr} {scoped_rest}, {context} {host_attr} {scoped_rest}"
+                ));
+            } else if sel.starts_with(":host") {
+                let rest = sel[":host".len()..].trim();
+                if rest.is_empty() {
+                    result.push_str(host_attr);
+                } else if rest.starts_with('(') {
+                    let inner = rest
+                        .trim_start_matches('(')
+                        .trim_end_matches(')')
+                        .trim();
+                    result.push_str(&format!("{inner}{host_attr}"));
+                } else {
+                    result.push_str(&format!("{host_attr} {rest}"));
+                }
+            } else {
+                // Regular selector — append content attr to each part
+                let parts: Vec<&str> = sel.split(',').collect();
+                let scoped: Vec<String> = parts
+                    .iter()
+                    .map(|p| scope_simple_selector(p.trim(), content_attr))
+                    .collect();
+                result.push_str(&scoped.join(", "));
+            }
+
+            result.push('{');
+            in_block = true;
+            brace_depth = 1;
+            selector.clear();
+        } else {
+            selector.push(ch);
+        }
+    }
+
+    // Reconstruct the styles array with scoped CSS
+    let prefix = &styles_src[..css_start];
+    let suffix = &styles_src[css_end..];
+    format!("{prefix}{result}{suffix}")
+}
+
+/// Append `[_ngcontent-%COMP%]` to the last element in a simple CSS selector.
+fn scope_simple_selector(selector: &str, content_attr: &str) -> String {
+    let trimmed = selector.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    // Split on spaces, append attr to last part
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    let mut result: Vec<String> = parts[..parts.len() - 1]
+        .iter()
+        .map(|p| p.to_string())
+        .collect();
+    let last = parts.last().unwrap();
+    result.push(format!("{last}{content_attr}"));
+    result.join(" ")
+}
+
 /// Get the tag name and consts index of the first root element in a template block.
 /// Returns (tag, consts_index) for the conditional host element.
 fn get_root_element_info(
