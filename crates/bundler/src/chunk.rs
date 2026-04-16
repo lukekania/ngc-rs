@@ -438,7 +438,17 @@ fn toposort_subset_with_cycles(
             sorted_scc.sort_by(|a, b| {
                 let pa = graph[sub[*a]].to_string_lossy();
                 let pb = graph[sub[*b]].to_string_lossy();
-                pa.cmp(&pb)
+                // Barrel/index files go LAST — they only re-export from other
+                // modules and don't define values needed at evaluation time.
+                // Starting DFS from them causes re-export edges to be followed
+                // before direct dependency edges, leading to use-before-define.
+                let a_barrel = pa.ends_with("/index.js")
+                    || pa.ends_with("/index.mjs")
+                    || pa.ends_with("/index.ts");
+                let b_barrel = pb.ends_with("/index.js")
+                    || pb.ends_with("/index.mjs")
+                    || pb.ends_with("/index.ts");
+                a_barrel.cmp(&b_barrel).then_with(|| pa.cmp(&pb))
             });
             let mut emitted = HashSet::new();
             let mut in_progress = HashSet::new();
