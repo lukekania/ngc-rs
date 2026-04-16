@@ -352,18 +352,21 @@ impl IvyCodegen {
             })
             .collect();
 
-        // Collect property/class/style/attr binding names for the consts array.
-        // Angular uses AttributeMarker.Bindings (3) to mark binding attribute names
-        // so that directive matching can find directives by their input selectors.
+        // Collect property binding names for the consts array.
+        // Angular uses AttributeMarker.Bindings (3) to mark binding names so that
+        // directive matching can find directives by their input selectors.
+        // Only include Property and TwoWayBinding — NOT ClassBinding ([class.x]),
+        // StyleBinding ([style.x]), or AttrBinding ([attr.x]) since those are handled
+        // by built-in instructions and don't participate in directive matching.
+        // Also exclude [class] and [style] which map to classMap/styleMap.
         let binding_names: Vec<&str> = el
             .attributes
             .iter()
             .filter_map(|a| match a {
-                TemplateAttribute::Property { name, .. } => Some(name.as_str()),
+                TemplateAttribute::Property { name, .. } if name != "class" && name != "style" => {
+                    Some(name.as_str())
+                }
                 TemplateAttribute::TwoWayBinding { name, .. } => Some(name.as_str()),
-                TemplateAttribute::ClassBinding { class_name, .. } => Some(class_name.as_str()),
-                TemplateAttribute::StyleBinding { property, .. } => Some(property.as_str()),
-                TemplateAttribute::AttrBinding { name, .. } => Some(name.as_str()),
                 _ => None,
             })
             .collect();
@@ -2429,16 +2432,33 @@ fn format_static_attrs(attrs: &[(&str, &str)]) -> String {
 }
 
 /// Format a consts array entry with both static attributes and binding markers.
+///
+/// Uses Angular's AttributeMarker format:
+/// - `1` (Classes) + individual class names for `class` attributes
+/// - Regular key-value pairs for other attributes
+/// - `3` (Bindings) + binding names for directive input matching
 fn format_attrs_with_bindings(attrs: &[(&str, &str)], binding_names: &[&str]) -> String {
-    let mut parts: Vec<String> = attrs
-        .iter()
-        .flat_map(|(k, v)| {
-            vec![
-                format!("'{}'", escape_js_string(k)),
-                format!("'{}'", escape_js_string(v)),
-            ]
-        })
-        .collect();
+    let mut parts: Vec<String> = Vec::new();
+    let mut class_names: Vec<String> = Vec::new();
+
+    for (k, v) in attrs {
+        if *k == "class" && !v.is_empty() {
+            // Split class value into individual names for AttributeMarker.Classes
+            for cls in v.split_whitespace() {
+                class_names.push(format!("'{}'", escape_js_string(cls)));
+            }
+        } else {
+            parts.push(format!("'{}'", escape_js_string(k)));
+            parts.push(format!("'{}'", escape_js_string(v)));
+        }
+    }
+
+    // Insert AttributeMarker.Classes (1) + class names
+    if !class_names.is_empty() {
+        parts.push("1".to_string());
+        parts.extend(class_names);
+    }
+
     // Append AttributeMarker.Bindings (3) + binding attribute names
     if !binding_names.is_empty() {
         parts.push("3".to_string());
