@@ -1425,12 +1425,28 @@ impl IvyCodegen {
         for attr in &el.attributes {
             match attr {
                 TemplateAttribute::Property { name, expression } => {
-                    self.ivy_imports
-                        .insert("\u{0275}\u{0275}property".to_string());
                     let compiled = self.compile_binding_expr(expression);
-                    self.update
-                        .push(format!("\u{0275}\u{0275}property('{}', {compiled});", name,));
-                    self.var_count += 1;
+                    if name == "class" {
+                        // [class]="expr" → ɵɵclassMap(expr), 2 binding slots
+                        self.ivy_imports
+                            .insert("\u{0275}\u{0275}classMap".to_string());
+                        self.update
+                            .push(format!("\u{0275}\u{0275}classMap({compiled});"));
+                        self.var_count += 2;
+                    } else if name == "style" {
+                        // [style]="expr" → ɵɵstyleMap(expr), 2 binding slots
+                        self.ivy_imports
+                            .insert("\u{0275}\u{0275}styleMap".to_string());
+                        self.update
+                            .push(format!("\u{0275}\u{0275}styleMap({compiled});"));
+                        self.var_count += 2;
+                    } else {
+                        self.ivy_imports
+                            .insert("\u{0275}\u{0275}property".to_string());
+                        self.update
+                            .push(format!("\u{0275}\u{0275}property('{}', {compiled});", name));
+                        self.var_count += 1;
+                    }
                 }
                 TemplateAttribute::TwoWayBinding { name, expression } => {
                     self.ivy_imports
@@ -2382,11 +2398,14 @@ fn count_sequential_bindings(update: &[String]) -> u32 {
         if instr.contains("\u{0275}\u{0275}conditional(") {
             count += 1;
         }
-        // classProp, styleProp = 1 binding each
+        // classProp, styleProp, classMap, styleMap = 2 binding slots each
+        // (Angular's styling system uses incrementBindingIndex(2))
         if instr.contains("\u{0275}\u{0275}classProp(")
             || instr.contains("\u{0275}\u{0275}styleProp(")
+            || instr.contains("\u{0275}\u{0275}classMap(")
+            || instr.contains("\u{0275}\u{0275}styleMap(")
         {
-            count += 1;
+            count += 2;
         }
         // repeater = 1 binding
         if instr.contains("\u{0275}\u{0275}repeater(") {
