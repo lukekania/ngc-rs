@@ -151,6 +151,7 @@ mod tests {
             angular_core_import_span: Some((0, 43)),
             other_angular_core_imports: Vec::new(),
             styles_source: None,
+            input_properties: Vec::new(),
         }
     }
 
@@ -163,6 +164,7 @@ mod tests {
                 "\u{0275}\u{0275}defineComponent".to_string(),
                 "\u{0275}\u{0275}element".to_string(),
             ]),
+            consts: Vec::new(),
         }
     }
 

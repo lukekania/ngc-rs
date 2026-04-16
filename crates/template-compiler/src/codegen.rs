@@ -89,7 +89,10 @@ pub fn generate_ivy(
     gen.generate_nodes(template_nodes);
 
     let decls = gen.slot_index;
-    let vars = gen.var_count;
+    // Count sequential bindings (non-pipe) vs pipe bindings to fix offsets
+    let seq_bindings = count_sequential_bindings(&gen.update);
+    let pipe_binding_total = count_pipe_binding_slots(&gen.update);
+    let vars = seq_bindings + pipe_binding_total;
 
     // Build template function body
     let mut template_body = String::new();
@@ -106,7 +109,8 @@ pub fn generate_ivy(
         template_body.push_str("    if (rf & 2) {\n");
         for instr in &gen.update {
             template_body.push_str("      ");
-            template_body.push_str(instr);
+            let rewritten = rewrite_pipe_offsets(instr, seq_bindings);
+            template_body.push_str(&rewritten);
             template_body.push('\n');
         }
         template_body.push_str("    }\n");
@@ -202,8 +206,8 @@ impl IvyCodegen {
                         // Merge if: non-empty suffix, short, no block-level content,
                         // and the next node after the text is NOT another interpolation
                         // (which would need its own slot).
-                        let is_last_or_followed_by_element =
-                            i + 2 >= nodes.len() || matches!(&nodes[i + 2], TemplateNode::Element(_));
+                        let is_last_or_followed_by_element = i + 2 >= nodes.len()
+                            || matches!(&nodes[i + 2], TemplateNode::Element(_));
                         if !trimmed.is_empty()
                             && trimmed.len() < 30
                             && !trimmed.contains('<')
@@ -364,8 +368,7 @@ impl IvyCodegen {
                                 .insert("\u{0275}\u{0275}restoreView".to_string());
                             self.ivy_imports
                                 .insert("\u{0275}\u{0275}nextContext".to_string());
-                            let listener_preamble =
-                                self.generate_listener_preamble();
+                            let listener_preamble = self.generate_listener_preamble();
                             self.creation.push(format!(
                                 "\u{0275}\u{0275}listener('{}', function($event) {{ {listener_preamble}{compiled_handler} }});",
                                 name,
@@ -386,8 +389,7 @@ impl IvyCodegen {
                                 .insert("\u{0275}\u{0275}restoreView".to_string());
                             self.ivy_imports
                                 .insert("\u{0275}\u{0275}nextContext".to_string());
-                            let listener_preamble =
-                                self.generate_listener_preamble();
+                            let listener_preamble = self.generate_listener_preamble();
                             self.creation.push(format!(
                                 "\u{0275}\u{0275}listener('{}Change', function($event) {{ {listener_preamble}return {} = $event; }});",
                                 name, ctx_expr(expression)
@@ -517,7 +519,6 @@ impl IvyCodegen {
         self.generate_element(el);
 
         let decls = self.slot_index;
-        let vars = self.var_count + parent_lets.len() as u32;
 
         let mut code = format!("function {fn_name}(rf, ctx) {{\n");
         if !self.creation.is_empty() {
@@ -547,6 +548,13 @@ impl IvyCodegen {
         }
         code.push('}');
 
+        // Rewrite pipe offsets: compute sequential binding count for this child,
+        // then shift all pipe offsets to not overlap with sequential bindings.
+        let child_seq = count_sequential_bindings(&self.update);
+        let child_pipe = count_pipe_binding_slots(&self.update);
+        let code = rewrite_pipe_offsets(&code, child_seq);
+        let vars = child_seq + child_pipe + parent_lets.len() as u32;
+
         self.slot_index = parent_slot;
         self.var_count = parent_var;
         self.last_update_slot = parent_last_update;
@@ -573,11 +581,7 @@ impl IvyCodegen {
             .push(format!("\u{0275}\u{0275}text({slot}, '{escaped}');"));
     }
 
-    fn generate_interpolation_with_suffix(
-        &mut self,
-        interp: &InterpolationNode,
-        suffix: &str,
-    ) {
+    fn generate_interpolation_with_suffix(&mut self, interp: &InterpolationNode, suffix: &str) {
         let slot = self.slot_index;
         self.slot_index += 1;
         self.ivy_imports.insert("\u{0275}\u{0275}text".to_string());
@@ -679,7 +683,7 @@ impl IvyCodegen {
 
         // Generate else-if and else child templates
         let mut else_if_slots = Vec::new();
-        for (_i, branch) in block.else_if_branches.iter().enumerate() {
+        for branch in &block.else_if_branches {
             let fn_name = format!(
                 "{}_ConditionalElseIf_{}_Template",
                 self.component_name, self.child_counter
@@ -944,7 +948,6 @@ impl IvyCodegen {
         self.generate_nodes(children);
 
         let decls = self.slot_index;
-        let vars = self.var_count + parent_lets.len() as u32;
 
         // Embedded views (conditional / repeater child templates) do not
         // receive the parent component as `ctx`.  We must use ɵɵnextContext()
@@ -991,6 +994,13 @@ impl IvyCodegen {
         }
         code.push('}');
 
+        // Rewrite pipe offsets: shift pipe varSlot values so they don't overlap
+        // with sequential bindings.  Must happen before self.update is restored.
+        let child_seq = count_sequential_bindings(&self.update);
+        let child_pipe = count_pipe_binding_slots(&self.update);
+        let code = rewrite_pipe_offsets(&code, child_seq);
+        let vars = child_seq + child_pipe + parent_lets.len() as u32;
+
         // Restore parent state (consts is NOT restored — shared)
         self.scope_stack.pop();
         self.slot_index = parent_slot;
@@ -1021,7 +1031,6 @@ impl IvyCodegen {
         let parent_creation = std::mem::take(&mut self.creation);
         let parent_update = std::mem::take(&mut self.update);
         let parent_lets = self.let_declarations.clone();
-        
 
         self.slot_index = 0;
         self.var_count = 0;
@@ -1032,13 +1041,13 @@ impl IvyCodegen {
         let parent_locals = self.local_vars.clone();
         self.local_vars.insert(item_name.to_string());
         // Track this @for's item variable and its depth for nested templates
-        self.scope_stack
-            .push(ScopeEntry::Repeater { item_name: item_name.to_string() });
+        self.scope_stack.push(ScopeEntry::Repeater {
+            item_name: item_name.to_string(),
+        });
 
         self.generate_nodes(children);
 
         let decls = self.slot_index;
-        let vars = self.var_count + parent_lets.len() as u32;
 
         let has_listeners = self.creation.iter().any(|s| s.contains("listener"));
 
@@ -1088,8 +1097,14 @@ impl IvyCodegen {
         }
         code.push('}');
 
+        // Rewrite pipe offsets: shift pipe varSlot values so they don't overlap
+        // with sequential bindings.  Must happen before self.update is restored.
+        let child_seq = count_sequential_bindings(&self.update);
+        let child_pipe = count_pipe_binding_slots(&self.update);
+        let code = rewrite_pipe_offsets(&code, child_seq);
+        let vars = child_seq + child_pipe + parent_lets.len() as u32;
+
         // Restore parent state (consts is NOT restored — shared)
-        
         self.scope_stack.pop();
         self.slot_index = parent_slot;
         self.var_count = parent_var;
@@ -1290,7 +1305,7 @@ impl IvyCodegen {
             return String::new(); // root template — ctx is the function parameter
         }
 
-        self.ivy_imports.clone(); // can't mutate, but we need imports
+        let _ = self.ivy_imports.clone(); // can't mutate, but we need imports
         let mut code = String::new();
         let depth = self.scope_stack.len();
         let mut levels_consumed = 0;
@@ -1333,9 +1348,7 @@ impl IvyCodegen {
 
         // Navigate remaining levels to the component
         let remaining = depth - levels_consumed;
-        if remaining == 0 {
-            code.push_str("    const ctx = \u{0275}\u{0275}nextContext();\n");
-        } else if remaining == 1 {
+        if remaining <= 1 {
             code.push_str("    const ctx = \u{0275}\u{0275}nextContext();\n");
         } else {
             code.push_str(&format!(
@@ -1709,24 +1722,24 @@ fn replace_nested_pipe_parens(expr: &str, gen: &mut IvyCodegen) -> String {
                     ));
                 } else {
                     let compiled_args: Vec<String> = args
-                .iter()
-                .map(|a| {
-                    let trimmed = a.trim();
-                    if trimmed.starts_with('{') {
-                        // Wrap object literals in parens so oxc parses them as
-                        // expressions, not block statements.
-                        let wrapped = format!("({})", trimmed);
-                        let result = ctx_expr(&wrapped);
-                        result
-                            .strip_prefix('(')
-                            .and_then(|s| s.strip_suffix(')'))
-                            .unwrap_or(&result)
-                            .to_string()
-                    } else {
-                        ctx_expr(a)
-                    }
-                })
-                .collect();
+                        .iter()
+                        .map(|a| {
+                            let trimmed = a.trim();
+                            if trimmed.starts_with('{') {
+                                // Wrap object literals in parens so oxc parses them as
+                                // expressions, not block statements.
+                                let wrapped = format!("({})", trimmed);
+                                let result = ctx_expr(&wrapped);
+                                result
+                                    .strip_prefix('(')
+                                    .and_then(|s| s.strip_suffix(')'))
+                                    .unwrap_or(&result)
+                                    .to_string()
+                            } else {
+                                ctx_expr(a)
+                            }
+                        })
+                        .collect();
                     result.push_str(&format!(
                         "{bind_fn}({pipe_slot}, {pipe_var_slot}, {compiled_base}, {})",
                         compiled_args.join(", ")
@@ -2073,13 +2086,7 @@ fn collect_ctx_rewrites(
             // Optional chaining (a?.b, a?.(), a?.[b]) — recurse into the inner expression
             match &chain.expression {
                 ChainElement::CallExpression(call) => {
-                    collect_ctx_rewrites(
-                        &call.callee,
-                        ctx_inserts,
-                        remove_ranges,
-                        false,
-                        locals,
-                    );
+                    collect_ctx_rewrites(&call.callee, ctx_inserts, remove_ranges, false, locals);
                     for arg in &call.arguments {
                         if let Argument::SpreadElement(spread) = arg {
                             collect_ctx_rewrites(
@@ -2101,22 +2108,10 @@ fn collect_ctx_rewrites(
                     }
                 }
                 ChainElement::StaticMemberExpression(member) => {
-                    collect_ctx_rewrites(
-                        &member.object,
-                        ctx_inserts,
-                        remove_ranges,
-                        false,
-                        locals,
-                    );
+                    collect_ctx_rewrites(&member.object, ctx_inserts, remove_ranges, false, locals);
                 }
                 ChainElement::ComputedMemberExpression(member) => {
-                    collect_ctx_rewrites(
-                        &member.object,
-                        ctx_inserts,
-                        remove_ranges,
-                        false,
-                        locals,
-                    );
+                    collect_ctx_rewrites(&member.object, ctx_inserts, remove_ranges, false, locals);
                     collect_ctx_rewrites(
                         &member.expression,
                         ctx_inserts,
@@ -2140,7 +2135,11 @@ fn build_conditional_expr(
     else_info: &Option<(String, u32)>,
     locals: &BTreeSet<String>,
 ) -> String {
-    let mut expr = format!("{} ? {} : ", ctx_expr_with_locals(condition, locals), if_slot);
+    let mut expr = format!(
+        "{} ? {} : ",
+        ctx_expr_with_locals(condition, locals),
+        if_slot
+    );
 
     for (cond, _fn_name, slot) in else_ifs {
         expr.push_str(&format!(
@@ -2167,7 +2166,6 @@ fn build_conditional_expr(
 /// - `:host { ... }` → `[_nghost-%COMP%] { ... }`
 /// - `:host-context(X) .class { ... }` → `X[_nghost-%COMP%] .class[_ngcontent-%COMP%], X [_nghost-%COMP%] .class[_ngcontent-%COMP%] { ... }`
 fn scope_component_styles(styles_src: &str) -> String {
-
     // The styles_src is a JavaScript array like [`...css...`]
     // We need to transform the CSS content inside the backticks.
     // Extract the CSS content between the first ` and last `
@@ -2186,12 +2184,11 @@ fn scope_component_styles(styles_src: &str) -> String {
     // Simple CSS rule parser: split on { and }
     // Simple string-based matching instead of regex
 
-    let mut chars = css.chars().peekable();
     let mut selector = String::new();
     let mut in_block = false;
     let mut brace_depth = 0;
 
-    while let Some(ch) = chars.next() {
+    for ch in css.chars() {
         if in_block {
             result.push(ch);
             if ch == '{' {
@@ -2233,15 +2230,12 @@ fn scope_component_styles(styles_src: &str) -> String {
                 result.push_str(&format!(
                     "{context}{host_attr} {scoped_rest}, {context} {host_attr} {scoped_rest}"
                 ));
-            } else if sel.starts_with(":host") {
-                let rest = sel[":host".len()..].trim();
+            } else if let Some(stripped) = sel.strip_prefix(":host") {
+                let rest = stripped.trim();
                 if rest.is_empty() {
                     result.push_str(host_attr);
                 } else if rest.starts_with('(') {
-                    let inner = rest
-                        .trim_start_matches('(')
-                        .trim_end_matches(')')
-                        .trim();
+                    let inner = rest.trim_start_matches('(').trim_end_matches(')').trim();
                     result.push_str(&format!("{inner}{host_attr}"));
                 } else {
                     result.push_str(&format!("{host_attr} {rest}"));
@@ -2369,6 +2363,95 @@ fn compile_event_handler(handler: &str, locals: &BTreeSet<String>) -> String {
 }
 
 /// Escape a string for use inside a single-quoted JavaScript string literal.
+/// Count sequential binding slots in the update block.
+/// These are consumed by nextBindingIndex() at runtime.
+fn count_sequential_bindings(update: &[String]) -> u32 {
+    let mut count: u32 = 0;
+    for instr in update {
+        // textInterpolate, textInterpolate1 = 1 binding each
+        if instr.contains("textInterpolate") {
+            count += 1;
+        }
+        // property, attribute = 1 binding each
+        if instr.contains("\u{0275}\u{0275}property(")
+            || instr.contains("\u{0275}\u{0275}attribute(")
+        {
+            count += 1;
+        }
+        // conditional = 1 binding
+        if instr.contains("\u{0275}\u{0275}conditional(") {
+            count += 1;
+        }
+        // classProp, styleProp = 1 binding each
+        if instr.contains("\u{0275}\u{0275}classProp(")
+            || instr.contains("\u{0275}\u{0275}styleProp(")
+        {
+            count += 1;
+        }
+        // repeater = 1 binding
+        if instr.contains("\u{0275}\u{0275}repeater(") {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Count total pipe binding slots used in the update block.
+fn count_pipe_binding_slots(update: &[String]) -> u32 {
+    let mut total: u32 = 0;
+    for instr in update {
+        // pipeBind1 = 2 slots, pipeBind2 = 3, pipeBind3 = 4
+        for (name, slots) in [("pipeBind1", 2), ("pipeBind2", 3), ("pipeBind3", 4)] {
+            let count = instr.matches(name).count() as u32;
+            total += count * slots;
+        }
+    }
+    total
+}
+
+/// Rewrite pipe offset parameters in an update instruction.
+/// Adds `seq_bindings` to each pipe's second parameter (the offset).
+fn rewrite_pipe_offsets(instr: &str, seq_bindings: u32) -> String {
+    let mut result = instr.to_string();
+    // Find all pipeBind*( patterns and shift their offset parameter
+    for prefix in [
+        "\u{0275}\u{0275}pipeBind1(",
+        "\u{0275}\u{0275}pipeBind2(",
+        "\u{0275}\u{0275}pipeBind3(",
+        "\u{0275}\u{0275}pipeBindV(",
+    ] {
+        let mut search_from = 0;
+        while let Some(start) = result[search_from..].find(prefix) {
+            let abs_start = search_from + start + prefix.len();
+            // Skip first arg (pipe slot)
+            let comma1 = match result[abs_start..].find(',') {
+                Some(i) => abs_start + i + 1,
+                None => break,
+            };
+            // Find the second arg (offset) — it's a number
+            let trimmed = result[comma1..].trim_start();
+            let offset_start = comma1 + (result[comma1..].len() - trimmed.len());
+            let offset_end = result[offset_start..]
+                .find(|c: char| !c.is_ascii_digit())
+                .map(|i| offset_start + i)
+                .unwrap_or(result.len());
+            if offset_start < offset_end {
+                if let Ok(current_offset) = result[offset_start..offset_end].parse::<u32>() {
+                    let new_offset = current_offset + seq_bindings;
+                    result = format!(
+                        "{}{}{}",
+                        &result[..offset_start],
+                        new_offset,
+                        &result[offset_end..]
+                    );
+                }
+            }
+            search_from = offset_start + 1;
+        }
+    }
+    result
+}
+
 fn escape_js_string(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('\'', "\\'")
@@ -2397,6 +2480,7 @@ mod tests {
             angular_core_import_span: None,
             other_angular_core_imports: Vec::new(),
             styles_source: None,
+            input_properties: Vec::new(),
         }
     }
 

@@ -135,7 +135,7 @@ pub fn build_chunk_graph(
     }
 
     // Group shared modules by their consumer set
-    let mut shared_groups: HashMap<BTreeSet<NodeIndex>, Vec<NodeIndex>> = HashMap::new();
+    let shared_groups: HashMap<BTreeSet<NodeIndex>, Vec<NodeIndex>> = HashMap::new();
     let mut lazy_exclusive: HashMap<NodeIndex, Vec<NodeIndex>> = HashMap::new();
 
     for (&module, consumers) in &module_consumers {
@@ -366,8 +366,8 @@ fn toposort_subset_with_cycles(
     // is non-deterministic (depends on node insertion order that can vary
     // between builds/environments).
     let cond_order = {
-        use std::collections::BinaryHeap;
         use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
         let mut in_degree: HashMap<NodeIndex, usize> = HashMap::new();
         for node in cond.node_indices() {
             in_degree.entry(node).or_insert(0);
@@ -585,8 +585,8 @@ mod tests {
         )
         .expect("should build chunk graph");
 
-        // Should have: main + 2 lazy + 1 shared = 4 chunks
-        assert_eq!(result.chunks.len(), 4);
+        // Should have: main + 2 lazy = 3 chunks (shared module goes to main)
+        assert_eq!(result.chunks.len(), 3);
         assert_eq!(
             result
                 .chunks
@@ -603,22 +603,14 @@ mod tests {
                 .count(),
             2
         );
-        assert_eq!(
-            result
-                .chunks
-                .iter()
-                .filter(|c| c.kind == ChunkKind::Shared)
-                .count(),
-            1
-        );
 
-        // Shared chunk should contain the shared module
-        let shared_chunk = result
+        // Main chunk should contain the shared module
+        let main_chunk = result
             .chunks
             .iter()
-            .find(|c| c.kind == ChunkKind::Shared)
-            .expect("should have shared chunk");
-        assert!(shared_chunk
+            .find(|c| c.kind == ChunkKind::Main)
+            .expect("should have main chunk");
+        assert!(main_chunk
             .modules
             .iter()
             .any(|m| m.to_str().unwrap_or("").contains("shared.service")));

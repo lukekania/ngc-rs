@@ -23,9 +23,8 @@ static FROM_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// multiple lines (e.g. `import {\n  x,\n  y\n} from "mod"`).
 /// Uses `[^;]*?` which in Rust regex matches newlines, preventing
 /// cross-statement false matches.
-static MULTILINE_FROM_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"\}\s+from\s+['"]([^'"]+)['"]"#).expect("valid regex")
-});
+static MULTILINE_FROM_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"\}\s+from\s+['"]([^'"]+)['"]"#).expect("valid regex"));
 
 static SIDE_EFFECT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?m)^\s*import\s+['"]([^'"]+)['"]"#).expect("valid regex"));
