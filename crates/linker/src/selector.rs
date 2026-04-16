@@ -218,4 +218,14 @@ mod tests {
             "[['', 'ngModel', '', 3, 'formControlName', '', 3, 'formControl', '']]"
         );
     }
+
+    #[test]
+    fn test_not_with_value_and_multiple_attrs() {
+        // RequiredValidator selector:
+        // :not([type=checkbox])[required][formControlName]
+        assert_eq!(
+            parse_selector(":not([type=checkbox])[required][formControlName]"),
+            "[['', 3, 'type', 'checkbox', 'required', '', 'formControlName', '']]"
+        );
+    }
 }
