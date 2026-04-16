@@ -67,12 +67,6 @@ where
     // Renamed exports: maps exported name → local name for `export { X as Y }` patterns.
     let mut renamed_exports: HashMap<String, String> = HashMap::new();
     let mut has_default_export = false;
-    // Lazy import mappings: local_name → "namespace.property" for inline replacement.
-    // Instead of generating `var X = __ns_Y.X;` (which breaks when modules are
-    // in a cycle and __ns_Y isn't populated yet), we replace all references to
-    // `X` with `__ns_Y.X` directly in the code.  This is lazy (evaluated at call
-    // time, not at module evaluation time), matching ESM live-binding semantics.
-    let mut import_rewrites: Vec<(String, String)> = Vec::new();
 
     for stmt in &parsed.program.body {
         if let Some(module_decl) = stmt.as_module_declaration() {
@@ -80,33 +74,39 @@ where
                 ModuleDeclaration::ImportDeclaration(import) => {
                     let source = import.source.value.as_str();
                     if let Some(target_ns) = resolve_import(source) {
-                        // Record mappings for lazy inline replacement
+                        // Rewrite import to namespace lookups
+                        let mut replacements = Vec::new();
                         if let Some(specifiers) = &import.specifiers {
                             for spec in specifiers {
                                 match spec {
                                     ImportDeclarationSpecifier::ImportSpecifier(s) => {
                                         let imported = s.imported.name();
-                                        let local = s.local.name.to_string();
-                                        import_rewrites
-                                            .push((local, format!("{target_ns}.{imported}")));
+                                        let local = &s.local.name;
+                                        replacements
+                                            .push(format!("var {local} = {target_ns}.{imported};"));
                                     }
                                     ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
-                                        let local = s.local.name.to_string();
-                                        import_rewrites
-                                            .push((local, format!("{target_ns}.default")));
+                                        let local = &s.local.name;
+                                        replacements
+                                            .push(format!("var {local} = {target_ns}.default;"));
                                     }
                                     ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => {
-                                        let local = s.local.name.to_string();
-                                        import_rewrites.push((local, target_ns.clone()));
+                                        let local = &s.local.name;
+                                        replacements.push(format!("var {local} = {target_ns};"));
                                     }
                                 }
                             }
                         }
-                        // Remove the import declaration entirely
+                        // Side-effect import: just remove (the target IIFE already ran)
+                        let replacement = if replacements.is_empty() {
+                            None
+                        } else {
+                            Some(replacements.join("\n"))
+                        };
                         edits.push(TextEdit {
                             start: import.span.start,
                             end: import.span.end,
-                            replacement: None,
+                            replacement,
                         });
                     } else {
                         // Truly external import — remove (will be hoisted)
@@ -234,45 +234,7 @@ where
     }
 
     // Apply edits
-    let mut module_code = apply_edits(js_code, &mut edits);
-
-    // Apply lazy import rewrites: replace `localName` with `__ns_Y.importedName`
-    // throughout the module body.  Process longer names first to avoid partial
-    // replacements (e.g. `formatDistance` before `format`).
-    import_rewrites.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
-    for (local, qualified) in &import_rewrites {
-        // Replace whole-word occurrences: the identifier must be bounded by
-        // non-identifier characters on both sides.
-        let mut result = String::with_capacity(module_code.len());
-        let mut remaining = module_code.as_str();
-        while let Some(pos) = remaining.find(local.as_str()) {
-            // Check character before match (must not be alphanumeric, _, or .)
-            let before_ok = if pos == 0 {
-                true
-            } else {
-                let ch = remaining.as_bytes()[pos - 1];
-                !ch.is_ascii_alphanumeric() && ch != b'_' && ch != b'.'
-            };
-            // Check character after match
-            let after_pos = pos + local.len();
-            let after_ok = if after_pos >= remaining.len() {
-                true
-            } else {
-                let ch = remaining.as_bytes()[after_pos];
-                !ch.is_ascii_alphanumeric() && ch != b'_'
-            };
-            if before_ok && after_ok {
-                result.push_str(&remaining[..pos]);
-                result.push_str(qualified);
-                remaining = &remaining[after_pos..];
-            } else {
-                result.push_str(&remaining[..after_pos]);
-                remaining = &remaining[after_pos..];
-            }
-        }
-        result.push_str(remaining);
-        module_code = result;
-    }
+    let module_code = apply_edits(js_code, &mut edits);
 
     // Build export assignments
     let mut export_lines = String::new();
@@ -486,17 +448,9 @@ mod tests {
             }
         };
         let result = wrap_npm_module(code, "test.js", "__ns_test", resolve).unwrap();
-        // Lazy inline replacement: Component → __ns_core.Component in usage
-        assert!(
-            result.wrapped_code.contains("extends __ns_core.Component"),
-            "expected inline replacement of Component"
-        );
-        assert!(
-            !result
-                .wrapped_code
-                .contains("var Component = __ns_core.Component;"),
-            "should NOT eagerly capture import"
-        );
+        assert!(result
+            .wrapped_code
+            .contains("var Component = __ns_core.Component;"));
         assert!(!result.wrapped_code.contains("from '@angular/core'"));
         assert!(result.wrapped_code.contains("__exports.MyClass = MyClass;"));
     }
