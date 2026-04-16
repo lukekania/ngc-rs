@@ -304,7 +304,9 @@ impl IvyCodegen {
             )
         });
 
-        // Static attributes for consts
+        // Static attributes for consts — include value-less (boolean/directive)
+        // attributes with an empty string so that directive selectors like
+        // `canvas[baseChart]` can match at runtime.
         let static_attrs: Vec<(&str, &str)> = el
             .attributes
             .iter()
@@ -313,24 +315,44 @@ impl IvyCodegen {
                     name,
                     value: Some(v),
                 } => Some((name.as_str(), v.as_str())),
+                TemplateAttribute::Static { name, value: None } => Some((name.as_str(), "")),
                 _ => None,
             })
             .collect();
 
+        // Collect property/class/style/attr binding names for the consts array.
+        // Angular uses AttributeMarker.Bindings (3) to mark binding attribute names
+        // so that directive matching can find directives by their input selectors.
+        let binding_names: Vec<&str> = el
+            .attributes
+            .iter()
+            .filter_map(|a| match a {
+                TemplateAttribute::Property { name, .. } => Some(name.as_str()),
+                TemplateAttribute::TwoWayBinding { name, .. } => Some(name.as_str()),
+                TemplateAttribute::ClassBinding { class_name, .. } => Some(class_name.as_str()),
+                TemplateAttribute::StyleBinding { property, .. } => Some(property.as_str()),
+                TemplateAttribute::AttrBinding { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        // Check if we need a consts entry (static attrs OR binding markers)
+        let has_consts = !static_attrs.is_empty() || !binding_names.is_empty();
+        let const_idx = if has_consts {
+            Some(self.register_const_with_bindings(&static_attrs, &binding_names))
+        } else {
+            None
+        };
+
         if el.is_void && !is_ng_container && !has_events {
-            let instr = if is_ng_container {
-                "\u{0275}\u{0275}elementContainer"
-            } else {
-                "\u{0275}\u{0275}element"
-            };
+            let instr = "\u{0275}\u{0275}element";
             self.ivy_imports.insert(instr.to_string());
-            if static_attrs.is_empty() {
+            if let Some(ci) = const_idx {
+                self.creation
+                    .push(format!("{instr}({slot}, '{}', {ci});", el.tag));
+            } else {
                 self.creation
                     .push(format!("{instr}({slot}, '{}');", el.tag));
-            } else {
-                let const_idx = self.register_const(&static_attrs);
-                self.creation
-                    .push(format!("{instr}({slot}, '{}', {const_idx});", el.tag));
             }
 
             // Bindings for void elements
@@ -347,21 +369,17 @@ impl IvyCodegen {
             self.ivy_imports.insert(start_instr.to_string());
             self.ivy_imports.insert(end_instr.to_string());
             if is_ng_container {
-                // ng-container has no DOM tag — only pass slot and optional consts index
-                if static_attrs.is_empty() {
-                    self.creation.push(format!("{start_instr}({slot});"));
+                if let Some(ci) = const_idx {
+                    self.creation.push(format!("{start_instr}({slot}, {ci});"));
                 } else {
-                    let const_idx = self.register_const(&static_attrs);
-                    self.creation
-                        .push(format!("{start_instr}({slot}, {const_idx});"));
+                    self.creation.push(format!("{start_instr}({slot});"));
                 }
-            } else if static_attrs.is_empty() {
+            } else if let Some(ci) = const_idx {
+                self.creation
+                    .push(format!("{start_instr}({slot}, '{}', {ci});", el.tag));
+            } else {
                 self.creation
                     .push(format!("{start_instr}({slot}, '{}');", el.tag));
-            } else {
-                let const_idx = self.register_const(&static_attrs);
-                self.creation
-                    .push(format!("{start_instr}({slot}, '{}', {const_idx});", el.tag));
             }
 
             // Event listeners and two-way binding listeners in creation block
@@ -1310,6 +1328,18 @@ impl IvyCodegen {
     /// Register a static attribute array in the `consts` table and return its index.
     fn register_const(&mut self, attrs: &[(&str, &str)]) -> usize {
         let formatted = format_static_attrs(attrs);
+        let idx = self.consts.len();
+        self.consts.push(formatted);
+        idx
+    }
+
+    /// Register a consts entry that includes both static attributes and binding markers.
+    fn register_const_with_bindings(
+        &mut self,
+        attrs: &[(&str, &str)],
+        binding_names: &[&str],
+    ) -> usize {
+        let formatted = format_attrs_with_bindings(attrs, binding_names);
         let idx = self.consts.len();
         self.consts.push(formatted);
         idx
@@ -2330,7 +2360,8 @@ fn get_root_element_info(
         match child {
             TemplateNode::Element(el) => {
                 let tag = el.tag.clone();
-                // Extract static attributes for the consts array
+                // Extract static attributes for the consts array — include
+                // value-less attributes with empty string for directive matching.
                 let static_attrs: Vec<(&str, &str)> = el
                     .attributes
                     .iter()
@@ -2339,6 +2370,9 @@ fn get_root_element_info(
                             name,
                             value: Some(v),
                         } => Some((name.as_str(), v.as_str())),
+                        crate::ast::TemplateAttribute::Static { name, value: None } => {
+                            Some((name.as_str(), ""))
+                        }
                         _ => None,
                     })
                     .collect();
@@ -2356,8 +2390,15 @@ fn get_root_element_info(
     (None, None)
 }
 
+/// Format a consts array entry with static attributes and optional binding markers.
+/// Angular's AttributeMarker.Bindings (3) marks binding attribute names for directive matching.
 fn format_static_attrs(attrs: &[(&str, &str)]) -> String {
-    let pairs: Vec<String> = attrs
+    format_attrs_with_bindings(attrs, &[])
+}
+
+/// Format a consts array entry with both static attributes and binding markers.
+fn format_attrs_with_bindings(attrs: &[(&str, &str)], binding_names: &[&str]) -> String {
+    let mut parts: Vec<String> = attrs
         .iter()
         .flat_map(|(k, v)| {
             vec![
@@ -2366,7 +2407,14 @@ fn format_static_attrs(attrs: &[(&str, &str)]) -> String {
             ]
         })
         .collect();
-    format!("[{}]", pairs.join(", "))
+    // Append AttributeMarker.Bindings (3) + binding attribute names
+    if !binding_names.is_empty() {
+        parts.push("3".to_string());
+        for name in binding_names {
+            parts.push(format!("'{}'", escape_js_string(name)));
+        }
+    }
+    format!("[{}]", parts.join(", "))
 }
 
 /// Compile an Angular event handler expression.
@@ -2776,5 +2824,38 @@ mod tests {
         );
         assert!(output.ivy_imports.contains("\u{0275}\u{0275}pipe"));
         assert!(output.ivy_imports.contains("\u{0275}\u{0275}pipeBind1"));
+    }
+
+    #[test]
+    fn test_valueless_attribute_included_in_consts() {
+        // Value-less attributes (e.g. `baseChart` on `<canvas baseChart>`)
+        // must appear in the consts array with an empty-string value so that
+        // directive selectors like `canvas[baseChart]` can match at runtime.
+        let comp = test_component();
+        let nodes = vec![TemplateNode::Element(ElementNode {
+            tag: "canvas".to_string(),
+            attributes: vec![TemplateAttribute::Static {
+                name: "baseChart".to_string(),
+                value: None,
+            }],
+            children: vec![],
+            is_void: false,
+        })];
+        let output = generate_ivy(&comp, &nodes).expect("should generate");
+        let dc = &output.static_fields[0];
+        // The consts array should contain the attribute pair
+        assert!(
+            output
+                .consts
+                .iter()
+                .any(|c| c.contains("'baseChart'") && c.contains("''")),
+            "consts should include valueless attribute: {:?}",
+            output.consts
+        );
+        // The elementStart call should reference a consts index
+        assert!(
+            dc.contains("elementStart(0, 'canvas', 0)"),
+            "elementStart should reference consts index for baseChart attr: {dc}"
+        );
     }
 }
