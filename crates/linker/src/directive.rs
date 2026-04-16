@@ -608,9 +608,13 @@ pub(crate) fn build_content_queries(
             "{cq}(directiveIndex, {}, {flags}{read_arg});",
             q.predicate
         ));
+        let assign_expr = if q.first {
+            format!("ctx.{} = _t.first", q.property_name)
+        } else {
+            format!("ctx.{} = _t", q.property_name)
+        };
         update_stmts.push(format!(
-            "let _t; {refresh}(_t = {load}()) && (ctx.{} = _t);",
-            q.property_name
+            "let _t; {refresh}(_t = {load}()) && ({assign_expr});"
         ));
     }
 
@@ -666,9 +670,13 @@ pub(crate) fn build_view_queries(
             String::new()
         };
         create_stmts.push(format!("{vq}({}, {flags}{read_arg});", q.predicate));
+        let assign_expr = if q.first {
+            format!("ctx.{} = _t.first", q.property_name)
+        } else {
+            format!("ctx.{} = _t", q.property_name)
+        };
         update_stmts.push(format!(
-            "let _t; {refresh}(_t = {load}()) && (ctx.{} = _t);",
-            q.property_name
+            "let _t; {refresh}(_t = {load}()) && ({assign_expr});"
         ));
     }
 
