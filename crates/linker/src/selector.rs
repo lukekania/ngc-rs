@@ -104,10 +104,62 @@ fn parse_single_selector(selector: &str) -> String {
                 items.push(format!("'{}'", class_name.trim()));
             }
             ':' => {
-                // Pseudo-selector (skip for now)
-                i += 1;
-                while i < chars.len() && chars[i] != ' ' && chars[i] != '[' && chars[i] != '.' {
+                // Check for :not() pseudo-selector
+                let remaining: String = chars[i..].iter().collect();
+                if remaining.starts_with(":not(") {
+                    i += 5; // skip ":not("
+                            // Parse the inner selector parts until ')'
+                    while i < chars.len() && chars[i] != ')' {
+                        if chars[i] == '[' {
+                            // :not([attr]) → emit SelectorFlags.NOT (4) + attr + value
+                            i += 1;
+                            let mut attr_name = String::new();
+                            let mut attr_value = String::new();
+                            let mut has_value = false;
+                            while i < chars.len() && chars[i] != ']' {
+                                if chars[i] == '=' {
+                                    has_value = true;
+                                    i += 1;
+                                    while i < chars.len() && chars[i] != ']' {
+                                        attr_value.push(chars[i]);
+                                        i += 1;
+                                    }
+                                } else {
+                                    attr_name.push(chars[i]);
+                                    i += 1;
+                                }
+                            }
+                            if i < chars.len() {
+                                i += 1; // skip ']'
+                            }
+                            // 4 = SelectorFlags.NOT — Angular uses this in v21+,
+                            // but some versions use 3 for NOT in selector context
+                            // (distinct from AttributeMarker.Bindings which is also 3
+                            // but used in a different array).  Angular 21 uses value 3.
+                            items.push("3".to_string());
+                            items.push(format!("'{}'", attr_name.trim()));
+                            items.push(format!(
+                                "'{}'",
+                                if has_value { attr_value.trim() } else { "" }
+                            ));
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    if i < chars.len() {
+                        i += 1; // skip ')'
+                    }
+                } else {
+                    // Other pseudo-selectors — skip
                     i += 1;
+                    while i < chars.len()
+                        && chars[i] != ' '
+                        && chars[i] != '['
+                        && chars[i] != '.'
+                        && chars[i] != ':'
+                    {
+                        i += 1;
+                    }
                 }
             }
             _ => {
@@ -156,6 +208,14 @@ mod tests {
         assert_eq!(
             parse_selector("button[type=submit]"),
             "[['button', 'type', 'submit']]"
+        );
+    }
+
+    #[test]
+    fn test_not_selector() {
+        assert_eq!(
+            parse_selector("[ngModel]:not([formControlName]):not([formControl])"),
+            "[['', 'ngModel', '', 3, 'formControlName', '', 3, 'formControl', '']]"
         );
     }
 }
