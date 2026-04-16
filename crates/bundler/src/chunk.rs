@@ -431,11 +431,19 @@ fn toposort_subset_with_cycles(
         } else {
             // For multi-node SCCs, do a local DFS post-order within the SCC
             // so that within-SCC dependencies are ordered as well as possible.
+            // Sort SCC nodes by path for deterministic iteration order
+            // (Tarjan's algorithm doesn't guarantee stable ordering).
             let scc_set: HashSet<NodeIndex> = scc.iter().copied().collect();
+            let mut sorted_scc: Vec<NodeIndex> = scc.to_vec();
+            sorted_scc.sort_by(|a, b| {
+                let pa = graph[sub[*a]].to_string_lossy();
+                let pb = graph[sub[*b]].to_string_lossy();
+                pa.cmp(&pb)
+            });
             let mut emitted = HashSet::new();
             let mut in_progress = HashSet::new();
             let mut local_order = Vec::new();
-            for &scc_node in scc {
+            for &scc_node in &sorted_scc {
                 scc_emit_deps_first(
                     &sub,
                     scc_node,
