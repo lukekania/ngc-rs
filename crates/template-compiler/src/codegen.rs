@@ -585,7 +585,8 @@ impl IvyCodegen {
         self.slot_index += 1;
         self.ivy_imports.insert("\u{0275}\u{0275}text".to_string());
 
-        let escaped = escape_js_string(&text.value);
+        let decoded = decode_html_entities(&text.value);
+        let escaped = escape_js_string(&decoded);
         self.creation
             .push(format!("\u{0275}\u{0275}text({slot}, '{escaped}');"));
     }
@@ -2494,6 +2495,64 @@ fn escape_js_string(s: &str) -> String {
         .replace('\'', "\\'")
         .replace('\n', "\\n")
         .replace('\r', "\\r")
+}
+
+/// Decode common HTML character entities to their Unicode equivalents.
+fn decode_html_entities(s: &str) -> String {
+    let mut result = s.to_string();
+    // Named entities (most common ones used in Angular templates)
+    let entities = [
+        ("&times;", "\u{00D7}"),
+        ("&amp;", "&"),
+        ("&lt;", "<"),
+        ("&gt;", ">"),
+        ("&quot;", "\""),
+        ("&apos;", "'"),
+        ("&nbsp;", "\u{00A0}"),
+        ("&laquo;", "\u{00AB}"),
+        ("&raquo;", "\u{00BB}"),
+        ("&mdash;", "\u{2014}"),
+        ("&ndash;", "\u{2013}"),
+        ("&hellip;", "\u{2026}"),
+        ("&copy;", "\u{00A9}"),
+        ("&reg;", "\u{00AE}"),
+        ("&trade;", "\u{2122}"),
+        ("&bull;", "\u{2022}"),
+        ("&larr;", "\u{2190}"),
+        ("&rarr;", "\u{2192}"),
+        ("&uarr;", "\u{2191}"),
+        ("&darr;", "\u{2193}"),
+        ("&check;", "\u{2713}"),
+        ("&cross;", "\u{2717}"),
+    ];
+    for (entity, ch) in entities {
+        result = result.replace(entity, ch);
+    }
+    // Numeric entities: &#NNN; and &#xHHH;
+    while let Some(start) = result.find("&#") {
+        let rest = &result[start + 2..];
+        if let Some(end) = rest.find(';') {
+            let num_str = &rest[..end];
+            let decoded = if let Some(hex) = num_str.strip_prefix('x') {
+                u32::from_str_radix(hex, 16).ok()
+            } else {
+                num_str.parse::<u32>().ok()
+            };
+            if let Some(cp) = decoded.and_then(char::from_u32) {
+                let mut buf = [0u8; 4];
+                let replacement = cp.encode_utf8(&mut buf);
+                result = format!(
+                    "{}{}{}",
+                    &result[..start],
+                    replacement,
+                    &result[start + 2 + end + 1..]
+                );
+                continue;
+            }
+        }
+        break; // malformed entity — stop processing
+    }
+    result
 }
 
 #[cfg(test)]
