@@ -333,6 +333,18 @@ fn toposort_subset_with_cycles(
     // Find SCCs using Kosaraju's algorithm
     let sccs = kosaraju_scc(&sub);
 
+    // Debug: log large SCCs
+    for (i, scc) in sccs.iter().enumerate() {
+        if scc.len() > 5 {
+            let paths: Vec<String> = scc
+                .iter()
+                .take(10)
+                .map(|&n| graph[sub[n]].to_string_lossy().to_string())
+                .collect();
+            tracing::debug!(scc_index = i, size = scc.len(), sample = ?paths, "large SCC detected");
+        }
+    }
+
     // Map each sub-node to its SCC index
     let mut node_to_scc: HashMap<NodeIndex, usize> = HashMap::new();
     for (scc_idx, scc) in sccs.iter().enumerate() {
@@ -438,17 +450,7 @@ fn toposort_subset_with_cycles(
             sorted_scc.sort_by(|a, b| {
                 let pa = graph[sub[*a]].to_string_lossy();
                 let pb = graph[sub[*b]].to_string_lossy();
-                // Barrel/index files go LAST — they only re-export from other
-                // modules and don't define values needed at evaluation time.
-                // Starting DFS from them causes re-export edges to be followed
-                // before direct dependency edges, leading to use-before-define.
-                let a_barrel = pa.ends_with("/index.js")
-                    || pa.ends_with("/index.mjs")
-                    || pa.ends_with("/index.ts");
-                let b_barrel = pb.ends_with("/index.js")
-                    || pb.ends_with("/index.mjs")
-                    || pb.ends_with("/index.ts");
-                a_barrel.cmp(&b_barrel).then_with(|| pa.cmp(&pb))
+                pa.cmp(&pb)
             });
             let mut emitted = HashSet::new();
             let mut in_progress = HashSet::new();
