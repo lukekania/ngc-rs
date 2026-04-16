@@ -52,6 +52,11 @@ struct IvyCodegen {
     /// Last slot index emitted in the update block (for computing `ɵɵadvance` deltas).
     /// `None` means no advance has been emitted yet (runtime starts at selectedIndex=-1).
     last_update_slot: Option<u32>,
+    /// Separate counter for pipe binding offsets.  Pipe bindings must be packed
+    /// contiguously after all sequential bindings in the LView binding array.
+    /// This counter tracks the pipe-relative offset (0, 2, 5, …) which
+    /// `rewrite_pipe_offsets` later shifts by the sequential binding count.
+    pipe_var_offset: u32,
 }
 
 struct ChildTemplate {
@@ -81,6 +86,7 @@ pub fn generate_ivy(
         local_vars: BTreeSet::new(),
         scope_stack: Vec::new(),
         last_update_slot: None,
+        pipe_var_offset: 0,
     };
 
     gen.ivy_imports
@@ -506,6 +512,7 @@ impl IvyCodegen {
     ) -> ChildTemplate {
         let parent_slot = self.slot_index;
         let parent_var = self.var_count;
+        let parent_pipe_offset = self.pipe_var_offset;
         let parent_last_update: Option<u32> = self.last_update_slot;
         let parent_creation = std::mem::take(&mut self.creation);
         let parent_update = std::mem::take(&mut self.update);
@@ -514,6 +521,7 @@ impl IvyCodegen {
 
         self.slot_index = 0;
         self.var_count = 0;
+        self.pipe_var_offset = 0;
         self.last_update_slot = None;
 
         self.generate_element(el);
@@ -557,6 +565,7 @@ impl IvyCodegen {
 
         self.slot_index = parent_slot;
         self.var_count = parent_var;
+        self.pipe_var_offset = parent_pipe_offset;
         self.last_update_slot = parent_last_update;
         self.creation = parent_creation;
         self.update = parent_update;
@@ -933,6 +942,7 @@ impl IvyCodegen {
         // so child template entries must accumulate in the same vec.
         let parent_slot = self.slot_index;
         let parent_var = self.var_count;
+        let parent_pipe_offset = self.pipe_var_offset;
         let parent_last_update: Option<u32> = self.last_update_slot;
         let parent_creation = std::mem::take(&mut self.creation);
         let parent_update = std::mem::take(&mut self.update);
@@ -941,6 +951,7 @@ impl IvyCodegen {
 
         self.slot_index = 0;
         self.var_count = 0;
+        self.pipe_var_offset = 0;
         self.last_update_slot = None;
         // Don't clear let_declarations, local_vars, or consts — children
         // inherit parent scope and share the component-level consts array.
@@ -1005,6 +1016,7 @@ impl IvyCodegen {
         self.scope_stack.pop();
         self.slot_index = parent_slot;
         self.var_count = parent_var;
+        self.pipe_var_offset = parent_pipe_offset;
         self.last_update_slot = parent_last_update;
         self.creation = parent_creation;
         self.update = parent_update;
@@ -1027,6 +1039,7 @@ impl IvyCodegen {
         // Save parent state (consts is NOT saved — shared component-level array)
         let parent_slot = self.slot_index;
         let parent_var = self.var_count;
+        let parent_pipe_offset = self.pipe_var_offset;
         let parent_last_update: Option<u32> = self.last_update_slot;
         let parent_creation = std::mem::take(&mut self.creation);
         let parent_update = std::mem::take(&mut self.update);
@@ -1034,6 +1047,7 @@ impl IvyCodegen {
 
         self.slot_index = 0;
         self.var_count = 0;
+        self.pipe_var_offset = 0;
         self.last_update_slot = None;
 
         // Register the @for item variable as a local so ctx_expr_with_locals()
@@ -1108,6 +1122,7 @@ impl IvyCodegen {
         self.scope_stack.pop();
         self.slot_index = parent_slot;
         self.var_count = parent_var;
+        self.pipe_var_offset = parent_pipe_offset;
         self.last_update_slot = parent_last_update;
         self.creation = parent_creation;
         self.update = parent_update;
@@ -1127,10 +1142,13 @@ impl IvyCodegen {
         for pipe in pipes {
             let pipe_slot = self.slot_index;
             self.slot_index += 1;
-            // Capture binding start BEFORE incrementing
-            let pipe_var_slot = self.var_count;
-            // Each pipe uses 2 + args binding slots: input + pure cache + extra args
-            self.var_count += 2 + pipe.args.len() as u32;
+            // Use the pipe-specific offset counter so pipe binding slots are
+            // contiguous (0, 2, 5, …).  rewrite_pipe_offsets later shifts these
+            // by the total sequential binding count.
+            let pipe_var_slot = self.pipe_var_offset;
+            let slots = 2 + pipe.args.len() as u32;
+            self.pipe_var_offset += slots;
+            self.var_count += slots;
 
             self.ivy_imports.insert("\u{0275}\u{0275}pipe".to_string());
             self.creation.push(format!(
