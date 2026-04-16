@@ -280,10 +280,42 @@ impl IvyCodegen {
                 );
                 self.child_counter += 1;
                 let child = self.generate_child_template(&fn_name, &el.children);
-                self.creation.push(format!(
-                    "\u{0275}\u{0275}template({slot}, {fn_name}, {}, {});",
-                    child.decls, child.vars
-                ));
+                // Collect static attributes for the ng-template (needed for directive
+                // matching, e.g. `<ng-template cdkPortalOutlet />`).
+                let tpl_attrs: Vec<(&str, &str)> = el
+                    .attributes
+                    .iter()
+                    .filter_map(|a| match a {
+                        TemplateAttribute::Static {
+                            name,
+                            value: Some(v),
+                        } => Some((name.as_str(), v.as_str())),
+                        TemplateAttribute::Static { name, value: None } => {
+                            Some((name.as_str(), ""))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let tpl_bindings: Vec<&str> = el
+                    .attributes
+                    .iter()
+                    .filter_map(|a| match a {
+                        TemplateAttribute::Property { name, .. } => Some(name.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if tpl_attrs.is_empty() && tpl_bindings.is_empty() {
+                    self.creation.push(format!(
+                        "\u{0275}\u{0275}template({slot}, {fn_name}, {}, {});",
+                        child.decls, child.vars
+                    ));
+                } else {
+                    let ci = self.register_const_with_bindings(&tpl_attrs, &tpl_bindings);
+                    self.creation.push(format!(
+                        "\u{0275}\u{0275}template({slot}, {fn_name}, {}, {}, 'ng-template', {ci});",
+                        child.decls, child.vars
+                    ));
+                }
                 self.child_templates.push(child);
                 return;
             }
