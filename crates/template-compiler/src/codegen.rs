@@ -295,11 +295,14 @@ impl IvyCodegen {
 
         let is_ng_container = el.tag == "ng-container";
 
-        // Check for event bindings (used for listener creation)
-        let _has_events = el
-            .attributes
-            .iter()
-            .any(|a| matches!(a, TemplateAttribute::Event { .. }));
+        // Check for event bindings — void elements with listeners need
+        // elementStart/elementEnd so ɵɵlistener() calls can be placed between them.
+        let has_events = el.attributes.iter().any(|a| {
+            matches!(
+                a,
+                TemplateAttribute::Event { .. } | TemplateAttribute::TwoWayBinding { .. }
+            )
+        });
 
         // Static attributes for consts
         let static_attrs: Vec<(&str, &str)> = el
@@ -314,7 +317,7 @@ impl IvyCodegen {
             })
             .collect();
 
-        if el.is_void && !is_ng_container {
+        if el.is_void && !is_ng_container && !has_events {
             let instr = if is_ng_container {
                 "\u{0275}\u{0275}elementContainer"
             } else {
