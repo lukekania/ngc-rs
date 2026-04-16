@@ -451,6 +451,7 @@ fn toposort_subset_with_cycles(
                     &mut emitted,
                     &mut in_progress,
                     &mut local_order,
+                    graph,
                 );
             }
             for sub_node in local_order {
@@ -474,6 +475,7 @@ fn scc_emit_deps_first(
     emitted: &mut HashSet<NodeIndex>,
     in_progress: &mut HashSet<NodeIndex>,
     order: &mut Vec<NodeIndex>,
+    graph: &DiGraph<std::path::PathBuf, crate::chunk::ImportKind>,
 ) {
     if emitted.contains(&node) {
         return;
@@ -482,11 +484,19 @@ fn scc_emit_deps_first(
         // Cycle detected — break it by skipping
         return;
     }
-    // Emit all in-SCC dependencies first
-    for neighbor in sub.neighbors(node) {
-        if scc_set.contains(&neighbor) && !emitted.contains(&neighbor) {
-            scc_emit_deps_first(sub, neighbor, scc_set, emitted, in_progress, order);
-        }
+    // Emit all in-SCC dependencies first.
+    // Sort neighbors by path for deterministic ordering across environments.
+    let mut neighbors: Vec<NodeIndex> = sub
+        .neighbors(node)
+        .filter(|n| scc_set.contains(n) && !emitted.contains(n))
+        .collect();
+    neighbors.sort_by(|a, b| {
+        let pa = graph[sub[*a]].to_string_lossy();
+        let pb = graph[sub[*b]].to_string_lossy();
+        pa.cmp(&pb)
+    });
+    for neighbor in neighbors {
+        scc_emit_deps_first(sub, neighbor, scc_set, emitted, in_progress, order, graph);
     }
     in_progress.remove(&node);
     if emitted.insert(node) {
