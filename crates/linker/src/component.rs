@@ -166,6 +166,24 @@ pub fn transform(
         props.push(format!("changeDetection: {cd}"));
     }
 
+    // Content queries
+    if let Some(queries) = metadata::get_source_text(obj, "queries", source) {
+        if let Some(content_queries_fn) =
+            crate::directive::build_content_queries(queries, ng_import, source, obj)
+        {
+            props.push(format!("contentQueries: {content_queries_fn}"));
+        }
+    }
+
+    // View queries
+    if let Some(view_queries) = metadata::get_source_text(obj, "viewQueries", source) {
+        if let Some(view_query_fn) =
+            crate::directive::build_view_queries(view_queries, ng_import, source, obj)
+        {
+            props.push(format!("viewQuery: {view_query_fn}"));
+        }
+    }
+
     let define_call = format!("{define_fn}({{ {} }})", props.join(", "));
 
     // If the template produced child template functions (e.g. for @if/@for blocks),
