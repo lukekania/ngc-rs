@@ -363,7 +363,13 @@ impl IvyCodegen {
             .attributes
             .iter()
             .filter_map(|a| match a {
-                TemplateAttribute::Property { name, .. } if name != "class" && name != "style" => {
+                TemplateAttribute::Property { name, .. }
+                    if name != "class"
+                        && name != "style"
+                        && !name.starts_with("attr.")
+                        && !name.starts_with("style.")
+                        && !name.starts_with("class.") =>
+                {
                     Some(name.as_str())
                 }
                 TemplateAttribute::TwoWayBinding { name, .. } => Some(name.as_str()),
@@ -1526,6 +1532,33 @@ impl IvyCodegen {
                             .insert("\u{0275}\u{0275}styleMap".to_string());
                         self.update
                             .push(format!("\u{0275}\u{0275}styleMap({compiled});"));
+                        self.var_count += 2;
+                    } else if let Some(attr_name) = name.strip_prefix("attr.") {
+                        // [attr.X]="expr" → ɵɵattribute('X', expr)
+                        self.ivy_imports
+                            .insert("\u{0275}\u{0275}attribute".to_string());
+                        self.update.push(format!(
+                            "\u{0275}\u{0275}attribute('{}', {compiled});",
+                            attr_name
+                        ));
+                        self.var_count += 1;
+                    } else if let Some(style_prop) = name.strip_prefix("style.") {
+                        // [style.X]="expr" → ɵɵstyleProp('X', expr)
+                        self.ivy_imports
+                            .insert("\u{0275}\u{0275}styleProp".to_string());
+                        self.update.push(format!(
+                            "\u{0275}\u{0275}styleProp('{}', {compiled});",
+                            style_prop
+                        ));
+                        self.var_count += 2;
+                    } else if let Some(class_name) = name.strip_prefix("class.") {
+                        // [class.X]="expr" → ɵɵclassProp('X', expr)
+                        self.ivy_imports
+                            .insert("\u{0275}\u{0275}classProp".to_string());
+                        self.update.push(format!(
+                            "\u{0275}\u{0275}classProp('{}', {compiled});",
+                            class_name
+                        ));
                         self.var_count += 2;
                     } else {
                         self.ivy_imports
