@@ -153,9 +153,11 @@ pub fn extract_component(source: &str, file_path: &Path) -> NgcResult<Option<Ext
         let mut input_properties = Vec::new();
         for member in &class.body.body {
             if let oxc_ast::ast::ClassElement::PropertyDefinition(prop) = member {
-                if prop.decorators.iter().any(|d| {
-                    find_decorator_by_name(std::slice::from_ref(d), "Input").is_some()
-                }) {
+                if prop
+                    .decorators
+                    .iter()
+                    .any(|d| find_decorator_by_name(std::slice::from_ref(d), "Input").is_some())
+                {
                     if let oxc_ast::ast::PropertyKey::StaticIdentifier(id) = &prop.key {
                         input_properties.push(id.name.to_string());
                     }
