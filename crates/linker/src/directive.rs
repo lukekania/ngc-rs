@@ -569,7 +569,7 @@ fn collect_ctx_rewrites(
 ///
 /// Transforms: `[{ propertyName: "links", predicate: RouterLink, descendants: true }]`
 /// Into: `function(rf, ctx, directiveIndex) { if (rf & 1) { ɵɵcontentQuery(directiveIndex, RouterLink, 5); } if (rf & 2) { let _t; ɵɵqueryRefresh(_t = ɵɵloadQuery()) && (ctx.links = _t); } }`
-fn build_content_queries(
+pub(crate) fn build_content_queries(
     queries_source: &str,
     ng_import: &str,
     source: &str,
@@ -630,7 +630,7 @@ fn build_content_queries(
 }
 
 /// Build a `viewQuery` function from the declare-format `viewQueries` array.
-fn build_view_queries(
+pub(crate) fn build_view_queries(
     queries_source: &str,
     ng_import: &str,
     source: &str,
