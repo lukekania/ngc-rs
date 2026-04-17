@@ -373,6 +373,7 @@ impl IvyCodegen {
                     Some(name.as_str())
                 }
                 TemplateAttribute::TwoWayBinding { name, .. } => Some(name.as_str()),
+                TemplateAttribute::Event { name, .. } => Some(name.as_str()),
                 _ => None,
             })
             .collect();
