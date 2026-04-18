@@ -19,6 +19,13 @@ static FROM_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?:import|export)\s+.*?\s+from\s+['"]([^'"]+)['"]"#).expect("valid regex")
 });
 
+/// Multi-line import pattern: matches imports whose named bindings span
+/// multiple lines (e.g. `import {\n  x,\n  y\n} from "mod"`).
+/// Uses `[^;]*?` which in Rust regex matches newlines, preventing
+/// cross-statement false matches.
+static MULTILINE_FROM_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"\}\s+from\s+['"]([^'"]+)['"]"#).expect("valid regex"));
+
 static SIDE_EFFECT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?m)^\s*import\s+['"]([^'"]+)['"]"#).expect("valid regex"));
 
@@ -37,10 +44,27 @@ static REEXPORT_RE: LazyLock<Regex> =
 /// - `export * from 'specifier'`
 /// - `import('specifier')` (dynamic)
 pub fn scan_npm_imports(source: &str) -> Vec<ScannedNpmImport> {
+    // Strip comments before scanning to avoid false matches from
+    // import/export statements inside JSDoc examples (e.g.,
+    // `* import { foo } from 'bar'` inside a `/** ... */` block).
+    let stripped = strip_comments(source);
+    let source = &stripped;
     let mut imports = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
     for cap in FROM_RE.captures_iter(source) {
+        let spec = cap[1].to_string();
+        if seen.insert((spec.clone(), false)) {
+            imports.push(ScannedNpmImport {
+                specifier: spec,
+                is_dynamic: false,
+            });
+        }
+    }
+
+    // Catch multi-line imports that FROM_RE misses because `.*?` doesn't
+    // cross newlines.  Matches the closing `} from "specifier"` pattern.
+    for cap in MULTILINE_FROM_RE.captures_iter(source) {
         let spec = cap[1].to_string();
         if seen.insert((spec.clone(), false)) {
             imports.push(ScannedNpmImport {
@@ -81,6 +105,71 @@ pub fn scan_npm_imports(source: &str) -> Vec<ScannedNpmImport> {
     }
 
     imports
+}
+
+/// Strip single-line (`//`) and multi-line (`/* ... */`) comments from JS source.
+///
+/// Replaces comment content with spaces (preserving line count) so that
+/// regex-based import scanning doesn't match `import` statements inside
+/// JSDoc examples or commented-out code.
+fn strip_comments(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut result = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'/' && i + 1 < bytes.len() {
+            if bytes[i + 1] == b'/' {
+                // Single-line comment — skip to end of line
+                result.push(b' ');
+                result.push(b' ');
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    result.push(b' ');
+                    i += 1;
+                }
+            } else if bytes[i + 1] == b'*' {
+                // Multi-line comment — skip to */
+                result.push(b' ');
+                result.push(b' ');
+                i += 2;
+                while i < bytes.len() {
+                    if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                        result.push(b' ');
+                        result.push(b' ');
+                        i += 2;
+                        break;
+                    }
+                    // Preserve newlines for line-count accuracy
+                    if bytes[i] == b'\n' {
+                        result.push(b'\n');
+                    } else {
+                        result.push(b' ');
+                    }
+                    i += 1;
+                }
+            } else {
+                result.push(bytes[i]);
+                i += 1;
+            }
+        } else if bytes[i] == b'\'' || bytes[i] == b'"' || bytes[i] == b'`' {
+            // String literal — pass through without stripping
+            let quote = bytes[i];
+            result.push(quote);
+            i += 1;
+            while i < bytes.len() {
+                result.push(bytes[i]);
+                if bytes[i] == quote && (i == 0 || bytes[i - 1] != b'\\') {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+        } else {
+            result.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(result).unwrap_or_else(|_| source.to_string())
 }
 
 #[cfg(test)]
