@@ -34,8 +34,15 @@ pub fn get_string_prop(obj: &ObjectExpression<'_>, key: &str) -> Option<String> 
     for prop in &obj.properties {
         if let ObjectPropertyKind::ObjectProperty(p) = prop {
             if property_key_matches(&p.key, key) {
-                if let Expression::StringLiteral(s) = &p.value {
-                    return Some(s.value.to_string());
+                match &p.value {
+                    Expression::StringLiteral(s) => return Some(s.value.to_string()),
+                    Expression::TemplateLiteral(t) if t.expressions.is_empty() => {
+                        // Simple template literal with no interpolations (e.g. `hello`)
+                        if let Some(quasi) = t.quasis.first() {
+                            return Some(quasi.value.raw.to_string());
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
