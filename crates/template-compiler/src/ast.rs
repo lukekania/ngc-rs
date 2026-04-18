@@ -13,6 +13,8 @@ pub enum TemplateNode {
     ForBlock(ForBlockNode),
     /// An `@switch` / `@case` / `@default` control flow block.
     SwitchBlock(SwitchBlockNode),
+    /// An `@let` variable declaration.
+    LetDeclaration(LetDeclarationNode),
 }
 
 /// An HTML element node.
@@ -167,6 +169,15 @@ pub struct SwitchBlockNode {
     pub cases: Vec<CaseBranch>,
     /// Optional default branch.
     pub default_branch: Option<Vec<TemplateNode>>,
+}
+
+/// An `@let` variable declaration: `@let name = expression;`
+#[derive(Debug, Clone, PartialEq)]
+pub struct LetDeclarationNode {
+    /// The variable name (e.g. `_options`).
+    pub name: String,
+    /// The initializer expression (e.g. `options()`).
+    pub expression: String,
 }
 
 /// A `@case` branch.
