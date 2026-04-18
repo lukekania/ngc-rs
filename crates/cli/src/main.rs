@@ -387,6 +387,8 @@ fn run_build(
     if let Some(ref ap) = angular_project {
         if !ap.styles.is_empty() {
             let path = extract_global_styles(&ap.styles, &out_dir, &config_dir)?;
+            // Step 9b: Compile CSS with PostCSS + Tailwind (if available)
+            compile_css_with_postcss(&path, &config_dir);
             output_files.push(path);
         }
     }
@@ -626,9 +628,10 @@ fn resolve_css_imports(css: &str, project_root: &Path) -> String {
             }
         }
 
-        // Lines starting with @config or other directives we can't resolve: skip them
+        // Preserve @config directives — PostCSS/Tailwind needs them
         if trimmed.starts_with("@config") {
-            result.push_str(&format!("/* {trimmed} (skipped) */\n"));
+            result.push_str(line);
+            result.push('\n');
             continue;
         }
 
@@ -988,7 +991,64 @@ fn find_css_in_exports(
     None
 }
 
-/// Format byte count as human-readable string.
+/// Compile CSS with PostCSS + Tailwind CSS if `@tailwindcss/postcss` is installed.
+///
+/// Runs a small Node.js script that loads the PostCSS plugin and processes
+/// the concatenated CSS file in-place. This handles `@import "tailwindcss"`,
+/// `@layer`, `@theme` directives from Tailwind v4.
+fn compile_css_with_postcss(css_path: &Path, project_dir: &Path) {
+    // Check if @tailwindcss/postcss is available
+    let postcss_pkg = project_dir.join("node_modules/@tailwindcss/postcss");
+    if !postcss_pkg.is_dir() {
+        return;
+    }
+
+    let script = format!(
+        r#"
+const postcss = require('postcss');
+const tailwindcss = require('@tailwindcss/postcss');
+const fs = require('fs');
+const css = fs.readFileSync('{}', 'utf8');
+postcss([tailwindcss]).process(css, {{ from: 'src/styles.css' }}).then(result => {{
+    fs.writeFileSync('{}', result.css);
+}}).catch(err => {{
+    console.error('PostCSS error:', err.message);
+    process.exit(1);
+}});
+"#,
+        css_path.display(),
+        css_path.display()
+    );
+
+    let result = std::process::Command::new("node")
+        .arg("-e")
+        .arg(&script)
+        .current_dir(project_dir)
+        .output();
+
+    match result {
+        Ok(output) => {
+            if output.status.success() {
+                tracing::info!("compiled CSS with PostCSS + Tailwind");
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                eprintln!(
+                    "{} PostCSS compilation failed: {}",
+                    "Warning:".yellow().bold(),
+                    stderr.trim()
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "{} could not run node for PostCSS: {}",
+                "Warning:".yellow().bold(),
+                e
+            );
+        }
+    }
+}
+
 fn format_bytes(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
@@ -1026,19 +1086,14 @@ fn transform_with_fallback(
                         path.display(),
                         e
                     );
-                    let original = std::fs::read_to_string(path).map_err(|e| NgcError::Io {
-                        path: path.clone(),
-                        source: e,
-                    })?;
-                    let (code, source_map) = ngc_ts_transform::transform_source_with_map(
-                        &original,
-                        &file_name,
-                        generate_source_maps,
-                    )?;
+                    // The compiled source (with AOT ɵcmp metadata) failed to
+                    // transform. Emit it as-is — the bundler uses SourceType::tsx()
+                    // and can handle remaining TS annotations. Preserving the AOT
+                    // metadata is critical to avoid JIT compilation at runtime.
                     Ok(ngc_ts_transform::TransformedModule {
                         source_path: path.clone(),
-                        code,
-                        source_map,
+                        code: source.clone(),
+                        source_map: None,
                     })
                 }
             }
