@@ -94,7 +94,24 @@ pub fn build_chunk_graph(
     }
 
     // Step 2: Compute static-only reachability from main entry
-    let main_reachable = static_reachable(graph, *entry_idx);
+    let mut main_reachable = static_reachable(graph, *entry_idx);
+
+    // Force npm modules that are reachable from ANY entry point (main or split)
+    // into the main chunk.  The bundler's IIFE wrapping and namespace system
+    // only operates on the main chunk — npm modules that end up in lazy/shared
+    // chunks would be silently omitted, producing missing cross-chunk exports.
+    // We compute full reachability (all edge types) from the main entry to find
+    // all npm modules the app actually uses, excluding unreachable npm modules
+    // (e.g. test-only packages discovered by scanning non-entry files).
+    let all_reachable = all_reachable(graph, *entry_idx);
+    for idx in all_reachable {
+        if graph[idx]
+            .components()
+            .any(|c| c.as_os_str() == "node_modules")
+        {
+            main_reachable.insert(idx);
+        }
+    }
 
     // Step 3: Compute static-only reachability from each split point
     let mut split_reachable: HashMap<NodeIndex, HashSet<NodeIndex>> = HashMap::new();
@@ -118,7 +135,7 @@ pub fn build_chunk_graph(
     }
 
     // Group shared modules by their consumer set
-    let mut shared_groups: HashMap<BTreeSet<NodeIndex>, Vec<NodeIndex>> = HashMap::new();
+    let shared_groups: HashMap<BTreeSet<NodeIndex>, Vec<NodeIndex>> = HashMap::new();
     let mut lazy_exclusive: HashMap<NodeIndex, Vec<NodeIndex>> = HashMap::new();
 
     for (&module, consumers) in &module_consumers {
@@ -126,10 +143,11 @@ pub fn build_chunk_graph(
             let sp = *consumers.iter().next().expect("consumer set is non-empty");
             lazy_exclusive.entry(sp).or_default().push(module);
         } else {
-            shared_groups
-                .entry(consumers.clone())
-                .or_default()
-                .push(module);
+            // Modules needed by multiple lazy chunks go to the main chunk
+            // so they can be exported via `./main.js` cross-chunk imports.
+            // Putting them in separate shared chunks would require cross-chunk
+            // import resolution between non-main chunks, which isn't supported yet.
+            main_reachable.insert(module);
         }
     }
 
@@ -217,6 +235,23 @@ pub fn build_chunk_graph(
     })
 }
 
+/// Compute the set of nodes reachable from `start` following all edge types.
+fn all_reachable(graph: &DiGraph<PathBuf, ImportKind>, start: NodeIndex) -> HashSet<NodeIndex> {
+    let mut visited = HashSet::new();
+    let mut stack = vec![start];
+
+    while let Some(node) = stack.pop() {
+        if !visited.insert(node) {
+            continue;
+        }
+        for neighbor in graph.neighbors(node) {
+            stack.push(neighbor);
+        }
+    }
+
+    visited
+}
+
 /// Compute the set of nodes reachable from `start` following only static edges.
 fn static_reachable(graph: &DiGraph<PathBuf, ImportKind>, start: NodeIndex) -> HashSet<NodeIndex> {
     let mut visited = HashSet::new();
@@ -260,46 +295,225 @@ fn toposort_subset(
     _start: NodeIndex,
     subset: &HashSet<NodeIndex>,
 ) -> NgcResult<Vec<NodeIndex>> {
-    // Try strict toposort first
-    match petgraph::algo::toposort(graph, None) {
-        Ok(topo) => {
-            let mut ordered: Vec<NodeIndex> = topo
-                .into_iter()
-                .filter(|idx| subset.contains(idx))
-                .collect();
-            ordered.reverse();
-            Ok(ordered)
-        }
-        Err(_) => {
-            // Graph has cycles (common with npm packages) — use DFS post-order
-            // which gives a valid ordering even with cycles
-            let mut visited = HashSet::new();
-            let mut order = Vec::new();
-            for &node in subset {
-                dfs_postorder(graph, node, subset, &mut visited, &mut order);
-            }
-            Ok(order)
-        }
-    }
+    // Always build a subgraph of the subset nodes and sort that.
+    // Filtering a global toposort is incorrect: the global order may
+    // interleave non-subset nodes that cause two subset nodes to appear
+    // in the wrong relative order.
+    toposort_subset_with_cycles(graph, subset)
 }
 
-/// DFS post-order traversal for cycle-tolerant topological sorting.
-fn dfs_postorder(
+/// Topological sort of a subset that may contain cycles.
+///
+/// Builds a subgraph of the subset nodes, condenses SCCs into single nodes
+/// (creating a DAG), toposorts the DAG, then expands SCCs back into their
+/// constituent nodes.  Within each SCC, nodes are ordered by DFS post-order.
+fn toposort_subset_with_cycles(
     graph: &DiGraph<PathBuf, ImportKind>,
-    node: NodeIndex,
     subset: &HashSet<NodeIndex>,
-    visited: &mut HashSet<NodeIndex>,
-    order: &mut Vec<NodeIndex>,
-) {
-    if !visited.insert(node) {
-        return;
+) -> NgcResult<Vec<NodeIndex>> {
+    use petgraph::algo::kosaraju_scc;
+
+    // Build a subgraph containing only subset nodes
+    let mut sub = DiGraph::<NodeIndex, ()>::new();
+    let mut orig_to_sub: HashMap<NodeIndex, NodeIndex> = HashMap::new();
+
+    for &node in subset {
+        let sub_node = sub.add_node(node);
+        orig_to_sub.insert(node, sub_node);
     }
-    for neighbor in graph.neighbors(node) {
-        if subset.contains(&neighbor) {
-            dfs_postorder(graph, neighbor, subset, visited, order);
+    for &node in subset {
+        let sub_from = orig_to_sub[&node];
+        for neighbor in graph.neighbors(node) {
+            if let Some(&sub_to) = orig_to_sub.get(&neighbor) {
+                sub.add_edge(sub_from, sub_to, ());
+            }
         }
     }
-    order.push(node);
+
+    // Find SCCs using Kosaraju's algorithm
+    let sccs = kosaraju_scc(&sub);
+
+    // Debug: log large SCCs
+    for (i, scc) in sccs.iter().enumerate() {
+        if scc.len() > 5 {
+            let paths: Vec<String> = scc
+                .iter()
+                .take(10)
+                .map(|&n| graph[sub[n]].to_string_lossy().to_string())
+                .collect();
+            tracing::debug!(scc_index = i, size = scc.len(), sample = ?paths, "large SCC detected");
+        }
+    }
+
+    // Map each sub-node to its SCC index
+    let mut node_to_scc: HashMap<NodeIndex, usize> = HashMap::new();
+    for (scc_idx, scc) in sccs.iter().enumerate() {
+        for &sub_node in scc {
+            node_to_scc.insert(sub_node, scc_idx);
+        }
+    }
+
+    // Build condensation DAG: each SCC becomes a single node
+    let mut cond = DiGraph::<usize, ()>::new();
+    let mut scc_to_cond: HashMap<usize, NodeIndex> = HashMap::new();
+    for i in 0..sccs.len() {
+        let cond_node = cond.add_node(i);
+        scc_to_cond.insert(i, cond_node);
+    }
+    let mut cond_edges_seen: HashSet<(usize, usize)> = HashSet::new();
+    for edge in sub.edge_indices() {
+        if let Some((from, to)) = sub.edge_endpoints(edge) {
+            let scc_from = node_to_scc[&from];
+            let scc_to = node_to_scc[&to];
+            if scc_from != scc_to && cond_edges_seen.insert((scc_from, scc_to)) {
+                let cf = scc_to_cond[&scc_from];
+                let ct = scc_to_cond[&scc_to];
+                cond.add_edge(cf, ct, ());
+            }
+        }
+    }
+
+    // Deterministic toposort of the condensation DAG using Kahn's algorithm
+    // with path-based tie-breaking.  petgraph::algo::toposort uses DFS which
+    // is non-deterministic (depends on node insertion order that can vary
+    // between builds/environments).
+    let cond_order = {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let mut in_degree: HashMap<NodeIndex, usize> = HashMap::new();
+        for node in cond.node_indices() {
+            in_degree.entry(node).or_insert(0);
+            for neighbor in cond.neighbors(node) {
+                *in_degree.entry(neighbor).or_insert(0) += 1;
+            }
+        }
+        // Build a stable sort key for each condensation node using the
+        // smallest file path in the SCC. This ensures deterministic ordering
+        // regardless of graph insertion order or SCC numbering.
+        let mut cond_sort_key: HashMap<NodeIndex, String> = HashMap::new();
+        for cond_node in cond.node_indices() {
+            let scc_idx = cond[cond_node];
+            let scc = &sccs[scc_idx];
+            let min_path = scc
+                .iter()
+                .map(|&sub_node| {
+                    let orig_idx = sub[sub_node];
+                    graph[orig_idx].to_string_lossy().to_string()
+                })
+                .min()
+                .unwrap_or_default();
+            cond_sort_key.insert(cond_node, min_path);
+        }
+        let mut queue: BinaryHeap<Reverse<(String, NodeIndex)>> = BinaryHeap::new();
+        for (&node, &deg) in &in_degree {
+            if deg == 0 {
+                let key = cond_sort_key.get(&node).cloned().unwrap_or_default();
+                queue.push(Reverse((key, node)));
+            }
+        }
+        let mut order = Vec::new();
+        while let Some(Reverse((_, node))) = queue.pop() {
+            order.push(node);
+            for neighbor in cond.neighbors(node) {
+                let deg = in_degree.get_mut(&neighbor).expect("node in graph");
+                *deg -= 1;
+                if *deg == 0 {
+                    let key = cond_sort_key.get(&neighbor).cloned().unwrap_or_default();
+                    queue.push(Reverse((key, neighbor)));
+                }
+            }
+        }
+        if order.len() != cond.node_count() {
+            return Err(NgcError::ChunkError {
+                message: "condensation graph has a cycle (should be impossible)".into(),
+            });
+        }
+        order
+    };
+
+    // Expand: for each SCC in reverse toposort order (dependencies first),
+    // emit the nodes within the SCC.  Within each SCC, use DFS post-order
+    // on the subgraph to get the best possible internal ordering.
+    let mut result = Vec::with_capacity(subset.len());
+    for cond_node in cond_order.into_iter().rev() {
+        let scc_idx = cond[cond_node];
+        let scc = &sccs[scc_idx];
+        if scc.len() == 1 {
+            result.push(sub[scc[0]]);
+        } else {
+            // For multi-node SCCs, do a local DFS post-order within the SCC
+            // so that within-SCC dependencies are ordered as well as possible.
+            // Sort SCC nodes by path for deterministic iteration order
+            // (Tarjan's algorithm doesn't guarantee stable ordering).
+            let scc_set: HashSet<NodeIndex> = scc.iter().copied().collect();
+            let mut sorted_scc: Vec<NodeIndex> = scc.to_vec();
+            sorted_scc.sort_by(|a, b| {
+                let pa = graph[sub[*a]].to_string_lossy();
+                let pb = graph[sub[*b]].to_string_lossy();
+                pa.cmp(&pb)
+            });
+            let mut emitted = HashSet::new();
+            let mut in_progress = HashSet::new();
+            let mut local_order = Vec::new();
+            for &scc_node in &sorted_scc {
+                scc_emit_deps_first(
+                    &sub,
+                    scc_node,
+                    &scc_set,
+                    &mut emitted,
+                    &mut in_progress,
+                    &mut local_order,
+                    graph,
+                );
+            }
+            for sub_node in local_order {
+                result.push(sub[sub_node]);
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/// Emit SCC nodes in dependency-first order (best-effort for cycles).
+///
+/// For each unfinished node, first recursively emit all its unfinished
+/// in-SCC dependencies.  Back edges (cycles) are detected by tracking
+/// nodes currently on the recursion path.
+fn scc_emit_deps_first(
+    sub: &DiGraph<NodeIndex, ()>,
+    node: NodeIndex,
+    scc_set: &HashSet<NodeIndex>,
+    emitted: &mut HashSet<NodeIndex>,
+    in_progress: &mut HashSet<NodeIndex>,
+    order: &mut Vec<NodeIndex>,
+    graph: &DiGraph<std::path::PathBuf, crate::chunk::ImportKind>,
+) {
+    if emitted.contains(&node) {
+        return;
+    }
+    if !in_progress.insert(node) {
+        // Cycle detected — break it by skipping
+        return;
+    }
+    // Emit all in-SCC dependencies first.
+    // Sort neighbors by path for deterministic ordering across environments.
+    let mut neighbors: Vec<NodeIndex> = sub
+        .neighbors(node)
+        .filter(|n| scc_set.contains(n) && !emitted.contains(n))
+        .collect();
+    neighbors.sort_by(|a, b| {
+        let pa = graph[sub[*a]].to_string_lossy();
+        let pb = graph[sub[*b]].to_string_lossy();
+        pa.cmp(&pb)
+    });
+    for neighbor in neighbors {
+        scc_emit_deps_first(sub, neighbor, scc_set, emitted, in_progress, order, graph);
+    }
+    in_progress.remove(&node);
+    if emitted.insert(node) {
+        order.push(node);
+    }
 }
 
 /// Derive a chunk filename from a split point's file path.
@@ -401,8 +615,8 @@ mod tests {
         )
         .expect("should build chunk graph");
 
-        // Should have: main + 2 lazy + 1 shared = 4 chunks
-        assert_eq!(result.chunks.len(), 4);
+        // Should have: main + 2 lazy = 3 chunks (shared module goes to main)
+        assert_eq!(result.chunks.len(), 3);
         assert_eq!(
             result
                 .chunks
@@ -419,22 +633,14 @@ mod tests {
                 .count(),
             2
         );
-        assert_eq!(
-            result
-                .chunks
-                .iter()
-                .filter(|c| c.kind == ChunkKind::Shared)
-                .count(),
-            1
-        );
 
-        // Shared chunk should contain the shared module
-        let shared_chunk = result
+        // Main chunk should contain the shared module
+        let main_chunk = result
             .chunks
             .iter()
-            .find(|c| c.kind == ChunkKind::Shared)
-            .expect("should have shared chunk");
-        assert!(shared_chunk
+            .find(|c| c.kind == ChunkKind::Main)
+            .expect("should have main chunk");
+        assert!(main_chunk
             .modules
             .iter()
             .any(|m| m.to_str().unwrap_or("").contains("shared.service")));
@@ -526,5 +732,49 @@ mod tests {
             .modules
             .iter()
             .any(|m| m.to_str().unwrap_or("").contains("admin")));
+    }
+
+    #[test]
+    fn test_npm_modules_forced_to_main_chunk() {
+        // main --dynamic--> lazy_component --static--> node_modules/cdk/overlay.mjs
+        // The npm module is only reachable via a dynamic import, but it must
+        // still end up in the main chunk for IIFE wrapping and cross-chunk exports.
+        let mut graph = DiGraph::new();
+        let npm_mod = graph.add_node(make_path(
+            "/root/node_modules/@angular/cdk/fesm2022/overlay.mjs",
+        ));
+        let lazy = graph.add_node(make_path("/root/src/dialog/dialog.component.ts"));
+        let entry = graph.add_node(make_path("/root/src/main.ts"));
+
+        graph.add_edge(entry, lazy, ImportKind::Dynamic);
+        graph.add_edge(lazy, npm_mod, ImportKind::Static);
+
+        let result = build_chunk_graph(
+            &graph,
+            &make_path("/root/src/main.ts"),
+            Path::new("/root/src"),
+        )
+        .expect("should build chunk graph");
+
+        // npm module must be in the main chunk
+        let main_chunk = &result.chunks[0];
+        assert!(
+            main_chunk
+                .modules
+                .iter()
+                .any(|m| m.to_string_lossy().contains("node_modules")),
+            "npm module should be in main chunk"
+        );
+
+        // Lazy chunk must NOT contain the npm module
+        for chunk in result.chunks.iter().filter(|c| c.kind == ChunkKind::Lazy) {
+            assert!(
+                !chunk
+                    .modules
+                    .iter()
+                    .any(|m| m.to_string_lossy().contains("node_modules")),
+                "npm module should NOT be in lazy chunk"
+            );
+        }
     }
 }
