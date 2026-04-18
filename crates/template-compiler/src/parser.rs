@@ -54,6 +54,7 @@ fn parse_node(pair: pest::iterators::Pair<Rule>) -> NgcResult<Option<TemplateNod
         Rule::if_block => Ok(Some(parse_if_block(pair)?)),
         Rule::for_block => Ok(Some(parse_for_block(pair)?)),
         Rule::switch_block => Ok(Some(parse_switch_block(pair)?)),
+        Rule::let_block => Ok(Some(parse_let_block(pair)?)),
         Rule::node => {
             let inner = pair.into_inner().next();
             match inner {
@@ -471,6 +472,25 @@ fn parse_switch_block(pair: pest::iterators::Pair<Rule>) -> NgcResult<TemplateNo
     }))
 }
 
+/// Parse an `@let name = expression;` declaration.
+fn parse_let_block(pair: pest::iterators::Pair<Rule>) -> NgcResult<TemplateNode> {
+    let mut inner = pair.into_inner();
+
+    let name = inner
+        .next()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_default();
+
+    let expression = inner
+        .next()
+        .map(|p| p.as_str().trim().to_string())
+        .unwrap_or_default();
+
+    Ok(TemplateNode::LetDeclaration(
+        crate::ast::LetDeclarationNode { name, expression },
+    ))
+}
+
 /// Extract the text content from an expression pair, handling nested rules.
 fn extract_expression_text(pair: pest::iterators::Pair<Rule>) -> String {
     // For ctrl_expression and track_expression, the text comes from
@@ -652,5 +672,26 @@ mod tests {
             }
             _ => panic!("expected switch block"),
         }
+    }
+
+    #[test]
+    fn test_let_block() {
+        let nodes = parse("@let _options = options();");
+        assert_eq!(nodes.len(), 1);
+        match &nodes[0] {
+            TemplateNode::LetDeclaration(l) => {
+                assert_eq!(l.name, "_options");
+                assert_eq!(l.expression, "options()");
+            }
+            _ => panic!("expected let declaration"),
+        }
+    }
+
+    #[test]
+    fn test_let_with_if() {
+        let nodes = parse("@let x = value(); @if (x) { <p>yes</p> }");
+        assert_eq!(nodes.len(), 2);
+        assert!(matches!(&nodes[0], TemplateNode::LetDeclaration(_)));
+        assert!(matches!(&nodes[1], TemplateNode::IfBlock(_)));
     }
 }

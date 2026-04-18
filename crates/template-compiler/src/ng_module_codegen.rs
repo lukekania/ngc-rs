@@ -85,6 +85,7 @@ pub fn generate_ng_module_ivy(extracted: &ExtractedNgModule) -> NgcResult<IvyOut
         static_fields: vec![mod_code, inj_code],
         child_template_functions: Vec::new(),
         ivy_imports,
+        consts: Vec::new(),
     })
 }
 

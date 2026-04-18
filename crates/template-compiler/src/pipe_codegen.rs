@@ -60,6 +60,7 @@ pub fn generate_pipe_ivy(extracted: &ExtractedPipe) -> NgcResult<IvyOutput> {
         static_fields: vec![define_code],
         child_template_functions: Vec::new(),
         ivy_imports,
+        consts: Vec::new(),
     })
 }
 

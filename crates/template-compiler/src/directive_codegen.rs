@@ -78,6 +78,7 @@ pub fn generate_directive_ivy(extracted: &ExtractedDirective) -> NgcResult<IvyOu
         static_fields: vec![define_code],
         child_template_functions: Vec::new(),
         ivy_imports,
+        consts: Vec::new(),
     })
 }
 
