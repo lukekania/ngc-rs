@@ -119,10 +119,20 @@ pub fn build_define_call(
         props.push(format!("providers: {providers}"));
     }
 
-    // Queries: contentQueries and viewQuery require compilation from declare format
-    // (array of descriptors) to runtime format (functions with ɵɵcontentQuery/ɵɵviewQuery calls).
-    // Skipped for now — the raw array format crashes the Angular runtime.
-    // TODO: compile query descriptors to query functions
+    // Content queries: compile from declare format (array of descriptors) to runtime
+    // format (contentQueries function with ɵɵcontentQuery/ɵɵloadQuery/ɵɵqueryRefresh calls).
+    if let Some(queries) = metadata::get_source_text(obj, "queries", source) {
+        if let Some(content_queries_fn) = build_content_queries(queries, ng_import, source, obj) {
+            props.push(format!("contentQueries: {content_queries_fn}"));
+        }
+    }
+
+    // View queries: compile from declare format to runtime format.
+    if let Some(view_queries) = metadata::get_source_text(obj, "viewQueries", source) {
+        if let Some(view_query_fn) = build_view_queries(view_queries, ng_import, source, obj) {
+            props.push(format!("viewQuery: {view_query_fn}"));
+        }
+    }
 
     Ok(format!("{define_fn}({{ {} }})", props.join(", ")))
 }
@@ -246,20 +256,50 @@ pub fn build_host_bindings(
         attrs.push(format!("'{style_attr}'"));
     }
 
-    // Property bindings
+    // Property bindings — dispatch to the correct Ivy instruction based on property name
     if let Some(properties_obj) = metadata::get_object_prop(host_obj, "properties") {
         for prop in &properties_obj.properties {
             if let ObjectPropertyKind::ObjectProperty(p) = prop {
                 let key = prop_key_text(&p.key, source);
                 if let Expression::StringLiteral(s) = &p.value {
-                    let prop_fn = if ng_import.is_empty() {
-                        "\u{0275}\u{0275}hostProperty".to_string()
-                    } else {
-                        format!("{ng_import}.\u{0275}\u{0275}hostProperty")
-                    };
                     let expr = compile_host_expression(&s.value);
-                    binding_stmts.push(format!("{prop_fn}(\"{key}\", {expr})"));
-                    host_vars += 1;
+                    if let Some(style_prop) = key.strip_prefix("style.") {
+                        // style.X → ɵɵstyleProp (2 vars per style binding)
+                        let fn_name = if ng_import.is_empty() {
+                            "\u{0275}\u{0275}styleProp".to_string()
+                        } else {
+                            format!("{ng_import}.\u{0275}\u{0275}styleProp")
+                        };
+                        binding_stmts.push(format!("{fn_name}(\"{style_prop}\", {expr})"));
+                        host_vars += 2;
+                    } else if let Some(class_name) = key.strip_prefix("class.") {
+                        // class.X → ɵɵclassProp (2 vars per class binding)
+                        let fn_name = if ng_import.is_empty() {
+                            "\u{0275}\u{0275}classProp".to_string()
+                        } else {
+                            format!("{ng_import}.\u{0275}\u{0275}classProp")
+                        };
+                        binding_stmts.push(format!("{fn_name}(\"{class_name}\", {expr})"));
+                        host_vars += 2;
+                    } else if key == "class" {
+                        // class → ɵɵclassMap
+                        let fn_name = if ng_import.is_empty() {
+                            "\u{0275}\u{0275}classMap".to_string()
+                        } else {
+                            format!("{ng_import}.\u{0275}\u{0275}classMap")
+                        };
+                        binding_stmts.push(format!("{fn_name}({expr})"));
+                        host_vars += 2;
+                    } else {
+                        // Regular property → ɵɵproperty (1 var)
+                        let fn_name = if ng_import.is_empty() {
+                            "\u{0275}\u{0275}property".to_string()
+                        } else {
+                            format!("{ng_import}.\u{0275}\u{0275}property")
+                        };
+                        binding_stmts.push(format!("{fn_name}(\"{key}\", {expr})"));
+                        host_vars += 1;
+                    }
                 }
             }
         }
@@ -523,6 +563,213 @@ fn collect_ctx_rewrites(
             // For other expression types, leave as-is
         }
     }
+}
+
+/// Build a `contentQueries` function from the declare-format `queries` array.
+///
+/// Transforms: `[{ propertyName: "links", predicate: RouterLink, descendants: true }]`
+/// Into: `function(rf, ctx, directiveIndex) { if (rf & 1) { ɵɵcontentQuery(directiveIndex, RouterLink, 5); } if (rf & 2) { let _t; ɵɵqueryRefresh(_t = ɵɵloadQuery()) && (ctx.links = _t); } }`
+pub(crate) fn build_content_queries(
+    queries_source: &str,
+    ng_import: &str,
+    source: &str,
+    obj: &oxc_ast::ast::ObjectExpression<'_>,
+) -> Option<String> {
+    let queries = parse_query_descriptors(queries_source, source, obj)?;
+    if queries.is_empty() {
+        return None;
+    }
+
+    let (cq, refresh, load) = if ng_import.is_empty() {
+        (
+            "\u{0275}\u{0275}contentQuery".to_string(),
+            "\u{0275}\u{0275}queryRefresh".to_string(),
+            "\u{0275}\u{0275}loadQuery".to_string(),
+        )
+    } else {
+        (
+            format!("{ng_import}.\u{0275}\u{0275}contentQuery"),
+            format!("{ng_import}.\u{0275}\u{0275}queryRefresh"),
+            format!("{ng_import}.\u{0275}\u{0275}loadQuery"),
+        )
+    };
+
+    let mut create_stmts = Vec::new();
+    let mut update_stmts = Vec::new();
+
+    for q in &queries {
+        let flags = compute_query_flags(q);
+        let read_arg = if let Some(ref read) = q.read {
+            format!(", {read}")
+        } else {
+            String::new()
+        };
+        create_stmts.push(format!(
+            "{cq}(directiveIndex, {}, {flags}{read_arg});",
+            q.predicate
+        ));
+        let assign_expr = if q.first {
+            format!("ctx.{} = _t.first", q.property_name)
+        } else {
+            format!("ctx.{} = _t", q.property_name)
+        };
+        update_stmts.push(format!(
+            "let _t; {refresh}(_t = {load}()) && ({assign_expr});"
+        ));
+    }
+
+    let mut body = String::from("if (rf & 1) { ");
+    for s in &create_stmts {
+        body.push_str(s);
+        body.push(' ');
+    }
+    body.push_str("} if (rf & 2) { ");
+    for s in &update_stmts {
+        body.push_str(s);
+        body.push(' ');
+    }
+    body.push('}');
+
+    Some(format!("function(rf, ctx, directiveIndex) {{ {body} }}"))
+}
+
+/// Build a `viewQuery` function from the declare-format `viewQueries` array.
+pub(crate) fn build_view_queries(
+    queries_source: &str,
+    ng_import: &str,
+    source: &str,
+    obj: &oxc_ast::ast::ObjectExpression<'_>,
+) -> Option<String> {
+    let queries = parse_query_descriptors(queries_source, source, obj)?;
+    if queries.is_empty() {
+        return None;
+    }
+
+    let (vq, refresh, load) = if ng_import.is_empty() {
+        (
+            "\u{0275}\u{0275}viewQuery".to_string(),
+            "\u{0275}\u{0275}queryRefresh".to_string(),
+            "\u{0275}\u{0275}loadQuery".to_string(),
+        )
+    } else {
+        (
+            format!("{ng_import}.\u{0275}\u{0275}viewQuery"),
+            format!("{ng_import}.\u{0275}\u{0275}queryRefresh"),
+            format!("{ng_import}.\u{0275}\u{0275}loadQuery"),
+        )
+    };
+
+    let mut create_stmts = Vec::new();
+    let mut update_stmts = Vec::new();
+
+    for q in &queries {
+        let flags = compute_query_flags(q);
+        let read_arg = if let Some(ref read) = q.read {
+            format!(", {read}")
+        } else {
+            String::new()
+        };
+        create_stmts.push(format!("{vq}({}, {flags}{read_arg});", q.predicate));
+        let assign_expr = if q.first {
+            format!("ctx.{} = _t.first", q.property_name)
+        } else {
+            format!("ctx.{} = _t", q.property_name)
+        };
+        update_stmts.push(format!(
+            "let _t; {refresh}(_t = {load}()) && ({assign_expr});"
+        ));
+    }
+
+    let mut body = String::from("if (rf & 1) { ");
+    for s in &create_stmts {
+        body.push_str(s);
+        body.push(' ');
+    }
+    body.push_str("} if (rf & 2) { ");
+    for s in &update_stmts {
+        body.push_str(s);
+        body.push(' ');
+    }
+    body.push('}');
+
+    Some(format!("function(rf, ctx) {{ {body} }}"))
+}
+
+/// A parsed query descriptor.
+struct QueryDescriptor {
+    property_name: String,
+    predicate: String,
+    descendants: bool,
+    is_static: bool,
+    read: Option<String>,
+    first: bool,
+}
+
+/// Compute the flags integer for a query.
+fn compute_query_flags(q: &QueryDescriptor) -> u32 {
+    let mut flags: u32 = 0;
+    if q.descendants {
+        flags |= 1; // QueryFlags.descendants
+    }
+    if q.is_static {
+        flags |= 2; // QueryFlags.isStatic
+    }
+    if !q.first {
+        flags |= 4; // QueryFlags.emitDistinctChangesOnly (for QueryList)
+    }
+    flags
+}
+
+/// Parse query descriptors from the raw source text of the `queries` array.
+///
+/// Uses oxc to parse the array literal and extract each query's fields.
+fn parse_query_descriptors(
+    _queries_source: &str,
+    source: &str,
+    obj: &oxc_ast::ast::ObjectExpression<'_>,
+) -> Option<Vec<QueryDescriptor>> {
+    use oxc_ast::ast::*;
+
+    // Find the queries/viewQueries property
+    let queries_arr = obj.properties.iter().find_map(|p| {
+        if let ObjectPropertyKind::ObjectProperty(prop) = p {
+            let key_name = match &prop.key {
+                PropertyKey::StaticIdentifier(id) => Some(id.name.as_str()),
+                _ => None,
+            };
+            if key_name == Some("queries") || key_name == Some("viewQueries") {
+                if let Expression::ArrayExpression(arr) = &prop.value {
+                    return Some(arr.as_ref());
+                }
+            }
+        }
+        None
+    })?;
+
+    let mut descriptors = Vec::new();
+    for elem in &queries_arr.elements {
+        if let ArrayExpressionElement::ObjectExpression(desc_obj) = elem {
+            let property_name = metadata::get_string_prop(desc_obj, "propertyName")?;
+            let predicate = metadata::get_source_text(desc_obj, "predicate", source)
+                .unwrap_or("null")
+                .to_string();
+            let descendants = metadata::get_bool_prop(desc_obj, "descendants").unwrap_or(false);
+            let is_static = metadata::get_bool_prop(desc_obj, "static").unwrap_or(false);
+            let first = metadata::get_bool_prop(desc_obj, "first").unwrap_or(false);
+            let read = metadata::get_source_text(desc_obj, "read", source).map(|s| s.to_string());
+
+            descriptors.push(QueryDescriptor {
+                property_name,
+                predicate,
+                descendants,
+                is_static,
+                read,
+                first,
+            });
+        }
+    }
+
+    Some(descriptors)
 }
 
 #[cfg(test)]
