@@ -367,7 +367,7 @@ struct TextEdit {
 
 /// Apply text edits to source code.
 fn apply_edits(source: &str, edits: &mut [TextEdit]) -> String {
-    edits.sort_by(|a, b| b.start.cmp(&a.start));
+    edits.sort_by_key(|e| std::cmp::Reverse(e.start));
 
     let mut result = source.to_string();
     for edit in edits.iter() {
