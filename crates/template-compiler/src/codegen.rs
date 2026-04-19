@@ -2113,10 +2113,10 @@ fn collect_ctx_rewrites(
     }
 
     match expr {
-        Expression::Identifier(id) => {
-            if !is_member_property && !is_builtin(&id.name) && !is_local(&id.name) {
-                ctx_inserts.push(id.span.start);
-            }
+        Expression::Identifier(id)
+            if !is_member_property && !is_builtin(&id.name) && !is_local(&id.name) =>
+        {
+            ctx_inserts.push(id.span.start);
         }
         Expression::CallExpression(call) => {
             collect_ctx_rewrites(&call.callee, ctx_inserts, remove_ranges, false, locals);
