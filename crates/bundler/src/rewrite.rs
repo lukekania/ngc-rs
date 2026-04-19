@@ -296,18 +296,18 @@ fn collect_module_decl_edits(
                 }
             } // close else block for preserve_exports
         }
-        ModuleDeclaration::ExportAllDeclaration(export) => {
+        ModuleDeclaration::ExportAllDeclaration(export)
             if is_local(
                 export.source.value.as_str(),
                 local_prefixes,
                 bundled_specifiers,
-            ) {
-                edits.push(TextEdit {
-                    start: export.span.start,
-                    end: export.span.end,
-                    replacement: None,
-                });
-            }
+            ) =>
+        {
+            edits.push(TextEdit {
+                start: export.span.start,
+                end: export.span.end,
+                replacement: None,
+            });
         }
         _ => {}
     }
@@ -541,7 +541,7 @@ fn is_local(
 /// Apply text edits to the source, producing the rewritten code.
 fn apply_edits(source: &str, edits: &mut [TextEdit]) -> String {
     // Sort in reverse order so later edits don't shift earlier offsets
-    edits.sort_by(|a, b| b.start.cmp(&a.start));
+    edits.sort_by_key(|e| std::cmp::Reverse(e.start));
 
     let mut result = source.to_string();
     for edit in edits.iter() {
