@@ -427,7 +427,7 @@ fn compile_host_expression(expr: &str) -> String {
         .iter()
         .map(|(s, e)| (s - expr_offset, e - expr_offset))
         .collect();
-    sorted_removes.sort_by(|a, b| b.0.cmp(&a.0));
+    sorted_removes.sort_by_key(|e| std::cmp::Reverse(e.0));
     for (s, e) in &sorted_removes {
         let s = *s as usize;
         let e = *e as usize;
@@ -494,10 +494,8 @@ fn collect_ctx_rewrites(
     }
 
     match expr {
-        Expression::Identifier(id) => {
-            if !is_member_property && !is_builtin(&id.name) {
-                ctx_inserts.push(id.span.start);
-            }
+        Expression::Identifier(id) if !is_member_property && !is_builtin(&id.name) => {
+            ctx_inserts.push(id.span.start);
         }
         Expression::CallExpression(call) => {
             collect_ctx_rewrites(&call.callee, ctx_inserts, remove_ranges, false);

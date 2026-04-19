@@ -157,20 +157,19 @@ pub fn generate_ivy(
     dc.push_str(&template_body);
     dc.push_str("    }");
 
-    // For standalone components, use getComponentDepsFactory to resolve NgModule imports
-    // to their exported directives/pipes at runtime via the depsTracker.
-    // rawImports must be the direct array, not wrapped in a function.
+    // Resolve component dependencies. Angular's AOT compiler resolves NgModule
+    // imports to individual directive/pipe classes at build time.  ngc-rs sets
+    // the component's rawImports so Angular's standalone resolution pipeline
+    // handles NgModule expansion at runtime, then provides the raw imports as
+    // dependencies for directive/pipe matching.
     if let Some(ref imports_src) = component.imports_source {
-        if component.standalone {
-            gen.ivy_imports
-                .insert("\u{0275}\u{0275}getComponentDepsFactory".to_string());
-            dc.push_str(&format!(
-                ",\n    dependencies: \u{0275}\u{0275}getComponentDepsFactory({}, {imports_src})",
-                component.class_name
-            ));
-        } else {
-            dc.push_str(&format!(",\n    dependencies: () => {imports_src}"));
-        }
+        // Set rawImports on the component class for Angular's depsTracker
+        dc.push_str(&format!(
+            ",\n    dependencies: \u{0275}\u{0275}getComponentDepsFactory({}, {imports_src})",
+            component.class_name
+        ));
+        gen.ivy_imports
+            .insert("\u{0275}\u{0275}getComponentDepsFactory".to_string());
     }
     if let Some(ref styles_src) = component.styles_source {
         // Pre-scope CSS with %COMP% placeholders for Angular's emulated ViewEncapsulation.
@@ -359,10 +358,18 @@ impl IvyCodegen {
         // StyleBinding ([style.x]), or AttrBinding ([attr.x]) since those are handled
         // by built-in instructions and don't participate in directive matching.
         // Also exclude [class] and [style] which map to classMap/styleMap.
-        let binding_names: Vec<&str> = el
-            .attributes
-            .iter()
-            .filter_map(|a| match a {
+        // Angular emits event output names BEFORE input property names in the
+        // binding markers section.  Collect them in two passes to match ng build order.
+        let mut binding_names: Vec<&str> = Vec::new();
+        // Pass 1: event outputs
+        for a in &el.attributes {
+            if let TemplateAttribute::Event { name, .. } = a {
+                binding_names.push(name.as_str());
+            }
+        }
+        // Pass 2: property inputs and two-way bindings
+        for a in &el.attributes {
+            match a {
                 TemplateAttribute::Property { name, .. }
                     if name != "class"
                         && name != "style"
@@ -370,13 +377,14 @@ impl IvyCodegen {
                         && !name.starts_with("style.")
                         && !name.starts_with("class.") =>
                 {
-                    Some(name.as_str())
+                    binding_names.push(name.as_str());
                 }
-                TemplateAttribute::TwoWayBinding { name, .. } => Some(name.as_str()),
-                TemplateAttribute::Event { name, .. } => Some(name.as_str()),
-                _ => None,
-            })
-            .collect();
+                TemplateAttribute::TwoWayBinding { name, .. } => {
+                    binding_names.push(name.as_str());
+                }
+                _ => {}
+            }
+        }
 
         // Check if we need a consts entry (static attrs OR binding markers)
         let has_consts = !static_attrs.is_empty() || !binding_names.is_empty();
@@ -2105,10 +2113,10 @@ fn collect_ctx_rewrites(
     }
 
     match expr {
-        Expression::Identifier(id) => {
-            if !is_member_property && !is_builtin(&id.name) && !is_local(&id.name) {
-                ctx_inserts.push(id.span.start);
-            }
+        Expression::Identifier(id)
+            if !is_member_property && !is_builtin(&id.name) && !is_local(&id.name) =>
+        {
+            ctx_inserts.push(id.span.start);
         }
         Expression::CallExpression(call) => {
             collect_ctx_rewrites(&call.callee, ctx_inserts, remove_ranges, false, locals);
