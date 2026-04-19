@@ -494,9 +494,7 @@ fn collect_ctx_rewrites(
     }
 
     match expr {
-        Expression::Identifier(id)
-            if !is_member_property && !is_builtin(&id.name) =>
-        {
+        Expression::Identifier(id) if !is_member_property && !is_builtin(&id.name) => {
             ctx_inserts.push(id.span.start);
         }
         Expression::CallExpression(call) => {
