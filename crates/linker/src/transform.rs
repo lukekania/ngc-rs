@@ -109,7 +109,7 @@ pub fn link_source(source: &str, file_path: &Path) -> NgcResult<Option<String>> 
     }
 
     // Sort by start offset descending so we can apply replacements from end to start
-    replacements.sort_by(|a, b| b.start.cmp(&a.start));
+    replacements.sort_by_key(|e| std::cmp::Reverse(e.start));
 
     let mut result = source.to_string();
     for r in &replacements {
