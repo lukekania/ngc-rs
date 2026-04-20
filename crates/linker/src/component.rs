@@ -59,6 +59,9 @@ pub fn transform(
 
     // Features — only emit features that exist in the Angular runtime.
     // ɵɵStandaloneFeature was removed in Angular 19+; standalone is handled via property.
+    //
+    // `ɵɵProvidersFeature(providers[, viewProviders])` wires component-level
+    // providers into the node injector at instantiation time.
     let mut features = Vec::new();
     if metadata::get_bool_prop(obj, "usesInheritance") == Some(true) {
         let feat = if ng_import.is_empty() {
@@ -67,6 +70,21 @@ pub fn transform(
             format!("{ng_import}.\u{0275}\u{0275}InheritDefinitionFeature")
         };
         features.push(feat);
+    }
+    let providers_src = metadata::get_source_text(obj, "providers", source);
+    let view_providers_src = metadata::get_source_text(obj, "viewProviders", source);
+    if let Some(providers) = providers_src {
+        let providers_feature = if ng_import.is_empty() {
+            "\u{0275}\u{0275}ProvidersFeature".to_string()
+        } else {
+            format!("{ng_import}.\u{0275}\u{0275}ProvidersFeature")
+        };
+        let call = if let Some(vp) = view_providers_src {
+            format!("{providers_feature}({providers}, {vp})")
+        } else {
+            format!("{providers_feature}({providers})")
+        };
+        features.push(call);
     }
     if !features.is_empty() {
         props.push(format!("features: [{}]", features.join(", ")));
