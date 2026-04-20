@@ -157,19 +157,12 @@ pub fn generate_ivy(
     dc.push_str(&template_body);
     dc.push_str("    }");
 
-    // Resolve component dependencies. Angular's AOT compiler resolves NgModule
-    // imports to individual directive/pipe classes at build time.  ngc-rs sets
-    // the component's rawImports so Angular's standalone resolution pipeline
-    // handles NgModule expansion at runtime, then provides the raw imports as
-    // dependencies for directive/pipe matching.
+    // Component dependencies. Emit the imports array verbatim here; the linker's
+    // post-pass (crates/linker/src/module_registry.rs) walks every
+    // ɵɵdefineComponent and flattens any NgModule identifiers in this array to
+    // their transitively-exported directive/pipe classes — mirroring ng build.
     if let Some(ref imports_src) = component.imports_source {
-        // Set rawImports on the component class for Angular's depsTracker
-        dc.push_str(&format!(
-            ",\n    dependencies: \u{0275}\u{0275}getComponentDepsFactory({}, {imports_src})",
-            component.class_name
-        ));
-        gen.ivy_imports
-            .insert("\u{0275}\u{0275}getComponentDepsFactory".to_string());
+        dc.push_str(&format!(",\n    dependencies: {imports_src}"));
     }
     if let Some(ref styles_src) = component.styles_source {
         // Pre-scope CSS with %COMP% placeholders for Angular's emulated ViewEncapsulation.
