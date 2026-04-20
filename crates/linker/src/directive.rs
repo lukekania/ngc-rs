@@ -340,6 +340,18 @@ pub fn build_host_bindings(
                         };
                         binding_stmts.push(format!("{fn_name}({expr})"));
                         host_vars += 2;
+                    } else if let Some(attr_name) = key.strip_prefix("attr.") {
+                        // attr.X → ɵɵattribute (1 var). Without this branch,
+                        // RouterLink's `[attr.href]` falls through to
+                        // ɵɵproperty, which sets a JS property named
+                        // "attr.href" instead of the HTML attribute.
+                        let fn_name = if ng_import.is_empty() {
+                            "\u{0275}\u{0275}attribute".to_string()
+                        } else {
+                            format!("{ng_import}.\u{0275}\u{0275}attribute")
+                        };
+                        binding_stmts.push(format!("{fn_name}(\"{attr_name}\", {expr})"));
+                        host_vars += 1;
                     } else {
                         // Regular property → ɵɵproperty (1 var)
                         let fn_name = if ng_import.is_empty() {
