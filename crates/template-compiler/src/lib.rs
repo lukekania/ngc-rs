@@ -735,4 +735,110 @@ export class AppModule {}
         assert!(!result.compiled);
         assert_eq!(result.source, source);
     }
+
+    #[test]
+    fn for_block_listener_resolves_loop_variable_via_ctx() {
+        // Regression test for #40: a (click) handler inside @for was receiving
+        // `undefined` for the loop variable because the listener preamble read
+        // `_r.$implicit` (LView) instead of `_ctx.$implicit` (template context).
+        let source = r#"import { Component } from '@angular/core';
+
+@Component({
+  selector: 'app-test',
+  standalone: true,
+  template: `
+    @for (group of items; track group) {
+      <button (click)="onClick(group)">{{ group }}</button>
+    }
+  `,
+})
+export class TestComponent {
+  items: string[] = [];
+  onClick(_group: string) {}
+}
+"#;
+        let path = PathBuf::from("for-listener.component.ts");
+        let result = compile_component(source, &path).expect("should compile");
+        assert!(result.compiled);
+        assert!(
+            result.source.contains("const group = _ctx.$implicit"),
+            "listener preamble must read the loop item from _ctx.$implicit; got:\n{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("const group = _r.$implicit"),
+            "listener preamble must NOT read from _r.$implicit (LView has no $implicit); got:\n{}",
+            result.source
+        );
+
+        let js = ngc_ts_transform::transform_source(&result.source, "for-listener.component.ts");
+        assert!(
+            js.is_ok(),
+            "compiled source should be valid JS: {:?}",
+            js.err()
+        );
+    }
+
+    #[test]
+    fn nested_for_block_listener_resolves_ancestor_loop_variables() {
+        // Regression test for #40 (nested case): inside nested @for blocks,
+        // listeners must also resolve *ancestor* loop variables via the
+        // ɵɵnextContext chain, not just the innermost one.
+        let source = r#"import { Component } from '@angular/core';
+
+interface Group { items: string[]; }
+
+@Component({
+  selector: 'app-test',
+  standalone: true,
+  template: `
+    @for (outer of groups; track outer) {
+      @for (inner of outer.items; track inner) {
+        <button (click)="onClick(outer, inner)">{{ inner }}</button>
+      }
+    }
+  `,
+})
+export class TestComponent {
+  groups: Group[] = [];
+  onClick(_outer: Group, _inner: string) {}
+}
+"#;
+        let path = PathBuf::from("nested-for-listener.component.ts");
+        let result = compile_component(source, &path).expect("should compile");
+        assert!(result.compiled);
+        assert!(
+            result.source.contains("const inner = _ctx.$implicit"),
+            "innermost @for item must be read from _ctx.$implicit; got:\n{}",
+            result.source
+        );
+        assert!(
+            result
+                .source
+                .contains("const _outer_ctx = \u{0275}\u{0275}nextContext()")
+                || result
+                    .source
+                    .contains("const _outer_ctx = \u{0275}\u{0275}nextContext(1)"),
+            "ancestor @for must be reached via ɵɵnextContext; got:\n{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("const outer = _outer_ctx.$implicit"),
+            "ancestor @for item must be read from the ɵɵnextContext()'d context; got:\n{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("_r.$implicit"),
+            "listener preamble must never dereference $implicit on _r (LView); got:\n{}",
+            result.source
+        );
+
+        let js =
+            ngc_ts_transform::transform_source(&result.source, "nested-for-listener.component.ts");
+        assert!(
+            js.is_ok(),
+            "compiled source should be valid JS: {:?}",
+            js.err()
+        );
+    }
 }

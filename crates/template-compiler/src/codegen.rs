@@ -1461,21 +1461,60 @@ impl IvyCodegen {
 
     /// Generate the preamble code for a listener closure inside an embedded view.
     ///
-    /// Produces: `ɵɵrestoreView(_r); const h = _r.$implicit; const ctx = ɵɵnextContext(N);`
-    /// where `h` is extracted from the innermost @for scope and `ctx` is the component.
+    /// Produces: `ɵɵrestoreView(_r); const inner = _ctx.$implicit;
+    /// [const _outer_ctx = ɵɵnextContext(); const outer = _outer_ctx.$implicit; …]
+    /// const ctx = ɵɵnextContext(N);`
+    ///
+    /// Walks the full `scope_stack` so listeners inside nested `@for` blocks
+    /// see every in-scope loop variable — mirrors `generate_context_navigation`
+    /// with listener-appropriate single-line formatting.
     fn generate_listener_preamble(&self) -> String {
-        let depth = self.scope_stack.len();
         let mut code = String::from("\u{0275}\u{0275}restoreView(_r); ");
-
-        // If the innermost scope is a @for, extract the item from the restored view
-        if let Some(ScopeEntry::Repeater { item_name }) = self.scope_stack.last() {
-            code.push_str(&format!("const {item_name} = _r.$implicit; "));
+        if self.scope_stack.is_empty() {
+            return code;
         }
 
-        // Navigate to the component context
-        code.push_str(&format!(
-            "const ctx = \u{0275}\u{0275}nextContext({depth}); "
-        ));
+        let depth = self.scope_stack.len();
+        let mut levels_consumed: usize = 0;
+
+        // Walk innermost → outermost. i=0 is the current scope (use _ctx directly,
+        // the closure-captured template function parameter). i>0 are ancestor scopes
+        // reached via ɵɵnextContext(steps).
+        for (i, entry) in self.scope_stack.iter().rev().enumerate() {
+            match entry {
+                ScopeEntry::Repeater { item_name } if i == 0 => {
+                    code.push_str(&format!("const {item_name} = _ctx.$implicit; "));
+                }
+                ScopeEntry::Repeater { item_name } => {
+                    let steps = i - levels_consumed;
+                    if steps == 1 {
+                        code.push_str(&format!(
+                            "const _{item_name}_ctx = \u{0275}\u{0275}nextContext(); "
+                        ));
+                    } else if steps > 1 {
+                        code.push_str(&format!(
+                            "const _{item_name}_ctx = \u{0275}\u{0275}nextContext({steps}); "
+                        ));
+                    }
+                    if steps > 0 {
+                        code.push_str(&format!("const {item_name} = _{item_name}_ctx.$implicit; "));
+                    }
+                    levels_consumed = i;
+                }
+                ScopeEntry::Conditional => {
+                    // No implicit variable — still counts toward navigation depth.
+                }
+            }
+        }
+
+        let remaining = depth - levels_consumed;
+        if remaining <= 1 {
+            code.push_str("const ctx = \u{0275}\u{0275}nextContext(); ");
+        } else {
+            code.push_str(&format!(
+                "const ctx = \u{0275}\u{0275}nextContext({remaining}); "
+            ));
+        }
 
         code
     }
