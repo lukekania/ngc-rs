@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ngc_diagnostics::NgcResult;
 
@@ -57,6 +57,10 @@ struct IvyCodegen {
     /// This counter tracks the pipe-relative offset (0, 2, 5, …) which
     /// `rewrite_pipe_offsets` later shifts by the sequential binding count.
     pipe_var_offset: u32,
+    /// Template reference variables declared in the current template scope.
+    /// Maps `#refName` → LView slot that stores the resolved ref value.
+    /// Binding expressions reading these names are rewritten to `ɵɵreference(slot)`.
+    template_refs: BTreeMap<String, u32>,
 }
 
 struct ChildTemplate {
@@ -87,6 +91,7 @@ pub fn generate_ivy(
         scope_stack: Vec::new(),
         last_update_slot: None,
         pipe_var_offset: 0,
+        template_refs: BTreeMap::new(),
     };
 
     gen.ivy_imports
@@ -387,19 +392,53 @@ impl IvyCodegen {
             None
         };
 
+        // Collect template reference variables on this element (e.g.
+        // `#profileForm="ngForm"`, `#fileInput`).  Register a consts entry
+        // `[name, exportAs]` per ref — Angular's runtime populates the ref
+        // value into the LView slot immediately following the element.
+        let refs: Vec<(String, String)> = el
+            .attributes
+            .iter()
+            .filter_map(|a| match a {
+                TemplateAttribute::Reference { name, export_as } => {
+                    Some((name.clone(), export_as.clone().unwrap_or_default()))
+                }
+                _ => None,
+            })
+            .collect();
+        let refs_const_idx = if refs.is_empty() {
+            None
+        } else {
+            Some(self.register_refs_const(&refs))
+        };
+
         if el.is_void && !is_ng_container && !has_events {
             let instr = "\u{0275}\u{0275}element";
             self.ivy_imports.insert(instr.to_string());
-            if let Some(ci) = const_idx {
-                self.creation
-                    .push(format!("{instr}({slot}, '{}', {ci});", el.tag));
-            } else {
-                self.creation
-                    .push(format!("{instr}({slot}, '{}');", el.tag));
+            match (const_idx, refs_const_idx) {
+                (Some(ci), Some(ri)) => self
+                    .creation
+                    .push(format!("{instr}({slot}, '{}', {ci}, {ri});", el.tag)),
+                (Some(ci), None) => self
+                    .creation
+                    .push(format!("{instr}({slot}, '{}', {ci});", el.tag)),
+                (None, Some(ri)) => self
+                    .creation
+                    .push(format!("{instr}({slot}, '{}', null, {ri});", el.tag)),
+                (None, None) => self
+                    .creation
+                    .push(format!("{instr}({slot}, '{}');", el.tag)),
             }
+
+            // Allocate ref slots BEFORE emitting bindings so that expressions
+            // using the ref name can resolve to the correct ɵɵreference(slot).
+            self.reserve_template_refs(&refs);
 
             // Bindings for void elements
             self.emit_element_bindings(el, slot);
+
+            // Emit ɵɵreference(slot) calls to register the refs at their slots.
+            self.emit_reference_calls(&refs);
         } else {
             let (start_instr, end_instr) = if is_ng_container {
                 (
@@ -412,18 +451,36 @@ impl IvyCodegen {
             self.ivy_imports.insert(start_instr.to_string());
             self.ivy_imports.insert(end_instr.to_string());
             if is_ng_container {
-                if let Some(ci) = const_idx {
-                    self.creation.push(format!("{start_instr}({slot}, {ci});"));
-                } else {
-                    self.creation.push(format!("{start_instr}({slot});"));
+                match (const_idx, refs_const_idx) {
+                    (Some(ci), Some(ri)) => self
+                        .creation
+                        .push(format!("{start_instr}({slot}, {ci}, {ri});")),
+                    (Some(ci), None) => self.creation.push(format!("{start_instr}({slot}, {ci});")),
+                    (None, Some(ri)) => self
+                        .creation
+                        .push(format!("{start_instr}({slot}, null, {ri});")),
+                    (None, None) => self.creation.push(format!("{start_instr}({slot});")),
                 }
-            } else if let Some(ci) = const_idx {
-                self.creation
-                    .push(format!("{start_instr}({slot}, '{}', {ci});", el.tag));
             } else {
-                self.creation
-                    .push(format!("{start_instr}({slot}, '{}');", el.tag));
+                match (const_idx, refs_const_idx) {
+                    (Some(ci), Some(ri)) => self
+                        .creation
+                        .push(format!("{start_instr}({slot}, '{}', {ci}, {ri});", el.tag)),
+                    (Some(ci), None) => self
+                        .creation
+                        .push(format!("{start_instr}({slot}, '{}', {ci});", el.tag)),
+                    (None, Some(ri)) => self
+                        .creation
+                        .push(format!("{start_instr}({slot}, '{}', null, {ri});", el.tag)),
+                    (None, None) => self
+                        .creation
+                        .push(format!("{start_instr}({slot}, '{}');", el.tag)),
+                }
             }
+
+            // Allocate ref slots BEFORE listeners, bindings, or children.
+            // Listener bodies and descendant bindings may reference these names.
+            self.reserve_template_refs(&refs);
 
             // Event listeners and two-way binding listeners in creation block
             for attr in &el.attributes {
@@ -431,7 +488,7 @@ impl IvyCodegen {
                     TemplateAttribute::Event { name, handler } => {
                         self.ivy_imports
                             .insert("\u{0275}\u{0275}listener".to_string());
-                        let compiled_handler = compile_event_handler(handler, &self.local_vars);
+                        let compiled_handler = self.compile_listener_handler(handler);
                         let depth = self.scope_depth();
                         if depth > 0 {
                             self.ivy_imports
@@ -454,6 +511,7 @@ impl IvyCodegen {
                         self.ivy_imports
                             .insert("\u{0275}\u{0275}listener".to_string());
                         let depth = self.scope_depth();
+                        let compiled_target = self.rewrite_refs_in_expr(&ctx_expr(expression));
                         if depth > 0 {
                             self.ivy_imports
                                 .insert("\u{0275}\u{0275}restoreView".to_string());
@@ -461,13 +519,13 @@ impl IvyCodegen {
                                 .insert("\u{0275}\u{0275}nextContext".to_string());
                             let listener_preamble = self.generate_listener_preamble();
                             self.creation.push(format!(
-                                "\u{0275}\u{0275}listener('{}Change', function($event) {{ {listener_preamble}return {} = $event; }});",
-                                name, ctx_expr(expression)
+                                "\u{0275}\u{0275}listener('{}Change', function($event) {{ {listener_preamble}return {compiled_target} = $event; }});",
+                                name,
                             ));
                         } else {
                             self.creation.push(format!(
-                                "\u{0275}\u{0275}listener('{}Change', function($event) {{ return {} = $event; }});",
-                                name, ctx_expr(expression)
+                                "\u{0275}\u{0275}listener('{}Change', function($event) {{ return {compiled_target} = $event; }});",
+                                name,
                             ));
                         }
                     }
@@ -484,18 +542,61 @@ impl IvyCodegen {
 
             self.creation.push(format!("{end_instr}();"));
 
-            // Template reference variables
-            for attr in &el.attributes {
-                if let TemplateAttribute::Reference { .. } = attr {
-                    self.ivy_imports
-                        .insert("\u{0275}\u{0275}reference".to_string());
-                    let ref_slot = self.slot_index;
-                    self.slot_index += 1;
-                    self.creation
-                        .push(format!("\u{0275}\u{0275}reference({ref_slot});"));
-                }
+            // Emit ɵɵreference(slot) calls after elementEnd to register the
+            // refs at their pre-reserved slots (matches Angular's output).
+            self.emit_reference_calls(&refs);
+        }
+    }
+
+    /// Reserve a slot for each template reference on the current element and
+    /// register the ref in `template_refs` + `local_vars` so binding
+    /// expressions can resolve it.
+    fn reserve_template_refs(&mut self, refs: &[(String, String)]) {
+        if refs.is_empty() {
+            return;
+        }
+        self.ivy_imports
+            .insert("\u{0275}\u{0275}reference".to_string());
+        for (name, _) in refs {
+            let ref_slot = self.slot_index;
+            self.slot_index += 1;
+            self.template_refs.insert(name.clone(), ref_slot);
+            self.local_vars.insert(name.clone());
+        }
+    }
+
+    /// Emit `ɵɵreference(slot);` creation-mode calls for each ref in order.
+    fn emit_reference_calls(&mut self, refs: &[(String, String)]) {
+        for (name, _) in refs {
+            if let Some(&slot) = self.template_refs.get(name) {
+                self.creation
+                    .push(format!("\u{0275}\u{0275}reference({slot});"));
             }
         }
+    }
+
+    /// Compile an event-handler expression with current locals and apply
+    /// template-reference rewriting so `refName.foo()` becomes
+    /// `ɵɵreference(slot).foo()` instead of `ctx.refName.foo()`.
+    fn compile_listener_handler(&mut self, handler: &str) -> String {
+        let compiled = compile_event_handler(handler, &self.local_vars);
+        self.rewrite_refs_in_expr(&compiled)
+    }
+
+    /// Replace bare identifier uses of template-reference names in `expr`
+    /// with `ɵɵreference(slot)`.  Ref identifiers are registered in
+    /// `local_vars` so prior `ctx_expr_with_locals` calls leave them
+    /// untouched; this pass substitutes the actual runtime lookup.
+    fn rewrite_refs_in_expr(&mut self, expr: &str) -> String {
+        if self.template_refs.is_empty() {
+            return expr.to_string();
+        }
+        let rewritten = rewrite_ref_identifiers(expr, &self.template_refs);
+        if rewritten != expr {
+            self.ivy_imports
+                .insert("\u{0275}\u{0275}reference".to_string());
+        }
+        rewritten
     }
 
     /// Desugar a structural directive (*ngIf, *ngFor) to an ng-template wrapper.
@@ -582,6 +683,7 @@ impl IvyCodegen {
         let parent_update = std::mem::take(&mut self.update);
         let parent_consts = std::mem::take(&mut self.consts);
         let parent_lets = self.let_declarations.clone();
+        let parent_refs = std::mem::take(&mut self.template_refs);
 
         self.slot_index = 0;
         self.var_count = 0;
@@ -635,6 +737,7 @@ impl IvyCodegen {
         self.update = parent_update;
         self.consts = parent_consts;
         self.let_declarations = parent_lets;
+        self.template_refs = parent_refs;
 
         ChildTemplate {
             function_name: fn_name.to_string(),
@@ -1012,6 +1115,7 @@ impl IvyCodegen {
         let parent_creation = std::mem::take(&mut self.creation);
         let parent_update = std::mem::take(&mut self.update);
         let parent_lets = self.let_declarations.clone();
+        let parent_refs = std::mem::take(&mut self.template_refs);
         self.scope_stack.push(ScopeEntry::Conditional);
 
         self.slot_index = 0;
@@ -1020,6 +1124,8 @@ impl IvyCodegen {
         self.last_update_slot = None;
         // Don't clear let_declarations, local_vars, or consts — children
         // inherit parent scope and share the component-level consts array.
+        // template_refs, however, is scoped per-template: refs live in a
+        // specific LView's slot space and can't cross TView boundaries.
 
         self.generate_nodes(children);
 
@@ -1086,6 +1192,7 @@ impl IvyCodegen {
         self.creation = parent_creation;
         self.update = parent_update;
         self.let_declarations = parent_lets;
+        self.template_refs = parent_refs;
 
         ChildTemplate {
             function_name: fn_name.to_string(),
@@ -1109,6 +1216,7 @@ impl IvyCodegen {
         let parent_creation = std::mem::take(&mut self.creation);
         let parent_update = std::mem::take(&mut self.update);
         let parent_lets = self.let_declarations.clone();
+        let parent_refs = std::mem::take(&mut self.template_refs);
 
         self.slot_index = 0;
         self.var_count = 0;
@@ -1193,6 +1301,7 @@ impl IvyCodegen {
         self.update = parent_update;
         self.let_declarations = parent_lets;
         self.local_vars = parent_locals;
+        self.template_refs = parent_refs;
 
         ChildTemplate {
             function_name: fn_name.to_string(),
@@ -1280,16 +1389,17 @@ impl IvyCodegen {
 
     fn compile_binding_expr(&mut self, expression: &str) -> String {
         let segments = extract_all_pipe_segments(expression);
-        if segments.is_empty() {
+        let compiled = if segments.is_empty() {
             // No pipes found — just compile with ctx. prefix
-            return ctx_expr_with_locals(expression, &self.local_vars);
-        }
-
-        // First segment is the base expression, rest are pipe names
-        // But pipes can be nested in sub-expressions. We need to replace
-        // pipe segments bottom-up. For simplicity, handle the common pattern:
-        // the entire expression or sub-expressions of form `(expr | pipe)`.
-        self.replace_pipes_in_expr(expression)
+            ctx_expr_with_locals(expression, &self.local_vars)
+        } else {
+            // First segment is the base expression, rest are pipe names
+            // But pipes can be nested in sub-expressions. We need to replace
+            // pipe segments bottom-up. For simplicity, handle the common pattern:
+            // the entire expression or sub-expressions of form `(expr | pipe)`.
+            self.replace_pipes_in_expr(expression)
+        };
+        self.rewrite_refs_in_expr(&compiled)
     }
 
     /// Replace all `expr | pipeName` patterns in an expression with `ɵɵpipeBind*` calls.
@@ -1355,6 +1465,22 @@ impl IvyCodegen {
         binding_names: &[&str],
     ) -> usize {
         let formatted = format_attrs_with_bindings(attrs, binding_names);
+        let idx = self.consts.len();
+        self.consts.push(formatted);
+        idx
+    }
+
+    /// Register a consts entry describing the template-reference variables
+    /// on an element, e.g. `['profileForm', 'ngForm']` or `['fileInput', '']`.
+    /// Multiple refs on the same element flatten into a single entry:
+    /// `['a', '', 'b', 'bDirective']`.
+    fn register_refs_const(&mut self, refs: &[(String, String)]) -> usize {
+        let mut parts = Vec::with_capacity(refs.len() * 2);
+        for (name, export_as) in refs {
+            parts.push(format!("'{}'", escape_js_string(name)));
+            parts.push(format!("'{}'", escape_js_string(export_as)));
+        }
+        let formatted = format!("[{}]", parts.join(", "));
         let idx = self.consts.len();
         self.consts.push(formatted);
         idx
@@ -1949,6 +2075,174 @@ fn compile_pipe_arg(arg: &str, locals: &BTreeSet<String>) -> String {
             .to_string()
     } else {
         ctx_expr_with_locals(arg, locals)
+    }
+}
+
+/// Replace bare-identifier uses of template reference names with
+/// `ɵɵreference(slot)` calls.  Operates on an expression that has already
+/// passed through `ctx_expr_with_locals`, so ref names appear unprefixed
+/// (they were registered in `local_vars`).  Uses oxc to walk identifiers
+/// in the AST — string literals and member-property names are left alone.
+fn rewrite_ref_identifiers(expr: &str, refs: &BTreeMap<String, u32>) -> String {
+    use oxc_ast::ast::*;
+
+    if refs.is_empty() {
+        return expr.to_string();
+    }
+    let trimmed = expr.trim();
+    if trimmed.is_empty() {
+        return expr.to_string();
+    }
+
+    let wrapper = format!("var __expr = {trimmed};");
+    let alloc = oxc_allocator::Allocator::default();
+    let parsed = oxc_parser::Parser::new(&alloc, &wrapper, oxc_span::SourceType::tsx()).parse();
+    if !parsed.errors.is_empty() || parsed.panicked {
+        return expr.to_string();
+    }
+
+    let init_expr = match parsed.program.body.first() {
+        Some(Statement::VariableDeclaration(decl)) => {
+            decl.declarations.first().and_then(|d| d.init.as_ref())
+        }
+        _ => None,
+    };
+    let init_expr = match init_expr {
+        Some(e) => e,
+        None => return expr.to_string(),
+    };
+
+    // Collect (start, end, slot) spans for identifiers that match a ref name.
+    let mut replacements: Vec<(u32, u32, u32)> = Vec::new();
+    collect_ref_replacements(init_expr, refs, &mut replacements, false);
+
+    if replacements.is_empty() {
+        return expr.to_string();
+    }
+
+    // Sort by start descending so we can rewrite back-to-front without
+    // invalidating earlier offsets.  Map wrapper offsets to expression offsets.
+    let expr_offset = "var __expr = ".len() as u32;
+    let mut adj: Vec<(usize, usize, u32)> = replacements
+        .into_iter()
+        .map(|(s, e, slot)| ((s - expr_offset) as usize, (e - expr_offset) as usize, slot))
+        .collect();
+    adj.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+
+    let mut result = trimmed.to_string();
+    for (s, e, slot) in adj {
+        if s <= result.len()
+            && e <= result.len()
+            && result.is_char_boundary(s)
+            && result.is_char_boundary(e)
+        {
+            result.replace_range(s..e, &format!("\u{0275}\u{0275}reference({slot})"));
+        }
+    }
+    result
+}
+
+fn collect_ref_replacements(
+    expr: &oxc_ast::ast::Expression<'_>,
+    refs: &BTreeMap<String, u32>,
+    out: &mut Vec<(u32, u32, u32)>,
+    is_member_property: bool,
+) {
+    use oxc_ast::ast::*;
+
+    match expr {
+        Expression::Identifier(id) if !is_member_property => {
+            if let Some(&slot) = refs.get(id.name.as_str()) {
+                out.push((id.span.start, id.span.end, slot));
+            }
+        }
+        Expression::CallExpression(call) => {
+            collect_ref_replacements(&call.callee, refs, out, false);
+            for arg in &call.arguments {
+                if let Argument::SpreadElement(spread) = arg {
+                    collect_ref_replacements(&spread.argument, refs, out, false);
+                } else {
+                    collect_ref_replacements(arg.to_expression(), refs, out, false);
+                }
+            }
+        }
+        Expression::StaticMemberExpression(member) => {
+            collect_ref_replacements(&member.object, refs, out, false);
+        }
+        Expression::ComputedMemberExpression(member) => {
+            collect_ref_replacements(&member.object, refs, out, false);
+            collect_ref_replacements(&member.expression, refs, out, false);
+        }
+        Expression::UnaryExpression(unary) => {
+            collect_ref_replacements(&unary.argument, refs, out, false);
+        }
+        Expression::BinaryExpression(binary) => {
+            collect_ref_replacements(&binary.left, refs, out, false);
+            collect_ref_replacements(&binary.right, refs, out, false);
+        }
+        Expression::LogicalExpression(logical) => {
+            collect_ref_replacements(&logical.left, refs, out, false);
+            collect_ref_replacements(&logical.right, refs, out, false);
+        }
+        Expression::ConditionalExpression(cond) => {
+            collect_ref_replacements(&cond.test, refs, out, false);
+            collect_ref_replacements(&cond.consequent, refs, out, false);
+            collect_ref_replacements(&cond.alternate, refs, out, false);
+        }
+        Expression::ParenthesizedExpression(paren) => {
+            collect_ref_replacements(&paren.expression, refs, out, false);
+        }
+        Expression::AssignmentExpression(assign) => {
+            collect_ref_replacements(&assign.right, refs, out, false);
+        }
+        Expression::TSNonNullExpression(non_null) => {
+            collect_ref_replacements(&non_null.expression, refs, out, is_member_property);
+        }
+        Expression::ObjectExpression(obj) => {
+            for prop in &obj.properties {
+                if let ObjectPropertyKind::ObjectProperty(p) = prop {
+                    collect_ref_replacements(&p.value, refs, out, false);
+                }
+            }
+        }
+        Expression::ArrayExpression(arr) => {
+            for elem in &arr.elements {
+                if let ArrayExpressionElement::SpreadElement(spread) = elem {
+                    collect_ref_replacements(&spread.argument, refs, out, false);
+                } else if !elem.is_elision() {
+                    collect_ref_replacements(elem.to_expression(), refs, out, false);
+                }
+            }
+        }
+        Expression::TemplateLiteral(tpl) => {
+            for e in &tpl.expressions {
+                collect_ref_replacements(e, refs, out, false);
+            }
+        }
+        Expression::ChainExpression(chain) => match &chain.expression {
+            ChainElement::CallExpression(call) => {
+                collect_ref_replacements(&call.callee, refs, out, false);
+                for arg in &call.arguments {
+                    if let Argument::SpreadElement(spread) = arg {
+                        collect_ref_replacements(&spread.argument, refs, out, false);
+                    } else {
+                        collect_ref_replacements(arg.to_expression(), refs, out, false);
+                    }
+                }
+            }
+            ChainElement::StaticMemberExpression(member) => {
+                collect_ref_replacements(&member.object, refs, out, false);
+            }
+            ChainElement::ComputedMemberExpression(member) => {
+                collect_ref_replacements(&member.object, refs, out, false);
+                collect_ref_replacements(&member.expression, refs, out, false);
+            }
+            ChainElement::TSNonNullExpression(non_null) => {
+                collect_ref_replacements(&non_null.expression, refs, out, false);
+            }
+            _ => {}
+        },
+        _ => {}
     }
 }
 
