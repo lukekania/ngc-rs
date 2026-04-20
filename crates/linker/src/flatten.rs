@@ -368,6 +368,13 @@ fn find_dependencies_array<'a>(obj: &'a ObjectExpression<'_>) -> Option<&'a Arra
 }
 
 /// Expand each element of the array. Returns `(items, any_expanded)`.
+///
+/// Deduplication happens at the *array* level, not per-module: two
+/// flattened modules that re-export the same internal module (e.g.
+/// `FormsModule` and `ReactiveFormsModule` both re-exporting the internal
+/// forms-shared module) must not emit the shared directives twice, or Angular
+/// will throw `NG0919 — Cannot read @Component metadata` at runtime.
+///
 /// As a side effect, schedules import additions on `imports` for any directive
 /// names that the file does not yet have in scope.
 fn flatten_array_items(
@@ -376,8 +383,16 @@ fn flatten_array_items(
     registry: &ModuleRegistry,
     imports: &mut [NamedImport],
 ) -> (Vec<String>, bool) {
-    let mut items = Vec::new();
+    let mut items: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut any_expanded = false;
+
+    let push_unique = |items: &mut Vec<String>, seen: &mut BTreeSet<String>, value: String| {
+        if seen.insert(value.clone()) {
+            items.push(value);
+        }
+    };
+
     for element in &array.elements {
         match element {
             ArrayExpressionElement::Identifier(id) => {
@@ -387,23 +402,23 @@ fn flatten_array_items(
                     let flat = registry.flatten(name);
                     let owner_idx = find_import_owning(imports, name);
                     for new_name in &flat {
-                        items.push(new_name.clone());
+                        push_unique(&mut items, &mut seen, new_name.clone());
                         if let Some(idx) = owner_idx {
-                            // Skip if any existing named import (anywhere in the file)
-                            // already brings this in.
                             if !any_import_has(imports, new_name) {
                                 imports[idx].additions.insert(new_name.clone());
                             }
                         }
                     }
                 } else {
-                    items.push(name.to_string());
+                    push_unique(&mut items, &mut seen, name.to_string());
                 }
             }
             ArrayExpressionElement::Elision(_) => {}
             other => {
                 let span = other.span();
                 let text = &source[span.start as usize..span.end as usize];
+                // Non-identifier elements (spreads, calls, etc.) keep verbatim
+                // text and don't participate in dedup.
                 items.push(text.to_string());
             }
         }
@@ -586,6 +601,52 @@ C.\u{0275}cmp = i0.\u{0275}\u{0275}defineComponent({ type: C, dependencies: [Dia
             .find(|l| l.contains("from '@angular/cdk/dialog'"))
             .expect("cdk import line");
         assert!(cdk_line.contains("CdkDialog"), "{cdk_line}");
+    }
+
+    #[test]
+    fn dedups_across_sibling_modules_sharing_internal_exports() {
+        // Mirrors the real-world case: FormsModule and ReactiveFormsModule
+        // both re-export the same shared internal module. Without
+        // cross-module dedup we'd emit every shared directive twice, which
+        // Angular rejects with NG0919.
+        let reg = ModuleRegistry::new();
+        reg.register(
+            "InternalShared",
+            vec!["DefaultValueAccessor".into(), "NgControlStatus".into()],
+        );
+        reg.register(
+            "FormsModule",
+            vec!["InternalShared".into(), "NgModel".into()],
+        );
+        reg.register(
+            "ReactiveFormsModule",
+            vec!["InternalShared".into(), "FormGroupDirective".into()],
+        );
+
+        let mut modules = HashMap::new();
+        let source = "import { FormsModule, ReactiveFormsModule } from '@angular/forms';\n\
+C.\u{0275}cmp = \u{0275}\u{0275}defineComponent({ type: C, dependencies: [FormsModule, ReactiveFormsModule] });";
+        modules.insert(PathBuf::from("/app/c.js"), source.to_string());
+
+        let rewritten = flatten_component_dependencies(&mut modules, &reg).unwrap();
+        assert_eq!(rewritten, 1);
+        let out = modules.get(Path::new("/app/c.js")).unwrap();
+
+        // Extract deps array content.
+        let start = out.find("dependencies: [").unwrap() + "dependencies: [".len();
+        let end = out[start..].find(']').unwrap() + start;
+        let arr = &out[start..end];
+        let items: Vec<&str> = arr.split(',').map(|s| s.trim()).collect();
+        // Each name appears exactly once.
+        for needed in [
+            "DefaultValueAccessor",
+            "NgControlStatus",
+            "NgModel",
+            "FormGroupDirective",
+        ] {
+            let count = items.iter().filter(|x| **x == needed).count();
+            assert_eq!(count, 1, "{needed} appeared {count} times in {arr}");
+        }
     }
 
     #[test]
