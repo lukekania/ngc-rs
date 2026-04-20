@@ -23,6 +23,8 @@ mod factory;
 mod injectable;
 mod injector;
 mod metadata;
+/// Build-time NgModule registry and import-flattening primitives.
+pub mod module_registry;
 mod ng_module;
 mod pipe;
 mod selector;
