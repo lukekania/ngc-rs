@@ -22,6 +22,9 @@ mod class_metadata;
 mod component;
 mod directive;
 mod factory;
+/// Post-link pass that expands NgModule references in component `dependencies`
+/// arrays using the [`module_registry::ModuleRegistry`].
+pub mod flatten;
 mod injectable;
 mod injector;
 mod metadata;
