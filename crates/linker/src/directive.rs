@@ -198,6 +198,33 @@ fn build_inputs(obj: &ObjectExpression<'_>, source: &str) -> Option<String> {
                         entries.push(format!("{key}: '{key}'"));
                     }
                 }
+                Expression::ArrayExpression(arr) => {
+                    // Declare format uses a 2-element array `[publicName, declaredName]`.
+                    // The Angular 21 runtime format is `[flags, publicName, declaredName, transform?]`
+                    // — a leading numeric `flags` value is required or the array
+                    // positions shift (publicName ends up where flags should be),
+                    // breaking input binding silently (e.g. `[formGroup]` never
+                    // propagates to `FormGroupDirective.form`).
+                    let elements: Vec<&str> = arr
+                        .elements
+                        .iter()
+                        .map(|el| {
+                            let sp = el.span();
+                            &source[sp.start as usize..sp.end as usize]
+                        })
+                        .collect();
+                    // If the first element is already a number, assume it's runtime-format.
+                    let first_is_number = elements.first().is_some_and(|s| {
+                        s.trim().chars().next().is_some_and(|c| c.is_ascii_digit())
+                    });
+                    let runtime = if first_is_number {
+                        format!("[{}]", elements.join(", "))
+                    } else {
+                        // Prepend `0` flags.
+                        format!("[0, {}]", elements.join(", "))
+                    };
+                    entries.push(format!("{key}: {runtime}"));
+                }
                 _ => {
                     // Pass through as source text
                     let val = &source[p.value.span().start as usize..p.value.span().end as usize];
