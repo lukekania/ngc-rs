@@ -1234,20 +1234,7 @@ impl IvyCodegen {
                 let compiled_args: Vec<String> = pipe
                     .args
                     .iter()
-                    .map(|a| {
-                        let trimmed = a.trim();
-                        if trimmed.starts_with('{') {
-                            let wrapped = format!("({})", trimmed);
-                            let result = ctx_expr(&wrapped);
-                            result
-                                .strip_prefix('(')
-                                .and_then(|s| s.strip_suffix(')'))
-                                .unwrap_or(&result)
-                                .to_string()
-                        } else {
-                            ctx_expr(a)
-                        }
-                    })
+                    .map(|a| compile_pipe_arg(a, &self.local_vars))
                     .collect();
                 expr = format!(
                     "{bind_fn}({pipe_slot}, {pipe_var_slot}, {expr}, {})",
@@ -1336,22 +1323,7 @@ impl IvyCodegen {
             }
             let compiled_args: Vec<String> = args
                 .iter()
-                .map(|a| {
-                    let trimmed = a.trim();
-                    if trimmed.starts_with('{') {
-                        // Wrap object literals in parens so oxc parses them as
-                        // expressions, not block statements.
-                        let wrapped = format!("({})", trimmed);
-                        let result = ctx_expr(&wrapped);
-                        result
-                            .strip_prefix('(')
-                            .and_then(|s| s.strip_suffix(')'))
-                            .unwrap_or(&result)
-                            .to_string()
-                    } else {
-                        ctx_expr(a)
-                    }
-                })
+                .map(|a| compile_pipe_arg(a, &self.local_vars))
                 .collect();
             return format!(
                 "{bind_fn}({pipe_slot}, {pipe_var_slot}, {compiled_base}, {})",
@@ -1876,7 +1848,7 @@ fn replace_nested_pipe_parens(expr: &str, gen: &mut IvyCodegen) -> String {
             if let Some((base, pipe_name, args)) = split_top_level_pipe_with_args(&inner) {
                 // Compile the base expression recursively
                 let compiled_base = replace_nested_pipe_parens(&base, gen);
-                let compiled_base = ctx_expr(&compiled_base);
+                let compiled_base = ctx_expr_with_locals(&compiled_base, &gen.local_vars);
 
                 let pipe_slot = gen.slot_index;
                 gen.slot_index += 1;
@@ -1900,22 +1872,7 @@ fn replace_nested_pipe_parens(expr: &str, gen: &mut IvyCodegen) -> String {
                 } else {
                     let compiled_args: Vec<String> = args
                         .iter()
-                        .map(|a| {
-                            let trimmed = a.trim();
-                            if trimmed.starts_with('{') {
-                                // Wrap object literals in parens so oxc parses them as
-                                // expressions, not block statements.
-                                let wrapped = format!("({})", trimmed);
-                                let result = ctx_expr(&wrapped);
-                                result
-                                    .strip_prefix('(')
-                                    .and_then(|s| s.strip_suffix(')'))
-                                    .unwrap_or(&result)
-                                    .to_string()
-                            } else {
-                                ctx_expr(a)
-                            }
-                        })
+                        .map(|a| compile_pipe_arg(a, &gen.local_vars))
                         .collect();
                     result.push_str(&format!(
                         "{bind_fn}({pipe_slot}, {pipe_var_slot}, {compiled_base}, {})",
@@ -1972,6 +1929,27 @@ fn replace_nested_pipe_parens(expr: &str, gen: &mut IvyCodegen) -> String {
 /// identifiers (not member properties, not builtins) get the `ctx.` prefix.
 fn ctx_expr(expr: &str) -> String {
     ctx_expr_with_locals(expr, &BTreeSet::new())
+}
+
+/// Compile a single pipe-call argument to JavaScript.
+///
+/// Object-literal arguments (e.g. `{ count: tier.count }`) are wrapped in
+/// parentheses so oxc parses them as expressions rather than block statements,
+/// then unwrapped again. Both forms preserve template-local variables from the
+/// enclosing `@for` / `@let` scope so they don't get a spurious `ctx.` prefix.
+fn compile_pipe_arg(arg: &str, locals: &BTreeSet<String>) -> String {
+    let trimmed = arg.trim();
+    if trimmed.starts_with('{') {
+        let wrapped = format!("({trimmed})");
+        let result = ctx_expr_with_locals(&wrapped, locals);
+        result
+            .strip_prefix('(')
+            .and_then(|s| s.strip_suffix(')'))
+            .unwrap_or(&result)
+            .to_string()
+    } else {
+        ctx_expr_with_locals(arg, locals)
+    }
 }
 
 /// Rewrite an expression by adding `ctx.` prefix to top-level identifiers,
@@ -2950,6 +2928,70 @@ mod tests {
         );
         assert!(output.ivy_imports.contains("\u{0275}\u{0275}pipe"));
         assert!(output.ivy_imports.contains("\u{0275}\u{0275}pipeBind1"));
+    }
+
+    #[test]
+    fn test_pipe_object_arg_preserves_for_local() {
+        // `@for (tier of tiers()) { {{ 'K' | translate: { count: tier.features['portfolios'] } }} }`
+        // The pipe's second argument references the @for loop variable `tier`, which
+        // must stay unprefixed in the emitted code — NOT `ctx.tier.features[...]`.
+        let comp = test_component();
+        let nodes = vec![TemplateNode::ForBlock(ForBlockNode {
+            item_name: "tier".to_string(),
+            iterable: "tiers()".to_string(),
+            track_expression: "tier".to_string(),
+            children: vec![TemplateNode::Interpolation(InterpolationNode {
+                expression: "'PRICING.PORTFOLIO_COUNT'".to_string(),
+                pipes: vec![PipeCall {
+                    name: "translate".to_string(),
+                    args: vec!["{ count: tier.features['portfolios'] }".to_string()],
+                }],
+            })],
+            empty_children: None,
+        })];
+        let output = generate_ivy(&comp, &nodes).expect("should generate");
+        let body = output.child_template_functions.join("\n");
+        assert!(
+            body.contains("pipeBind2"),
+            "single-arg translate pipe should compile to pipeBind2: {body}"
+        );
+        assert!(
+            body.contains("tier.features['portfolios']"),
+            "@for loop variable must stay unprefixed inside pipe arg: {body}"
+        );
+        assert!(
+            !body.contains("ctx.tier"),
+            "must not emit ctx.tier inside the @for body: {body}"
+        );
+    }
+
+    #[test]
+    fn test_pipe_positional_arg_preserves_for_local() {
+        // Same principle with a non-object positional argument.
+        let comp = test_component();
+        let nodes = vec![TemplateNode::ForBlock(ForBlockNode {
+            item_name: "item".to_string(),
+            iterable: "items()".to_string(),
+            track_expression: "item".to_string(),
+            children: vec![TemplateNode::Interpolation(InterpolationNode {
+                expression: "item.date".to_string(),
+                pipes: vec![PipeCall {
+                    name: "date".to_string(),
+                    args: vec!["item.format".to_string()],
+                }],
+            })],
+            empty_children: None,
+        })];
+        let output = generate_ivy(&comp, &nodes).expect("should generate");
+        let body = output.child_template_functions.join("\n");
+        assert!(
+            body.contains("item.format"),
+            "@for loop variable used as positional pipe arg must stay unprefixed: {body}"
+        );
+        assert!(
+            !body.contains("ctx.item.format"),
+            "must not emit ctx.item.format: {body}"
+        );
     }
 
     #[test]
