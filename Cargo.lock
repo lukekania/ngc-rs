@@ -698,6 +698,7 @@ dependencies = [
  "petgraph",
  "regex",
  "sha2",
+ "tempfile",
  "tracing",
 ]
 

@@ -93,11 +93,26 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
     // Process main chunk first to get specifier→namespace mapping
     let main_chunk = &chunk_graph.chunks[0];
     let main_unused = if input.options.tree_shake {
+        // Lazy chunks consume symbols from main cross-chunk; those consumptions
+        // are invisible to the per-chunk shake analysis below. Precompute them
+        // so the analyzer won't mark them unused and strip their declarations.
+        let mut lazy_consumers: Vec<PathBuf> = Vec::new();
+        for chunk in &chunk_graph.chunks[1..] {
+            lazy_consumers.extend(chunk.modules.iter().cloned());
+        }
+        let externally_used = shake::collect_cross_chunk_used_names(
+            &lazy_consumers,
+            &main_chunk.modules,
+            &input.modules,
+            &prefix_refs,
+        )?;
+
         shake::analyze_unused_exports(
             &main_chunk.modules,
             &input.modules,
             &main_chunk.entry,
             &prefix_refs,
+            Some(&externally_used),
         )?
     } else {
         HashMap::new()
@@ -137,6 +152,7 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
                 &input.modules,
                 &chunk.entry,
                 &prefix_refs,
+                None,
             )?
         } else {
             HashMap::new()
