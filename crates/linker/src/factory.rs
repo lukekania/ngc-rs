@@ -19,16 +19,51 @@ use oxc_ast::ast::{
 use crate::metadata;
 
 /// Transform a `ɵɵngDeclareFactory` call into a factory function.
+///
+/// `deps: null` in the declare format signals that the factory is inherited
+/// from a parent class (no deps of its own). In that case we emit an IIFE
+/// that calls `ɵɵgetInheritedFactory(Type)` to look up the parent's factory
+/// at runtime — matching what Angular's own AOT compiler emits. A plain
+/// empty-args factory would call the constructor with no arguments, which
+/// breaks e.g. `SelectControlValueAccessor extends BaseControlValueAccessor`
+/// because `_renderer` and `_elementRef` would never be injected.
 pub fn transform(obj: &ObjectExpression<'_>, source: &str, ng_import: &str) -> NgcResult<String> {
     let type_name = metadata::get_identifier_prop(obj, "type")
         .or_else(|| metadata::get_source_text(obj, "type", source).map(|s| s.to_string()))
         .unwrap_or_else(|| "Unknown".to_string());
+
+    if is_deps_null(obj) {
+        let get_inherited = if ng_import.is_empty() {
+            "\u{0275}\u{0275}getInheritedFactory".to_string()
+        } else {
+            format!("{ng_import}.\u{0275}\u{0275}getInheritedFactory")
+        };
+        return Ok(format!(
+            "function {type_name}_Factory(\u{0275}t) {{ \
+                let \u{0275}{type_name}_BaseFactory; \
+                return (\u{0275}{type_name}_BaseFactory || (\u{0275}{type_name}_BaseFactory = {get_inherited}({type_name})))(\u{0275}t || {type_name}); \
+            }}"
+        ));
+    }
 
     let deps = build_deps_args(obj, source, ng_import);
 
     Ok(format!(
         "function {type_name}_Factory(\u{0275}t) {{ return new (\u{0275}t || {type_name})({deps}); }}"
     ))
+}
+
+/// Return `true` if the `deps` property is the literal `null` — the declare
+/// format's way of saying "inherit factory from parent".
+fn is_deps_null(obj: &ObjectExpression<'_>) -> bool {
+    for prop in &obj.properties {
+        if let ObjectPropertyKind::ObjectProperty(p) = prop {
+            if matches!(&p.key, PropertyKey::StaticIdentifier(id) if id.name.as_str() == "deps") {
+                return matches!(&p.value, Expression::NullLiteral(_));
+            }
+        }
+    }
+    false
 }
 
 /// Build the constructor arguments from the `deps` array.
@@ -166,5 +201,17 @@ mod tests {
             "{ type: MyService, deps: [{ token: SomeDep, optional: true }], target: 2 }",
         );
         assert!(result.contains("i0.\u{0275}\u{0275}inject(SomeDep, 8)"));
+    }
+
+    #[test]
+    fn test_factory_with_null_deps_inherits() {
+        let result = parse_and_transform("{ type: SubClass, deps: null, target: 2 }");
+        // No bare `new (ɵt || SubClass)()` call — must chain through inherited factory.
+        assert!(
+            result.contains("\u{0275}\u{0275}getInheritedFactory(SubClass)"),
+            "expected inherited-factory chain: {result}"
+        );
+        // The base-factory cache var prefixed with ɵ to avoid identifier clashes.
+        assert!(result.contains("\u{0275}SubClass_BaseFactory"));
     }
 }
