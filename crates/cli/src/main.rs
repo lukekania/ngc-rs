@@ -235,13 +235,20 @@ fn run_build(
         modules.insert(path.clone(), source.clone());
     }
 
-    // Step 6.6: Link partially compiled Angular npm packages
-    let module_registry = ngc_linker::ModuleRegistry::new();
-    let linker_stats = ngc_linker::link_npm_modules(&mut modules, &config_dir, &module_registry)?;
+    // Step 6.6: Link partially compiled Angular npm packages and flatten
+    // NgModule references in component dependencies arrays.
+    let linker_stats = ngc_linker::link_modules(&mut modules, &config_dir)?;
     if linker_stats.files_linked > 0 {
         tracing::info!(
             "linked {} Angular package file(s)",
             linker_stats.files_linked
+        );
+    }
+    if linker_stats.components_flattened > 0 {
+        tracing::info!(
+            "flattened NgModule imports in {} component file(s) across {} registered module(s)",
+            linker_stats.components_flattened,
+            linker_stats.modules_registered
         );
     }
 

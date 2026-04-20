@@ -44,12 +44,17 @@ use ngc_diagnostics::NgcResult;
 pub use module_registry::ModuleRegistry;
 
 /// Statistics from the linking process.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LinkerStats {
     /// Number of npm files scanned for declarations.
     pub files_scanned: usize,
     /// Number of files that contained `ɵɵngDeclare*` calls and were linked.
     pub files_linked: usize,
+    /// Number of `ɵɵdefineNgModule` calls scanned in Pass A.
+    pub modules_registered: usize,
+    /// Number of files whose component `dependencies` arrays were rewritten
+    /// to expand NgModule references into flat directive/pipe lists.
+    pub components_flattened: usize,
 }
 
 /// Link all partially compiled Angular npm modules in the modules map.
@@ -102,7 +107,32 @@ pub fn link_npm_modules(
     Ok(LinkerStats {
         files_scanned,
         files_linked,
+        ..LinkerStats::default()
     })
+}
+
+/// Full Angular module-linking orchestrator.
+///
+/// Runs three passes in order:
+/// 1. [`link_npm_modules`] — rewrites npm `ɵɵngDeclare*` partial declarations
+///    into fully-compiled `ɵɵdefine*` calls, and registers each NgModule in
+///    `registry` as a side effect.
+/// 2. [`module_registry::scan_define_ng_modules`] — registers any remaining
+///    `ɵɵdefineNgModule` calls (project AOT output, pre-compiled npm bundles).
+/// 3. [`flatten::flatten_component_dependencies`] — walks every
+///    `ɵɵdefineComponent` and expands NgModule references in its
+///    `dependencies` array to transitively-exported directives/pipes. This is
+///    what removes the need for the runtime `ɵɵgetComponentDepsFactory`
+///    helper and fixes reactive-forms `NG01050` errors inside dialogs.
+pub fn link_modules(
+    modules: &mut HashMap<PathBuf, String>,
+    project_root: &Path,
+) -> NgcResult<LinkerStats> {
+    let registry = ModuleRegistry::new();
+    let mut stats = link_npm_modules(modules, project_root, &registry)?;
+    stats.modules_registered = module_registry::scan_define_ng_modules(modules, &registry)?;
+    stats.components_flattened = flatten::flatten_component_dependencies(modules, &registry)?;
+    Ok(stats)
 }
 
 /// Check whether a path is inside node_modules.
