@@ -2953,6 +2953,70 @@ mod tests {
     }
 
     #[test]
+    fn test_pipe_object_arg_preserves_for_local() {
+        // `@for (tier of tiers()) { {{ 'K' | translate: { count: tier.features['portfolios'] } }} }`
+        // The pipe's second argument references the @for loop variable `tier`, which
+        // must stay unprefixed in the emitted code — NOT `ctx.tier.features[...]`.
+        let comp = test_component();
+        let nodes = vec![TemplateNode::ForBlock(ForBlockNode {
+            item_name: "tier".to_string(),
+            iterable: "tiers()".to_string(),
+            track_expression: "tier".to_string(),
+            children: vec![TemplateNode::Interpolation(InterpolationNode {
+                expression: "'PRICING.PORTFOLIO_COUNT'".to_string(),
+                pipes: vec![PipeCall {
+                    name: "translate".to_string(),
+                    args: vec!["{ count: tier.features['portfolios'] }".to_string()],
+                }],
+            })],
+            empty_children: None,
+        })];
+        let output = generate_ivy(&comp, &nodes).expect("should generate");
+        let body = output.child_template_functions.join("\n");
+        assert!(
+            body.contains("pipeBind2"),
+            "single-arg translate pipe should compile to pipeBind2: {body}"
+        );
+        assert!(
+            body.contains("tier.features['portfolios']"),
+            "@for loop variable must stay unprefixed inside pipe arg: {body}"
+        );
+        assert!(
+            !body.contains("ctx.tier"),
+            "must not emit ctx.tier inside the @for body: {body}"
+        );
+    }
+
+    #[test]
+    fn test_pipe_positional_arg_preserves_for_local() {
+        // Same principle with a non-object positional argument.
+        let comp = test_component();
+        let nodes = vec![TemplateNode::ForBlock(ForBlockNode {
+            item_name: "item".to_string(),
+            iterable: "items()".to_string(),
+            track_expression: "item".to_string(),
+            children: vec![TemplateNode::Interpolation(InterpolationNode {
+                expression: "item.date".to_string(),
+                pipes: vec![PipeCall {
+                    name: "date".to_string(),
+                    args: vec!["item.format".to_string()],
+                }],
+            })],
+            empty_children: None,
+        })];
+        let output = generate_ivy(&comp, &nodes).expect("should generate");
+        let body = output.child_template_functions.join("\n");
+        assert!(
+            body.contains("item.format"),
+            "@for loop variable used as positional pipe arg must stay unprefixed: {body}"
+        );
+        assert!(
+            !body.contains("ctx.item.format"),
+            "must not emit ctx.item.format: {body}"
+        );
+    }
+
+    #[test]
     fn test_valueless_attribute_included_in_consts() {
         // Value-less attributes (e.g. `baseChart` on `<canvas baseChart>`)
         // must appear in the consts array with an empty-string value so that
