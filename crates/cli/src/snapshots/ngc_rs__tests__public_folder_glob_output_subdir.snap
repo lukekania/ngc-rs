@@ -1,0 +1,8 @@
+---
+source: crates/cli/src/main.rs
+expression: "files.join(\"\\n\")"
+---
+assets/appleid_button@4x.png
+assets/i18n/de.json
+assets/i18n/en.json
+assets/nested/deep/file.txt

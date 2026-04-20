@@ -1393,4 +1393,74 @@ mod tests {
         // Path key should remain the original
         assert_eq!(result[0].0, env_file);
     }
+
+    /// Scaffold a `public/` tree mirroring the treasr-frontend shape.
+    fn scaffold_public_tree(root: &Path) -> PathBuf {
+        let public = root.join("public");
+        std::fs::create_dir_all(public.join("i18n")).unwrap();
+        std::fs::create_dir_all(public.join("nested/deep")).unwrap();
+        std::fs::write(public.join("i18n/de.json"), r#"{"hello":"hallo"}"#).unwrap();
+        std::fs::write(public.join("i18n/en.json"), r#"{"hello":"hello"}"#).unwrap();
+        std::fs::write(public.join("appleid_button@4x.png"), b"\x89PNG\r\n").unwrap();
+        std::fs::write(public.join("nested/deep/file.txt"), "leaf").unwrap();
+        public
+    }
+
+    /// Collect files under `dir`, returning paths relative to `dir` with
+    /// forward-slash separators — deterministic output for snapshots.
+    fn collect_relative_files(dir: &Path) -> Vec<String> {
+        fn walk(dir: &Path, base: &Path, out: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, base, out);
+                } else {
+                    let rel = path.strip_prefix(base).unwrap();
+                    out.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(dir, dir, &mut files);
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn test_copy_assets_public_folder_glob() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let public = scaffold_public_tree(dir.path());
+        let out = dir.path().join("dist");
+        std::fs::create_dir_all(&out).unwrap();
+
+        let asset = ResolvedAsset::Glob {
+            pattern: "**/*".to_string(),
+            input: public,
+            output: "/".to_string(),
+            ignore: vec![],
+        };
+        copy_assets(&[asset], &out).expect("copy_assets should succeed");
+
+        let files = collect_relative_files(&out);
+        insta::assert_snapshot!("public_folder_glob_dist", files.join("\n"));
+    }
+
+    #[test]
+    fn test_copy_assets_glob_with_output_subdir() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let public = scaffold_public_tree(dir.path());
+        let out = dir.path().join("dist");
+        std::fs::create_dir_all(&out).unwrap();
+
+        let asset = ResolvedAsset::Glob {
+            pattern: "**/*".to_string(),
+            input: public,
+            output: "/assets/".to_string(),
+            ignore: vec![],
+        };
+        copy_assets(&[asset], &out).expect("copy_assets should succeed");
+
+        let files = collect_relative_files(&out);
+        insta::assert_snapshot!("public_folder_glob_output_subdir", files.join("\n"));
+    }
 }
