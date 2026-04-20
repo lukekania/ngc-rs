@@ -748,4 +748,127 @@ mod tests {
         assert!(result.code.contains("'./chunk-lazy.js'"));
         assert_eq!(result.dynamic_imports.len(), 1);
     }
+
+    #[test]
+    fn test_unused_export_const_with_nested_dynamic_import_fully_removed() {
+        // Issue #13 repro: a tree-shaken export containing a dynamic import
+        // must not produce both a removal edit and a lengthening specifier
+        // rewrite — the removal's `end` offset would point inside the grown
+        // replacement, leaving a stray `export` keyword.
+        let code =
+            "export const routes = [{ loadComponent: () => import('./lazy').then(m => m.C) }];\n";
+        let mut rewrites = HashMap::new();
+        rewrites.insert("./lazy".to_string(), "chunk-lazy.js".to_string());
+        let mut unused = HashSet::new();
+        unused.insert("routes".to_string());
+
+        let result = rewrite_module_with_shaking(
+            code,
+            "test.js",
+            &["."],
+            &rewrites,
+            Some(&unused),
+            &HashSet::new(),
+            &HashMap::new(),
+            false,
+        )
+        .expect("should rewrite");
+
+        assert!(
+            result.code.trim().is_empty(),
+            "expected empty output, got: {:?}",
+            result.code
+        );
+        assert!(!result.code.contains("export"));
+        assert!(!result.code.contains("chunk-lazy.js"));
+        assert!(!result.code.contains("./lazy"));
+        assert!(result.dynamic_imports.is_empty());
+    }
+
+    #[test]
+    fn test_used_export_const_with_nested_dynamic_import_is_rewritten() {
+        // Opposite of the prior test: when the export is used, the body is
+        // kept (only `export ` stripped) and the nested dynamic import is
+        // rewritten to its chunk filename.
+        let code =
+            "export const routes = [{ loadComponent: () => import('./lazy').then(m => m.C) }];\n";
+        let mut rewrites = HashMap::new();
+        rewrites.insert("./lazy".to_string(), "chunk-lazy.js".to_string());
+        let empty_unused: HashSet<String> = HashSet::new();
+
+        let result = rewrite_module_with_shaking(
+            code,
+            "test.js",
+            &["."],
+            &rewrites,
+            Some(&empty_unused),
+            &HashSet::new(),
+            &HashMap::new(),
+            false,
+        )
+        .expect("should rewrite");
+
+        assert!(result.code.contains("const routes"));
+        assert!(!result.code.contains("export"));
+        assert!(result.code.contains("'./chunk-lazy.js'"));
+        assert!(!result.code.contains("import('./lazy')"));
+        assert_eq!(result.dynamic_imports.len(), 1);
+    }
+
+    #[test]
+    fn test_unused_export_function_with_nested_dynamic_import_fully_removed() {
+        let code = "export function loadIt() { return import('./lazy'); }\n";
+        let mut rewrites = HashMap::new();
+        rewrites.insert("./lazy".to_string(), "chunk-lazy.js".to_string());
+        let mut unused = HashSet::new();
+        unused.insert("loadIt".to_string());
+
+        let result = rewrite_module_with_shaking(
+            code,
+            "test.js",
+            &["."],
+            &rewrites,
+            Some(&unused),
+            &HashSet::new(),
+            &HashMap::new(),
+            false,
+        )
+        .expect("should rewrite");
+
+        assert!(
+            result.code.trim().is_empty(),
+            "expected empty output, got: {:?}",
+            result.code
+        );
+        assert!(!result.code.contains("export"));
+        assert!(!result.code.contains("chunk-lazy.js"));
+        assert!(!result.code.contains("./lazy"));
+        assert!(result.dynamic_imports.is_empty());
+    }
+
+    #[test]
+    fn test_used_export_function_with_nested_dynamic_import_is_rewritten() {
+        let code = "export function loadIt() { return import('./lazy'); }\n";
+        let mut rewrites = HashMap::new();
+        rewrites.insert("./lazy".to_string(), "chunk-lazy.js".to_string());
+        let empty_unused: HashSet<String> = HashSet::new();
+
+        let result = rewrite_module_with_shaking(
+            code,
+            "test.js",
+            &["."],
+            &rewrites,
+            Some(&empty_unused),
+            &HashSet::new(),
+            &HashMap::new(),
+            false,
+        )
+        .expect("should rewrite");
+
+        assert!(result.code.contains("function loadIt"));
+        assert!(!result.code.contains("export"));
+        assert!(result.code.contains("'./chunk-lazy.js'"));
+        assert!(!result.code.contains("import('./lazy')"));
+        assert_eq!(result.dynamic_imports.len(), 1);
+    }
 }
