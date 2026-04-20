@@ -34,11 +34,18 @@ struct ModuleInfo {
 /// Modules with no used exports, no side effects, and that are not the entry point
 /// are indicated by having ALL their exports listed as unused — the caller can
 /// choose to drop them entirely.
+///
+/// `externally_used` optionally carries a flat set of names that must be preserved
+/// across every module in the chunk regardless of intra-chunk usage. Callers pass
+/// this for the main chunk to reflect symbols consumed cross-chunk by lazy chunks
+/// — such consumption is invisible to the per-chunk analysis below and would
+/// otherwise leave dangling names in the bundler's final `export { ... }` block.
 pub fn analyze_unused_exports(
     module_paths: &[PathBuf],
     all_code: &HashMap<PathBuf, String>,
     entry: &PathBuf,
     local_prefixes: &[&str],
+    externally_used: Option<&HashSet<String>>,
 ) -> NgcResult<HashMap<PathBuf, HashSet<String>>> {
     // Step 1: Parse each module and collect export/import information
     let mut module_infos: HashMap<PathBuf, ModuleInfo> = HashMap::new();
@@ -105,7 +112,8 @@ pub fn analyze_unused_exports(
 
         for name in &info.exported_names {
             let is_used = used.is_some_and(|u| u.contains(name));
-            if !is_used {
+            let is_externally_used = externally_used.is_some_and(|set| set.contains(name));
+            if !is_used && !is_externally_used {
                 unused_names.insert(name.clone());
             }
         }
@@ -250,14 +258,19 @@ fn resolve_local_specifier(
     // For relative imports, resolve against the importer's directory
     let importer_dir = importer.parent()?;
 
-    // Try various extensions and index file patterns
+    // Try various extensions and index file patterns.
+    //
+    // Append extensions by string concatenation rather than `Path::with_extension`,
+    // because filenames like `analytics.service` contain a dot that would
+    // otherwise be treated as an existing extension and replaced.
     let candidates: Vec<PathBuf> = if specifier.starts_with('.') {
         let base = importer_dir.join(specifier);
+        let base_str = base.to_string_lossy().into_owned();
         vec![
             base.clone(),
-            base.with_extension("ts"),
-            base.with_extension("tsx"),
-            base.with_extension("js"),
+            PathBuf::from(format!("{base_str}.ts")),
+            PathBuf::from(format!("{base_str}.tsx")),
+            PathBuf::from(format!("{base_str}.js")),
             base.join("index.ts"),
             base.join("index.js"),
         ]
@@ -291,6 +304,129 @@ fn resolve_local_specifier(
     None
 }
 
+/// Collect symbol names imported by `consumer_modules` from any module in
+/// `provider_modules`, by parsing each consumer's source for `ImportDeclaration`
+/// statements and resolving their specifiers against the provider set.
+///
+/// Used by the bundler to tell the main-chunk tree-shaker which symbols are
+/// consumed by lazy chunks and must therefore be preserved — such consumption
+/// is invisible when shaking each chunk in isolation, and would otherwise
+/// leave the cross-chunk `export { ... }` block referring to names whose
+/// declarations have been tree-shaken away.
+///
+/// For named and default imports, the specific name is collected. For
+/// namespace imports (`import * as X from '...'`), every exported name of
+/// the target provider module is collected since individual accesses can't
+/// be known statically here.
+pub fn collect_cross_chunk_used_names(
+    consumer_modules: &[PathBuf],
+    provider_modules: &[PathBuf],
+    all_code: &HashMap<PathBuf, String>,
+    local_prefixes: &[&str],
+) -> NgcResult<HashSet<String>> {
+    let mut used: HashSet<String> = HashSet::new();
+    let provider_set: HashSet<&PathBuf> = provider_modules.iter().collect();
+
+    // Cache provider exports so we only parse each once when expanding namespace imports.
+    let mut provider_exports: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+
+    for consumer_path in consumer_modules {
+        let Some(code) = all_code.get(consumer_path) else {
+            continue;
+        };
+
+        let info = analyze_module(code, consumer_path)?;
+        for (specifier, imported_names) in &info.local_imports {
+            let Some(target) =
+                resolve_local_specifier(specifier, consumer_path, provider_modules, local_prefixes)
+            else {
+                continue;
+            };
+
+            if !provider_set.contains(&target) {
+                continue;
+            }
+
+            for name in imported_names {
+                if name == "* as " || name.starts_with("* as ") {
+                    // ImportNamespaceSpecifier — `analyze_module` currently drops these
+                    // (returns None), so this branch is defensive. Fall through to the
+                    // dedicated namespace pass below when the signal is present.
+                    continue;
+                }
+                used.insert(name.clone());
+            }
+        }
+
+        // ImportNamespaceSpecifier is not captured by `analyze_module` (which
+        // returns None for namespace imports). Re-parse here to expand them
+        // into the full provider export set for each such import.
+        expand_namespace_imports(
+            code,
+            consumer_path,
+            provider_modules,
+            local_prefixes,
+            all_code,
+            &mut provider_exports,
+            &mut used,
+        )?;
+    }
+
+    Ok(used)
+}
+
+fn expand_namespace_imports(
+    code: &str,
+    consumer_path: &Path,
+    provider_modules: &[PathBuf],
+    local_prefixes: &[&str],
+    all_code: &HashMap<PathBuf, String>,
+    provider_exports: &mut HashMap<PathBuf, HashSet<String>>,
+    used: &mut HashSet<String>,
+) -> NgcResult<()> {
+    let allocator = Allocator::new();
+    let parsed = Parser::new(&allocator, code, SourceType::mjs()).parse();
+    if parsed.panicked {
+        return Ok(());
+    }
+
+    for stmt in &parsed.program.body {
+        let Some(ModuleDeclaration::ImportDeclaration(import)) = stmt.as_module_declaration()
+        else {
+            continue;
+        };
+        let Some(specifiers) = &import.specifiers else {
+            continue;
+        };
+        let has_namespace = specifiers
+            .iter()
+            .any(|s| matches!(s, ImportDeclarationSpecifier::ImportNamespaceSpecifier(_)));
+        if !has_namespace {
+            continue;
+        }
+        let source = import.source.value.to_string();
+        let Some(target) =
+            resolve_local_specifier(&source, consumer_path, provider_modules, local_prefixes)
+        else {
+            continue;
+        };
+        let exports = match provider_exports.get(&target) {
+            Some(e) => e.clone(),
+            None => {
+                let Some(provider_code) = all_code.get(&target) else {
+                    continue;
+                };
+                let info = analyze_module(provider_code, &target)?;
+                provider_exports.insert(target.clone(), info.exported_names.clone());
+                info.exported_names
+            }
+        };
+        used.extend(exports);
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,9 +449,14 @@ mod tests {
             PathBuf::from("/root/main.js"),
         ];
 
-        let result =
-            analyze_unused_exports(&paths, &modules, &PathBuf::from("/root/main.js"), &["."])
-                .expect("should analyze");
+        let result = analyze_unused_exports(
+            &paths,
+            &modules,
+            &PathBuf::from("/root/main.js"),
+            &["."],
+            None,
+        )
+        .expect("should analyze");
 
         let utils_unused = result.get(&PathBuf::from("/root/utils.js"));
         assert!(utils_unused.is_some(), "utils should have unused exports");
@@ -339,9 +480,14 @@ mod tests {
 
         let paths = vec![PathBuf::from("/root/main.ts")];
 
-        let result =
-            analyze_unused_exports(&paths, &modules, &PathBuf::from("/root/main.ts"), &["."])
-                .expect("should analyze");
+        let result = analyze_unused_exports(
+            &paths,
+            &modules,
+            &PathBuf::from("/root/main.ts"),
+            &["."],
+            None,
+        )
+        .expect("should analyze");
 
         assert!(
             !result.contains_key(&PathBuf::from("/root/main.ts")),
@@ -366,13 +512,130 @@ mod tests {
             PathBuf::from("/root/main.ts"),
         ];
 
-        let result =
-            analyze_unused_exports(&paths, &modules, &PathBuf::from("/root/main.ts"), &["."])
-                .expect("should analyze");
+        let result = analyze_unused_exports(
+            &paths,
+            &modules,
+            &PathBuf::from("/root/main.ts"),
+            &["."],
+            None,
+        )
+        .expect("should analyze");
 
         assert!(
             !result.contains_key(&PathBuf::from("/root/side.ts")),
             "side-effect module should not have unused exports listed"
         );
+    }
+
+    #[test]
+    fn test_externally_used_preserves_export() {
+        // When a name is marked externally used (e.g. consumed by a lazy
+        // chunk cross-chunk), it must not be reported as unused even if
+        // no intra-chunk importer references it.
+        let mut modules = HashMap::new();
+        modules.insert(
+            PathBuf::from("/root/svc.js"),
+            "export class AnalyticsService {}\n".to_string(),
+        );
+        modules.insert(
+            PathBuf::from("/root/main.js"),
+            "// main has no import of AnalyticsService\n".to_string(),
+        );
+
+        let paths = vec![
+            PathBuf::from("/root/svc.js"),
+            PathBuf::from("/root/main.js"),
+        ];
+
+        let mut externally_used = HashSet::new();
+        externally_used.insert("AnalyticsService".to_string());
+
+        let result = analyze_unused_exports(
+            &paths,
+            &modules,
+            &PathBuf::from("/root/main.js"),
+            &["."],
+            Some(&externally_used),
+        )
+        .expect("should analyze");
+
+        let svc_unused = result.get(&PathBuf::from("/root/svc.js"));
+        assert!(
+            svc_unused.is_none() || !svc_unused.expect("checked").contains("AnalyticsService"),
+            "externally-used export must not be flagged unused"
+        );
+    }
+
+    #[test]
+    fn test_collect_cross_chunk_used_names_dotted_filename() {
+        // Regression: resolve_local_specifier previously used `with_extension`,
+        // which treated `.service` as an existing extension and replaced it.
+        // Imports like `./foo.service` then failed to resolve against
+        // `foo.service.ts` and cross-chunk consumption was missed.
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let svc = dir.path().join("analytics.service.ts");
+        let comp = dir.path().join("comp.ts");
+        std::fs::write(&svc, "export class AnalyticsService {}\n").expect("write svc");
+        std::fs::write(
+            &comp,
+            "import { AnalyticsService } from './analytics.service';\nnew AnalyticsService();\n",
+        )
+        .expect("write comp");
+
+        let canon_svc = svc.canonicalize().expect("canon svc");
+        let canon_comp = comp.canonicalize().expect("canon comp");
+
+        let mut modules = HashMap::new();
+        modules.insert(
+            canon_svc.clone(),
+            "export class AnalyticsService {}\n".into(),
+        );
+        modules.insert(
+            canon_comp.clone(),
+            "import { AnalyticsService } from './analytics.service';\nnew AnalyticsService();\n"
+                .into(),
+        );
+
+        let used = collect_cross_chunk_used_names(&[canon_comp], &[canon_svc], &modules, &["."])
+            .expect("should collect");
+        assert!(
+            used.contains("AnalyticsService"),
+            "import of ./foo.service must resolve to foo.service.ts"
+        );
+    }
+
+    #[test]
+    fn test_collect_cross_chunk_used_names_named_import() {
+        // A lazy-chunk module imports AnalyticsService from a main-chunk module;
+        // collect_cross_chunk_used_names must surface it. Uses a real tempdir
+        // so resolve_local_specifier's canonicalize step can succeed.
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let main_svc = dir.path().join("svc.js");
+        let lazy_dir = dir.path().join("lazy");
+        std::fs::create_dir_all(&lazy_dir).expect("create lazy dir");
+        let lazy_comp = lazy_dir.join("comp.js");
+        std::fs::write(&main_svc, "export class AnalyticsService {}\n").expect("write svc");
+        std::fs::write(
+            &lazy_comp,
+            "import { AnalyticsService } from '../svc';\nnew AnalyticsService();\n",
+        )
+        .expect("write comp");
+
+        let canon_svc = main_svc.canonicalize().expect("canon svc");
+        let canon_comp = lazy_comp.canonicalize().expect("canon comp");
+
+        let mut modules = HashMap::new();
+        modules.insert(
+            canon_svc.clone(),
+            "export class AnalyticsService {}\n".into(),
+        );
+        modules.insert(
+            canon_comp.clone(),
+            "import { AnalyticsService } from '../svc';\nnew AnalyticsService();\n".into(),
+        );
+
+        let used = collect_cross_chunk_used_names(&[canon_comp], &[canon_svc], &modules, &["."])
+            .expect("should collect");
+        assert!(used.contains("AnalyticsService"));
     }
 }

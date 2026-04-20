@@ -102,8 +102,12 @@ pub fn rewrite_module_with_shaking(
     let mut dynamic_imports: Vec<DynamicImportInfo> = Vec::new();
 
     for stmt in &parsed.program.body {
-        // Walk top-level module declarations (import/export)
-        if let Some(module_decl) = stmt.as_module_declaration() {
+        // Walk top-level module declarations (import/export).
+        // `fully_removed` is true when the statement's span was elided or
+        // entirely replaced, so nested dynamic imports are dead code and
+        // must not be rewritten — their length-changing edits would shift
+        // byte offsets and break the removal edit.
+        let fully_removed = if let Some(module_decl) = stmt.as_module_declaration() {
             collect_module_decl_edits(
                 module_decl,
                 local_prefixes,
@@ -113,16 +117,19 @@ pub fn rewrite_module_with_shaking(
                 bundled_specifiers,
                 namespace_map,
                 preserve_exports,
+            )
+        } else {
+            false
+        };
+
+        if !fully_removed {
+            collect_dynamic_import_edits(
+                stmt,
+                dynamic_import_rewrites,
+                &mut edits,
+                &mut dynamic_imports,
             );
         }
-
-        // Walk all expressions recursively for dynamic import()
-        collect_dynamic_import_edits(
-            stmt,
-            dynamic_import_rewrites,
-            &mut edits,
-            &mut dynamic_imports,
-        );
     }
 
     let code = apply_edits(js_code, &mut edits);
@@ -135,6 +142,13 @@ pub fn rewrite_module_with_shaking(
 }
 
 /// Process a top-level module declaration (import/export) and collect edits.
+///
+/// Returns `true` when the statement's full span was elided from output
+/// (either removed outright or replaced wholesale). The caller uses this
+/// signal to skip nested dynamic-import rewriting for that statement —
+/// nested `import()` calls inside a fully-removed span are dead code, and
+/// their length-changing edits would shift byte offsets and corrupt the
+/// removal edit's `end` position.
 #[allow(clippy::too_many_arguments)]
 fn collect_module_decl_edits(
     module_decl: &ModuleDeclaration,
@@ -145,7 +159,7 @@ fn collect_module_decl_edits(
     bundled_specifiers: &HashSet<String>,
     namespace_map: &HashMap<String, String>,
     preserve_exports: bool,
-) {
+) -> bool {
     match module_decl {
         ModuleDeclaration::ImportDeclaration(import) => {
             let source = import.source.value.as_str();
@@ -233,16 +247,19 @@ fn collect_module_decl_edits(
                     replacement: None,
                 });
             }
+            true
         }
         ModuleDeclaration::ExportNamedDeclaration(export) => {
             if preserve_exports {
                 // Keep exports intact for lazy chunk entry modules
+                false
             } else if export.source.is_some() {
                 edits.push(TextEdit {
                     start: export.span.start,
                     end: export.span.end,
                     replacement: None,
                 });
+                true
             } else if let Some(decl) = &export.declaration {
                 // Check if this export's declaration name is in the unused set
                 let decl_name = get_declaration_name(decl);
@@ -257,34 +274,41 @@ fn collect_module_decl_edits(
                         end: export.span.end,
                         replacement: None,
                     });
+                    true
                 } else {
-                    // Just strip the "export " keyword
+                    // Just strip the "export " keyword; body is preserved
+                    // so nested dynamic imports still need rewriting.
                     edits.push(TextEdit {
                         start: export.span.start,
                         end: export.span.start + 7, // "export "
                         replacement: None,
                     });
+                    false
                 }
-            } else if !preserve_exports {
+            } else {
                 edits.push(TextEdit {
                     start: export.span.start,
                     end: export.span.end,
                     replacement: None,
                 });
+                true
             }
         }
         ModuleDeclaration::ExportDefaultDeclaration(export) => {
             if preserve_exports {
                 // Keep exports intact for lazy chunk entry modules
+                false
             } else {
                 match &export.declaration {
                     ExportDefaultDeclarationKind::FunctionDeclaration(_)
                     | ExportDefaultDeclarationKind::ClassDeclaration(_) => {
+                        // Only strip "export default "; body preserved.
                         edits.push(TextEdit {
                             start: export.span.start,
                             end: export.span.start + 15, // "export default "
                             replacement: None,
                         });
+                        false
                     }
                     _ => {
                         edits.push(TextEdit {
@@ -292,9 +316,10 @@ fn collect_module_decl_edits(
                             end: export.span.end,
                             replacement: None,
                         });
+                        true
                     }
                 }
-            } // close else block for preserve_exports
+            }
         }
         ModuleDeclaration::ExportAllDeclaration(export)
             if is_local(
@@ -308,8 +333,9 @@ fn collect_module_decl_edits(
                 end: export.span.end,
                 replacement: None,
             });
+            true
         }
-        _ => {}
+        _ => false,
     }
 }
 
@@ -720,6 +746,129 @@ mod tests {
         rewrites.insert("./lazy".to_string(), "chunk-lazy.js".to_string());
         let result = rewrite_module(code, "test.js", &["."], &rewrites).expect("should rewrite");
         assert!(result.code.contains("'./chunk-lazy.js'"));
+        assert_eq!(result.dynamic_imports.len(), 1);
+    }
+
+    #[test]
+    fn test_unused_export_const_with_nested_dynamic_import_fully_removed() {
+        // Issue #13 repro: a tree-shaken export containing a dynamic import
+        // must not produce both a removal edit and a lengthening specifier
+        // rewrite — the removal's `end` offset would point inside the grown
+        // replacement, leaving a stray `export` keyword.
+        let code =
+            "export const routes = [{ loadComponent: () => import('./lazy').then(m => m.C) }];\n";
+        let mut rewrites = HashMap::new();
+        rewrites.insert("./lazy".to_string(), "chunk-lazy.js".to_string());
+        let mut unused = HashSet::new();
+        unused.insert("routes".to_string());
+
+        let result = rewrite_module_with_shaking(
+            code,
+            "test.js",
+            &["."],
+            &rewrites,
+            Some(&unused),
+            &HashSet::new(),
+            &HashMap::new(),
+            false,
+        )
+        .expect("should rewrite");
+
+        assert!(
+            result.code.trim().is_empty(),
+            "expected empty output, got: {:?}",
+            result.code
+        );
+        assert!(!result.code.contains("export"));
+        assert!(!result.code.contains("chunk-lazy.js"));
+        assert!(!result.code.contains("./lazy"));
+        assert!(result.dynamic_imports.is_empty());
+    }
+
+    #[test]
+    fn test_used_export_const_with_nested_dynamic_import_is_rewritten() {
+        // Opposite of the prior test: when the export is used, the body is
+        // kept (only `export ` stripped) and the nested dynamic import is
+        // rewritten to its chunk filename.
+        let code =
+            "export const routes = [{ loadComponent: () => import('./lazy').then(m => m.C) }];\n";
+        let mut rewrites = HashMap::new();
+        rewrites.insert("./lazy".to_string(), "chunk-lazy.js".to_string());
+        let empty_unused: HashSet<String> = HashSet::new();
+
+        let result = rewrite_module_with_shaking(
+            code,
+            "test.js",
+            &["."],
+            &rewrites,
+            Some(&empty_unused),
+            &HashSet::new(),
+            &HashMap::new(),
+            false,
+        )
+        .expect("should rewrite");
+
+        assert!(result.code.contains("const routes"));
+        assert!(!result.code.contains("export"));
+        assert!(result.code.contains("'./chunk-lazy.js'"));
+        assert!(!result.code.contains("import('./lazy')"));
+        assert_eq!(result.dynamic_imports.len(), 1);
+    }
+
+    #[test]
+    fn test_unused_export_function_with_nested_dynamic_import_fully_removed() {
+        let code = "export function loadIt() { return import('./lazy'); }\n";
+        let mut rewrites = HashMap::new();
+        rewrites.insert("./lazy".to_string(), "chunk-lazy.js".to_string());
+        let mut unused = HashSet::new();
+        unused.insert("loadIt".to_string());
+
+        let result = rewrite_module_with_shaking(
+            code,
+            "test.js",
+            &["."],
+            &rewrites,
+            Some(&unused),
+            &HashSet::new(),
+            &HashMap::new(),
+            false,
+        )
+        .expect("should rewrite");
+
+        assert!(
+            result.code.trim().is_empty(),
+            "expected empty output, got: {:?}",
+            result.code
+        );
+        assert!(!result.code.contains("export"));
+        assert!(!result.code.contains("chunk-lazy.js"));
+        assert!(!result.code.contains("./lazy"));
+        assert!(result.dynamic_imports.is_empty());
+    }
+
+    #[test]
+    fn test_used_export_function_with_nested_dynamic_import_is_rewritten() {
+        let code = "export function loadIt() { return import('./lazy'); }\n";
+        let mut rewrites = HashMap::new();
+        rewrites.insert("./lazy".to_string(), "chunk-lazy.js".to_string());
+        let empty_unused: HashSet<String> = HashSet::new();
+
+        let result = rewrite_module_with_shaking(
+            code,
+            "test.js",
+            &["."],
+            &rewrites,
+            Some(&empty_unused),
+            &HashSet::new(),
+            &HashMap::new(),
+            false,
+        )
+        .expect("should rewrite");
+
+        assert!(result.code.contains("function loadIt"));
+        assert!(!result.code.contains("export"));
+        assert!(result.code.contains("'./chunk-lazy.js'"));
+        assert!(!result.code.contains("import('./lazy')"));
         assert_eq!(result.dynamic_imports.len(), 1);
     }
 }
