@@ -326,12 +326,10 @@ fn visit_class(
 
 fn visit_expr(expr: &Expression<'_>, source: &str, registry: &ModuleRegistry, count: &mut usize) {
     match expr {
-        Expression::CallExpression(call) => {
-            if is_define_ng_module(call) {
-                if let Some(obj) = first_object_arg(call) {
-                    register_from_define(obj, source, registry);
-                    *count += 1;
-                }
+        Expression::CallExpression(call) if is_define_ng_module(call) => {
+            if let Some(obj) = first_object_arg(call) {
+                register_from_define(obj, source, registry);
+                *count += 1;
             }
         }
         Expression::AssignmentExpression(assign) => {
