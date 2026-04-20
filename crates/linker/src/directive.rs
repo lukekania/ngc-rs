@@ -874,6 +874,34 @@ mod tests {
     }
 
     #[test]
+    fn test_host_binding_attr() {
+        let result = parse_and_transform(
+            "{ type: RouterLink, selector: 'a[routerLink]', host: { properties: { 'attr.href': 'href' } } }",
+        );
+        assert!(
+            result.contains("i0.\u{0275}\u{0275}attribute(\"href\", ctx.href)"),
+            "expected ɵɵattribute call for attr.href, got: {result}"
+        );
+        assert!(!result.contains("\u{0275}\u{0275}property(\"attr.href\""));
+        assert!(result.contains("hostVars: 1"));
+    }
+
+    #[test]
+    fn test_host_binding_attr_mixed() {
+        let result = parse_and_transform(
+            "{ type: MyDir, selector: '[myDir]', host: { properties: { 'attr.href': 'href', 'class.active': 'isActive', 'disabled': 'isDisabled' } } }",
+        );
+        assert!(result.contains("i0.\u{0275}\u{0275}attribute(\"href\", ctx.href)"));
+        assert!(result.contains("i0.\u{0275}\u{0275}classProp(\"active\", ctx.isActive)"));
+        assert!(result.contains("i0.\u{0275}\u{0275}property(\"disabled\", ctx.isDisabled)"));
+        // attr (1) + class (2) + property (1) = 4
+        assert!(
+            result.contains("hostVars: 4"),
+            "expected hostVars: 4, got: {result}"
+        );
+    }
+
+    #[test]
     fn test_compile_host_expression_simple() {
         assert_eq!(compile_host_expression("checked"), "ctx.checked");
     }
