@@ -156,6 +156,12 @@ fn is_npm_module(path: &Path) -> bool {
     path.components().any(|c| c.as_os_str() == "node_modules")
 }
 
+/// Public version of [`is_npm_module`] for consumers (the CLI's post-link
+/// scan needs to filter project files vs. npm files).
+pub fn is_npm_path(path: &Path) -> bool {
+    is_npm_module(path)
+}
+
 /// Fast check whether a source file might contain Angular partial declarations.
 ///
 /// Uses a simple substring check — much faster than parsing.

@@ -259,7 +259,18 @@ fn run_build(
     // — so we re-scan and resolve the delta, folding the new modules +
     // internal edges into `npm_resolution` so the graph-construction below
     // picks them up.
-    let post_link_specifiers = scan_transformed_bare_specifiers(&modules, &local_prefixes);
+    //
+    // Scope the scan to PROJECT files only. Scanning npm files pulls in
+    // spurious specifiers from packages' embedded test/dev code (e.g.
+    // `@vitest/*`, `pathe`, `tinyrainbow`) that the app never reaches but
+    // which, once linked, can corrupt the evaluation order of unrelated
+    // modules — observed in treasr-frontend as a silent dialog failure.
+    let project_modules: HashMap<PathBuf, String> = modules
+        .iter()
+        .filter(|(path, _)| !ngc_linker::is_npm_path(path))
+        .map(|(p, s)| (p.clone(), s.clone()))
+        .collect();
+    let post_link_specifiers = scan_transformed_bare_specifiers(&project_modules, &local_prefixes);
     let mut new_specifiers: Vec<String> = Vec::new();
     for spec in post_link_specifiers {
         if !bare_specifiers.contains(&spec) {
@@ -279,7 +290,9 @@ fn run_build(
             extra.modules.len()
         );
         for (path, source) in &extra.modules {
-            modules.entry(path.clone()).or_insert_with(|| source.clone());
+            modules
+                .entry(path.clone())
+                .or_insert_with(|| source.clone());
             npm_resolution
                 .modules
                 .entry(path.clone())
