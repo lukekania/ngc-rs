@@ -9,10 +9,12 @@
 //! ```ignore
 //! use std::collections::HashMap;
 //! use std::path::PathBuf;
+//! use ngc_linker::ModuleRegistry;
 //!
 //! let mut modules: HashMap<PathBuf, String> = HashMap::new();
 //! // ... populate with npm module sources ...
-//! let stats = ngc_linker::link_npm_modules(&mut modules, &project_root)?;
+//! let registry = ModuleRegistry::new();
+//! let stats = ngc_linker::link_npm_modules(&mut modules, &project_root, &registry)?;
 //! println!("Linked {} files", stats.files_linked);
 //! ```
 
@@ -20,11 +22,18 @@ mod class_metadata;
 mod component;
 mod directive;
 mod factory;
+/// Post-link pass that expands NgModule references in component `dependencies`
+/// arrays using the [`module_registry::ModuleRegistry`].
+pub mod flatten;
 mod injectable;
 mod injector;
 mod metadata;
+/// Build-time NgModule registry and import-flattening primitives.
+pub mod module_registry;
 mod ng_module;
 mod pipe;
+/// Map of publicly-exported npm identifier → best import specifier.
+pub mod public_exports;
 mod selector;
 /// Low-level linking API for transforming a single source file.
 pub mod transform;
@@ -34,25 +43,36 @@ use std::path::{Path, PathBuf};
 
 use ngc_diagnostics::NgcResult;
 
+pub use module_registry::ModuleRegistry;
+pub use public_exports::PublicExports;
+
 /// Statistics from the linking process.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LinkerStats {
     /// Number of npm files scanned for declarations.
     pub files_scanned: usize,
     /// Number of files that contained `ɵɵngDeclare*` calls and were linked.
     pub files_linked: usize,
+    /// Number of `ɵɵdefineNgModule` calls scanned in Pass A.
+    pub modules_registered: usize,
+    /// Number of files whose component `dependencies` arrays were rewritten
+    /// to expand NgModule references into flat directive/pipe lists.
+    pub components_flattened: usize,
 }
 
 /// Link all partially compiled Angular npm modules in the modules map.
 ///
 /// Scans all modules whose paths contain `node_modules` for `ɵɵngDeclare*`
 /// calls. Files that contain declarations are parsed, transformed, and their
-/// source is replaced in the map.
+/// source is replaced in the map. Any `ɵɵngDeclareNgModule` calls encountered
+/// are also registered in `registry` so a later flatten pass can resolve
+/// standalone-component `imports` arrays.
 ///
 /// Files without `ɵɵngDeclare` are skipped with zero overhead (fast string check).
 pub fn link_npm_modules(
     modules: &mut HashMap<PathBuf, String>,
     _project_root: &Path,
+    registry: &ModuleRegistry,
 ) -> NgcResult<LinkerStats> {
     let mut files_scanned = 0;
     let mut files_linked = 0;
@@ -73,7 +93,7 @@ pub fn link_npm_modules(
     for path in paths_to_link {
         if let Some(source) = modules.get(&path) {
             let source = source.clone();
-            match transform::link_source(&source, &path)? {
+            match transform::link_source(&source, &path, registry)? {
                 Some(linked) => {
                     modules.insert(path.clone(), linked);
                     files_linked += 1;
@@ -90,12 +110,56 @@ pub fn link_npm_modules(
     Ok(LinkerStats {
         files_scanned,
         files_linked,
+        ..LinkerStats::default()
     })
+}
+
+/// Full Angular module-linking orchestrator.
+///
+/// Runs three passes in order:
+/// 1. [`link_npm_modules`] — rewrites npm `ɵɵngDeclare*` partial declarations
+///    into fully-compiled `ɵɵdefine*` calls, and registers each NgModule in
+///    `registry` as a side effect.
+/// 2. [`module_registry::scan_define_ng_modules`] — registers any remaining
+///    `ɵɵdefineNgModule` calls (project AOT output, pre-compiled npm bundles).
+/// 3. [`flatten::flatten_component_dependencies`] — walks every
+///    `ɵɵdefineComponent` and expands NgModule references in its
+///    `dependencies` array to transitively-exported directives/pipes. This is
+///    what removes the need for the runtime `ɵɵgetComponentDepsFactory`
+///    helper and fixes reactive-forms `NG01050` errors inside dialogs.
+pub fn link_modules(
+    modules: &mut HashMap<PathBuf, String>,
+    project_root: &Path,
+) -> NgcResult<LinkerStats> {
+    let registry = ModuleRegistry::new();
+    let public_exports = PublicExports::new();
+    let mut stats = link_npm_modules(modules, project_root, &registry)?;
+
+    // Build the public-exports index by scanning every npm file's top-level
+    // `export { … }` statements. Needed so the flatten pass can target the
+    // correct import specifier for each directive it adds.
+    for (path, source) in modules.iter() {
+        if !is_npm_module(path) {
+            continue;
+        }
+        public_exports.scan_file(source, path);
+    }
+
+    stats.modules_registered = module_registry::scan_define_ng_modules(modules, &registry)?;
+    stats.components_flattened =
+        flatten::flatten_component_dependencies(modules, &registry, &public_exports)?;
+    Ok(stats)
 }
 
 /// Check whether a path is inside node_modules.
 fn is_npm_module(path: &Path) -> bool {
     path.components().any(|c| c.as_os_str() == "node_modules")
+}
+
+/// Public version of [`is_npm_module`] for consumers (the CLI's post-link
+/// scan needs to filter project files vs. npm files).
+pub fn is_npm_path(path: &Path) -> bool {
+    is_npm_module(path)
 }
 
 /// Fast check whether a source file might contain Angular partial declarations.
@@ -134,7 +198,8 @@ mod tests {
             PathBuf::from("/project/src/app.ts"),
             "export class App {}".to_string(),
         );
-        let stats = link_npm_modules(&mut modules, Path::new("/project")).unwrap();
+        let registry = ModuleRegistry::new();
+        let stats = link_npm_modules(&mut modules, Path::new("/project"), &registry).unwrap();
         assert_eq!(stats.files_scanned, 0);
         assert_eq!(stats.files_linked, 0);
     }
@@ -146,7 +211,8 @@ mod tests {
             PathBuf::from("/project/node_modules/lodash/lodash.mjs"),
             "export function chunk() {}".to_string(),
         );
-        let stats = link_npm_modules(&mut modules, Path::new("/project")).unwrap();
+        let registry = ModuleRegistry::new();
+        let stats = link_npm_modules(&mut modules, Path::new("/project"), &registry).unwrap();
         assert_eq!(stats.files_scanned, 1);
         assert_eq!(stats.files_linked, 0);
     }
@@ -170,7 +236,8 @@ export { MyService };"#;
             source,
         );
 
-        let stats = link_npm_modules(&mut modules, Path::new("/project")).unwrap();
+        let registry = ModuleRegistry::new();
+        let stats = link_npm_modules(&mut modules, Path::new("/project"), &registry).unwrap();
         assert_eq!(stats.files_linked, 1);
 
         let linked = modules
@@ -179,5 +246,27 @@ export { MyService };"#;
         assert!(!linked.contains("\u{0275}\u{0275}ngDeclare"));
         assert!(linked.contains("_Factory"));
         assert!(linked.contains("\u{0275}\u{0275}defineInjectable"));
+    }
+
+    #[test]
+    fn test_link_npm_modules_registers_ng_module_exports() {
+        let mut modules = HashMap::new();
+        let source = "import * as i0 from '@angular/core';\n\
+class ReactiveFormsModule {}\n\
+ReactiveFormsModule.\u{0275}mod = i0.\u{0275}\u{0275}ngDeclareNgModule({ minVersion: \"14.0.0\", version: \"17.0.0\", ngImport: i0, type: ReactiveFormsModule, exports: [FormGroupDirective, FormControlName] });\n\
+export { ReactiveFormsModule };";
+        modules.insert(
+            PathBuf::from("/project/node_modules/@angular/forms/index.mjs"),
+            source.to_string(),
+        );
+
+        let registry = ModuleRegistry::new();
+        let stats = link_npm_modules(&mut modules, Path::new("/project"), &registry).unwrap();
+        assert_eq!(stats.files_linked, 1);
+        assert!(registry.is_module("ReactiveFormsModule"));
+        assert_eq!(
+            registry.flatten("ReactiveFormsModule"),
+            vec!["FormGroupDirective", "FormControlName"]
+        );
     }
 }

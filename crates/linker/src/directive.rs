@@ -93,6 +93,13 @@ pub fn build_define_call(
     // Features — only emit features that exist in the Angular runtime.
     // Note: ɵɵStandaloneFeature was removed in Angular 19+; standalone is now
     // handled via the `standalone: true` property on the definition (emitted above).
+    //
+    // `ɵɵProvidersFeature(providers[, viewProviders])` is what actually wires
+    // directive `providers` into the node injector at instantiation time.
+    // Without it, `providers` on the directive def is dead weight — directly
+    // visible as `NG0201 No provider for NgControl` when e.g. `FormControlName`
+    // declares `{provide: NgControl, useExisting: FormControlName}` but
+    // `NgControlStatus` can't resolve it.
     let mut features = Vec::new();
     if metadata::get_bool_prop(obj, "usesInheritance") == Some(true) {
         let feat = if ng_import.is_empty() {
@@ -110,13 +117,29 @@ pub fn build_define_call(
         };
         features.push(feat);
     }
-    if !features.is_empty() {
-        props.push(format!("features: [{}]", features.join(", ")));
+
+    // Providers — emit BOTH the `providers` property on the def (for Angular's
+    // own introspection) AND a `ɵɵProvidersFeature(providers[, viewProviders])`
+    // call in `features` (which is what actually registers them at runtime).
+    let providers_src = metadata::get_source_text(obj, "providers", source);
+    let view_providers_src = metadata::get_source_text(obj, "viewProviders", source);
+    if let Some(providers) = providers_src {
+        props.push(format!("providers: {providers}"));
+        let providers_feature = if ng_import.is_empty() {
+            "\u{0275}\u{0275}ProvidersFeature".to_string()
+        } else {
+            format!("{ng_import}.\u{0275}\u{0275}ProvidersFeature")
+        };
+        let call = if let Some(vp) = view_providers_src {
+            format!("{providers_feature}({providers}, {vp})")
+        } else {
+            format!("{providers_feature}({providers})")
+        };
+        features.push(call);
     }
 
-    // Providers
-    if let Some(providers) = metadata::get_source_text(obj, "providers", source) {
-        props.push(format!("providers: {providers}"));
+    if !features.is_empty() {
+        props.push(format!("features: [{}]", features.join(", ")));
     }
 
     // Content queries: compile from declare format (array of descriptors) to runtime
@@ -174,6 +197,33 @@ fn build_inputs(obj: &ObjectExpression<'_>, source: &str) -> Option<String> {
                     } else {
                         entries.push(format!("{key}: '{key}'"));
                     }
+                }
+                Expression::ArrayExpression(arr) => {
+                    // Declare format uses a 2-element array `[publicName, declaredName]`.
+                    // The Angular 21 runtime format is `[flags, publicName, declaredName, transform?]`
+                    // — a leading numeric `flags` value is required or the array
+                    // positions shift (publicName ends up where flags should be),
+                    // breaking input binding silently (e.g. `[formGroup]` never
+                    // propagates to `FormGroupDirective.form`).
+                    let elements: Vec<&str> = arr
+                        .elements
+                        .iter()
+                        .map(|el| {
+                            let sp = el.span();
+                            &source[sp.start as usize..sp.end as usize]
+                        })
+                        .collect();
+                    // If the first element is already a number, assume it's runtime-format.
+                    let first_is_number = elements.first().is_some_and(|s| {
+                        s.trim().chars().next().is_some_and(|c| c.is_ascii_digit())
+                    });
+                    let runtime = if first_is_number {
+                        format!("[{}]", elements.join(", "))
+                    } else {
+                        // Prepend `0` flags.
+                        format!("[0, {}]", elements.join(", "))
+                    };
+                    entries.push(format!("{key}: {runtime}"));
                 }
                 _ => {
                     // Pass through as source text

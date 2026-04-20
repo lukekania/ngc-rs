@@ -12,6 +12,7 @@ use oxc_ast::ast::{CallExpression, Expression, Program, Statement};
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
 
+use crate::module_registry::ModuleRegistry;
 use crate::{class_metadata, component, directive, factory, injectable, injector, ng_module, pipe};
 
 /// A single text replacement to apply to the source.
@@ -90,7 +91,13 @@ fn get_ng_import_alias(call: &CallExpression<'_>) -> Option<String> {
 /// Transform a single npm module source by linking all `ɵɵngDeclare*` calls.
 ///
 /// Returns the transformed source, or `None` if no declarations were found.
-pub fn link_source(source: &str, file_path: &Path) -> NgcResult<Option<String>> {
+/// Any `ɵɵngDeclareNgModule` calls encountered are also registered in
+/// `registry` so the post-link flatten pass can expand them.
+pub fn link_source(
+    source: &str,
+    file_path: &Path,
+    registry: &ModuleRegistry,
+) -> NgcResult<Option<String>> {
     let alloc = Allocator::default();
     let parsed = Parser::new(&alloc, source, SourceType::mjs()).parse();
 
@@ -102,7 +109,13 @@ pub fn link_source(source: &str, file_path: &Path) -> NgcResult<Option<String>> 
     }
 
     let mut replacements = Vec::new();
-    collect_replacements(&parsed.program, source, file_path, &mut replacements)?;
+    collect_replacements(
+        &parsed.program,
+        source,
+        file_path,
+        registry,
+        &mut replacements,
+    )?;
 
     if replacements.is_empty() {
         return Ok(None);
@@ -124,10 +137,11 @@ fn collect_replacements(
     program: &Program<'_>,
     source: &str,
     file_path: &Path,
+    registry: &ModuleRegistry,
     replacements: &mut Vec<Replacement>,
 ) -> NgcResult<()> {
     for stmt in &program.body {
-        visit_statement(stmt, source, file_path, replacements)?;
+        visit_statement(stmt, source, file_path, registry, replacements)?;
     }
     Ok(())
 }
@@ -137,16 +151,23 @@ fn visit_statement(
     stmt: &Statement<'_>,
     source: &str,
     file_path: &Path,
+    registry: &ModuleRegistry,
     replacements: &mut Vec<Replacement>,
 ) -> NgcResult<()> {
     match stmt {
         Statement::ExpressionStatement(expr_stmt) => {
-            visit_expression(&expr_stmt.expression, source, file_path, replacements)?;
+            visit_expression(
+                &expr_stmt.expression,
+                source,
+                file_path,
+                registry,
+                replacements,
+            )?;
         }
         Statement::VariableDeclaration(decl) => {
             for declarator in &decl.declarations {
                 if let Some(init) = &declarator.init {
-                    visit_expression(init, source, file_path, replacements)?;
+                    visit_expression(init, source, file_path, registry, replacements)?;
                 }
             }
         }
@@ -156,12 +177,12 @@ fn visit_statement(
                     oxc_ast::ast::Declaration::VariableDeclaration(var_decl) => {
                         for declarator in &var_decl.declarations {
                             if let Some(init) = &declarator.init {
-                                visit_expression(init, source, file_path, replacements)?;
+                                visit_expression(init, source, file_path, registry, replacements)?;
                             }
                         }
                     }
                     oxc_ast::ast::Declaration::ClassDeclaration(class) => {
-                        visit_class_body(class, source, file_path, replacements)?;
+                        visit_class_body(class, source, file_path, registry, replacements)?;
                     }
                     _ => {}
                 }
@@ -171,11 +192,11 @@ fn visit_statement(
             if let oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(class) =
                 &export.declaration
             {
-                visit_class_body(class, source, file_path, replacements)?;
+                visit_class_body(class, source, file_path, registry, replacements)?;
             }
         }
         Statement::ClassDeclaration(class) => {
-            visit_class_body(class, source, file_path, replacements)?;
+            visit_class_body(class, source, file_path, registry, replacements)?;
         }
         _ => {}
     }
@@ -188,19 +209,20 @@ fn visit_class_body(
     class: &oxc_ast::ast::Class<'_>,
     source: &str,
     file_path: &Path,
+    registry: &ModuleRegistry,
     replacements: &mut Vec<Replacement>,
 ) -> NgcResult<()> {
     for element in &class.body.body {
         match element {
             oxc_ast::ast::ClassElement::PropertyDefinition(prop) => {
                 if let Some(ref init) = prop.value {
-                    visit_expression(init, source, file_path, replacements)?;
+                    visit_expression(init, source, file_path, registry, replacements)?;
                 }
             }
             oxc_ast::ast::ClassElement::StaticBlock(block) => {
                 // static { this.ɵfac = i0.ɵɵngDeclareFactory({...}); }
                 for stmt in &block.body {
-                    visit_statement(stmt, source, file_path, replacements)?;
+                    visit_statement(stmt, source, file_path, registry, replacements)?;
                 }
             }
             _ => {}
@@ -214,24 +236,27 @@ fn visit_expression(
     expr: &Expression<'_>,
     source: &str,
     file_path: &Path,
+    registry: &ModuleRegistry,
     replacements: &mut Vec<Replacement>,
 ) -> NgcResult<()> {
     match expr {
         Expression::CallExpression(call) => {
-            if let Some(replacement) = try_transform_declare_call(call, source, file_path)? {
+            if let Some(replacement) =
+                try_transform_declare_call(call, source, file_path, registry)?
+            {
                 replacements.push(replacement);
             }
         }
         Expression::AssignmentExpression(assign) => {
-            visit_expression(&assign.right, source, file_path, replacements)?;
+            visit_expression(&assign.right, source, file_path, registry, replacements)?;
         }
         Expression::SequenceExpression(seq) => {
             for expr in &seq.expressions {
-                visit_expression(expr, source, file_path, replacements)?;
+                visit_expression(expr, source, file_path, registry, replacements)?;
             }
         }
         Expression::ClassExpression(class) => {
-            visit_class_body(class, source, file_path, replacements)?;
+            visit_class_body(class, source, file_path, registry, replacements)?;
         }
         _ => {}
     }
@@ -245,6 +270,7 @@ fn try_transform_declare_call(
     call: &CallExpression<'_>,
     source: &str,
     file_path: &Path,
+    registry: &ModuleRegistry,
 ) -> NgcResult<Option<Replacement>> {
     let callee_name = match get_callee_name(call) {
         Some(name) => name,
@@ -281,7 +307,7 @@ fn try_transform_declare_call(
         DeclareKind::Factory => factory::transform(obj, source, &ng_import)?,
         DeclareKind::Injectable => injectable::transform(obj, source, &ng_import)?,
         DeclareKind::Injector => injector::transform(obj, source, &ng_import)?,
-        DeclareKind::NgModule => ng_module::transform(obj, source, &ng_import)?,
+        DeclareKind::NgModule => ng_module::transform(obj, source, &ng_import, registry)?,
         DeclareKind::Pipe => pipe::transform(obj, source, &ng_import)?,
         DeclareKind::Directive => directive::transform(obj, source, &ng_import, file_path)?,
         DeclareKind::Component => component::transform(obj, source, &ng_import, file_path)?,
@@ -321,7 +347,8 @@ mod tests {
     #[test]
     fn test_no_declarations_returns_none() {
         let source = "export class Foo { bar() {} }";
-        let result = link_source(source, &PathBuf::from("test.mjs")).unwrap();
+        let registry = ModuleRegistry::new();
+        let result = link_source(source, &PathBuf::from("test.mjs"), &registry).unwrap();
         assert!(result.is_none());
     }
 }
