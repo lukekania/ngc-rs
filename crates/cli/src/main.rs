@@ -236,7 +236,8 @@ fn run_build(
     }
 
     // Step 6.6: Link partially compiled Angular npm packages
-    let linker_stats = ngc_linker::link_npm_modules(&mut modules, &config_dir)?;
+    let module_registry = ngc_linker::ModuleRegistry::new();
+    let linker_stats = ngc_linker::link_npm_modules(&mut modules, &config_dir, &module_registry)?;
     if linker_stats.files_linked > 0 {
         tracing::info!(
             "linked {} Angular package file(s)",

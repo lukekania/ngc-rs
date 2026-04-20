@@ -9,10 +9,12 @@
 //! ```ignore
 //! use std::collections::HashMap;
 //! use std::path::PathBuf;
+//! use ngc_linker::ModuleRegistry;
 //!
 //! let mut modules: HashMap<PathBuf, String> = HashMap::new();
 //! // ... populate with npm module sources ...
-//! let stats = ngc_linker::link_npm_modules(&mut modules, &project_root)?;
+//! let registry = ModuleRegistry::new();
+//! let stats = ngc_linker::link_npm_modules(&mut modules, &project_root, &registry)?;
 //! println!("Linked {} files", stats.files_linked);
 //! ```
 
@@ -36,6 +38,8 @@ use std::path::{Path, PathBuf};
 
 use ngc_diagnostics::NgcResult;
 
+pub use module_registry::ModuleRegistry;
+
 /// Statistics from the linking process.
 #[derive(Debug, Clone)]
 pub struct LinkerStats {
@@ -49,12 +53,15 @@ pub struct LinkerStats {
 ///
 /// Scans all modules whose paths contain `node_modules` for `ɵɵngDeclare*`
 /// calls. Files that contain declarations are parsed, transformed, and their
-/// source is replaced in the map.
+/// source is replaced in the map. Any `ɵɵngDeclareNgModule` calls encountered
+/// are also registered in `registry` so a later flatten pass can resolve
+/// standalone-component `imports` arrays.
 ///
 /// Files without `ɵɵngDeclare` are skipped with zero overhead (fast string check).
 pub fn link_npm_modules(
     modules: &mut HashMap<PathBuf, String>,
     _project_root: &Path,
+    registry: &ModuleRegistry,
 ) -> NgcResult<LinkerStats> {
     let mut files_scanned = 0;
     let mut files_linked = 0;
@@ -75,7 +82,7 @@ pub fn link_npm_modules(
     for path in paths_to_link {
         if let Some(source) = modules.get(&path) {
             let source = source.clone();
-            match transform::link_source(&source, &path)? {
+            match transform::link_source(&source, &path, registry)? {
                 Some(linked) => {
                     modules.insert(path.clone(), linked);
                     files_linked += 1;
@@ -136,7 +143,8 @@ mod tests {
             PathBuf::from("/project/src/app.ts"),
             "export class App {}".to_string(),
         );
-        let stats = link_npm_modules(&mut modules, Path::new("/project")).unwrap();
+        let registry = ModuleRegistry::new();
+        let stats = link_npm_modules(&mut modules, Path::new("/project"), &registry).unwrap();
         assert_eq!(stats.files_scanned, 0);
         assert_eq!(stats.files_linked, 0);
     }
@@ -148,7 +156,8 @@ mod tests {
             PathBuf::from("/project/node_modules/lodash/lodash.mjs"),
             "export function chunk() {}".to_string(),
         );
-        let stats = link_npm_modules(&mut modules, Path::new("/project")).unwrap();
+        let registry = ModuleRegistry::new();
+        let stats = link_npm_modules(&mut modules, Path::new("/project"), &registry).unwrap();
         assert_eq!(stats.files_scanned, 1);
         assert_eq!(stats.files_linked, 0);
     }
@@ -172,7 +181,8 @@ export { MyService };"#;
             source,
         );
 
-        let stats = link_npm_modules(&mut modules, Path::new("/project")).unwrap();
+        let registry = ModuleRegistry::new();
+        let stats = link_npm_modules(&mut modules, Path::new("/project"), &registry).unwrap();
         assert_eq!(stats.files_linked, 1);
 
         let linked = modules
@@ -181,5 +191,27 @@ export { MyService };"#;
         assert!(!linked.contains("\u{0275}\u{0275}ngDeclare"));
         assert!(linked.contains("_Factory"));
         assert!(linked.contains("\u{0275}\u{0275}defineInjectable"));
+    }
+
+    #[test]
+    fn test_link_npm_modules_registers_ng_module_exports() {
+        let mut modules = HashMap::new();
+        let source = "import * as i0 from '@angular/core';\n\
+class ReactiveFormsModule {}\n\
+ReactiveFormsModule.\u{0275}mod = i0.\u{0275}\u{0275}ngDeclareNgModule({ minVersion: \"14.0.0\", version: \"17.0.0\", ngImport: i0, type: ReactiveFormsModule, exports: [FormGroupDirective, FormControlName] });\n\
+export { ReactiveFormsModule };";
+        modules.insert(
+            PathBuf::from("/project/node_modules/@angular/forms/index.mjs"),
+            source.to_string(),
+        );
+
+        let registry = ModuleRegistry::new();
+        let stats = link_npm_modules(&mut modules, Path::new("/project"), &registry).unwrap();
+        assert_eq!(stats.files_linked, 1);
+        assert!(registry.is_module("ReactiveFormsModule"));
+        assert_eq!(
+            registry.flatten("ReactiveFormsModule"),
+            vec!["FormGroupDirective", "FormControlName"]
+        );
     }
 }
