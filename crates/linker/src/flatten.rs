@@ -192,6 +192,12 @@ fn flatten_one(
 }
 
 /// Collect all top-level `import { a, b } from 'x'` statements.
+///
+/// For each named-import block, record the exact byte span of the `{ ... }`
+/// list (inclusive of both braces) by scanning the source around the first
+/// specifier rather than guessing based on fixed offsets — whitespace and
+/// multi-line formatting would otherwise misplace the replacement range and
+/// corrupt the file.
 fn collect_named_imports(program: &Program<'_>) -> Vec<NamedImport> {
     let mut out = Vec::new();
     for stmt in &program.body {
@@ -199,7 +205,6 @@ fn collect_named_imports(program: &Program<'_>) -> Vec<NamedImport> {
             let Some(specifiers) = &decl.specifiers else {
                 continue;
             };
-            // Determine if there's at least one named import (vs. only namespace/default)
             let mut has_named = false;
             let mut existing = BTreeSet::new();
             let mut min_start = u32::MAX;
@@ -220,13 +225,15 @@ fn collect_named_imports(program: &Program<'_>) -> Vec<NamedImport> {
             if !has_named {
                 continue;
             }
-            // Find the brace span: scan source to widen min_start..max_end to include braces.
-            // We use the parser-provided endpoints; the surrounding braces sit just outside
-            // the first/last specifier. Caller widens by ±1 byte to swallow `{` and `}`.
-            // To be safe, use the declaration's source range minus the from-clause.
-            // Simpler and reliable: construct the new brace block as `{ ... }` but
-            // replace exactly the existing brace block, located by scanning.
-            let list_span = Span::new(min_start.saturating_sub(2), max_end + 2);
+            // Brace positions: scan backward from first specifier for the `{`,
+            // and forward from last specifier for the matching `}`. Bounded by
+            // the import declaration's own span.
+            let decl_span = decl.span();
+            let Some(list_span) =
+                find_brace_list_span(min_start, max_end, decl_span.start, decl_span.end, program)
+            else {
+                continue;
+            };
             out.push(NamedImport {
                 list_span,
                 existing,
@@ -236,6 +243,47 @@ fn collect_named_imports(program: &Program<'_>) -> Vec<NamedImport> {
         }
     }
     out
+}
+
+/// Find the brace span `{ … }` containing the named-import specifiers.
+///
+/// Takes the byte offsets of the first specifier's start (`first_spec_start`)
+/// and the last specifier's end (`last_spec_end`), and the import declaration's
+/// own start/end as bounds. Walks backward for `{` and forward for `}`.
+/// Returns `None` if braces aren't found — caller skips this import (we only
+/// touch well-formed `import { … } from '…'` statements).
+fn find_brace_list_span(
+    first_spec_start: u32,
+    last_spec_end: u32,
+    decl_start: u32,
+    decl_end: u32,
+    program: &Program<'_>,
+) -> Option<Span> {
+    let src = program.source_text.as_bytes();
+    let mut i = first_spec_start as usize;
+    let lower = decl_start as usize;
+    while i > lower {
+        i -= 1;
+        match src[i] {
+            b'{' => {
+                let open = i as u32;
+                let mut j = last_spec_end as usize;
+                let upper = decl_end as usize;
+                while j < upper && j < src.len() {
+                    if src[j] == b'}' {
+                        return Some(Span::new(open, (j + 1) as u32));
+                    }
+                    j += 1;
+                }
+                return None;
+            }
+            // Stop if we hit something that can't be a brace prefix — should
+            // only be whitespace between `{` and first specifier normally.
+            b'\n' | b'\r' | b'\t' | b' ' | b',' => continue,
+            _ => {}
+        }
+    }
+    None
 }
 
 fn visit_program_deps(
@@ -972,6 +1020,50 @@ C.\u{0275}cmp = \u{0275}\u{0275}defineComponent({ type: C, dependencies: [Reacti
             out.contains("from '@angular/forms'"),
             "expected injected import, got: {out}"
         );
+    }
+
+    #[test]
+    fn extends_multiline_import_block_correctly() {
+        // Regression: early implementations assumed `{ A, B }` fixed-offset
+        // braces and corrupted multi-line imports (which Prettier produces
+        // for long lists). The file would end up with a truncated import
+        // and stale code bleeding into the rewritten span — visible in the
+        // treasr-frontend dialog as "backdrop renders, container doesn't".
+        let reg = make_registry();
+        let mut modules = HashMap::new();
+        let source = "import {\n  ReactiveFormsModule,\n  FormBuilder,\n  FormGroup,\n  Validators,\n} from '@angular/forms';\n\
+class C {}\n\
+C.\u{0275}cmp = \u{0275}\u{0275}defineComponent({ type: C, dependencies: [ReactiveFormsModule] });";
+        modules.insert(PathBuf::from("/app/m.js"), source.to_string());
+
+        let rewritten =
+            flatten_component_dependencies(&mut modules, &reg, &make_public_exports()).unwrap();
+        assert_eq!(rewritten, 1);
+        let out = modules.get(Path::new("/app/m.js")).unwrap();
+        // The defineComponent call must still be intact (no truncation).
+        assert!(
+            out.contains("C.\u{0275}cmp = \u{0275}\u{0275}defineComponent"),
+            "defineComponent corrupted: {out}"
+        );
+        assert!(out.contains("class C {}"), "class C corrupted: {out}");
+        // All original import names must still be present exactly once,
+        // checked as whole tokens (avoid `FormGroup` matching `FormGroupDirective`).
+        let import_section = out.split("} from '@angular/forms'").next().unwrap();
+        let names: Vec<&str> = import_section
+            .trim_start_matches("import {")
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        for needed in [
+            "ReactiveFormsModule",
+            "FormBuilder",
+            "FormGroup",
+            "Validators",
+        ] {
+            let count = names.iter().filter(|n| **n == needed).count();
+            assert_eq!(count, 1, "{needed} miscounted in: {import_section}");
+        }
     }
 
     #[test]
