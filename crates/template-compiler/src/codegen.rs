@@ -908,7 +908,7 @@ impl IvyCodegen {
         self.add_advance(slot);
         self.update.push(format!(
             "\u{0275}\u{0275}repeater({});",
-            ctx_expr(&block.iterable)
+            ctx_expr_with_locals(&block.iterable, &self.local_vars)
         ));
         self.var_count += 1;
     }
@@ -982,7 +982,7 @@ impl IvyCodegen {
             }
             cond.push_str(&format!(
                 "{} === {} ? {}",
-                ctx_expr(&block.expression),
+                ctx_expr_with_locals(&block.expression, &self.local_vars),
                 expr,
                 case_slot
             ));

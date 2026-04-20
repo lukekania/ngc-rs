@@ -780,6 +780,58 @@ export class TestComponent {
     }
 
     #[test]
+    fn nested_for_iterable_does_not_prefix_outer_loop_variable_with_ctx() {
+        // Regression: in @for (inner of outer.items), the iterable passed to
+        // ɵɵrepeater() was being compiled with a `ctx.` prefix even though
+        // `outer` is an outer @for's loop variable (a local), producing
+        // `ɵɵrepeater(ctx.outer.items)` — which throws at runtime.
+        let source = r#"import { Component } from '@angular/core';
+
+interface Group { items: string[]; }
+
+@Component({
+  selector: 'app-test',
+  standalone: true,
+  template: `
+    @for (outer of groups; track outer) {
+      @for (inner of outer.items; track inner) {
+        <span>{{ inner }}</span>
+      }
+    }
+  `,
+})
+export class TestComponent {
+  groups: Group[] = [];
+}
+"#;
+        let path = PathBuf::from("nested-for-iterable.component.ts");
+        let result = compile_component(source, &path).expect("should compile");
+        assert!(result.compiled);
+        assert!(
+            result
+                .source
+                .contains("\u{0275}\u{0275}repeater(outer.items)"),
+            "inner @for iterable must read outer.items without ctx. prefix; got:\n{}",
+            result.source
+        );
+        assert!(
+            !result
+                .source
+                .contains("\u{0275}\u{0275}repeater(ctx.outer.items)"),
+            "inner @for iterable must NOT get ctx. prefix on outer loop variable; got:\n{}",
+            result.source
+        );
+
+        let js =
+            ngc_ts_transform::transform_source(&result.source, "nested-for-iterable.component.ts");
+        assert!(
+            js.is_ok(),
+            "compiled source should be valid JS: {:?}",
+            js.err()
+        );
+    }
+
+    #[test]
     fn nested_for_block_listener_resolves_ancestor_loop_variables() {
         // Regression test for #40 (nested case): inside nested @for blocks,
         // listeners must also resolve *ancestor* loop variables via the
