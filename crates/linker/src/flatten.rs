@@ -35,6 +35,7 @@ use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
 
 use crate::module_registry::ModuleRegistry;
+use crate::public_exports::PublicExports;
 
 /// One textual replacement to apply to the source.
 #[derive(Debug)]
@@ -57,12 +58,15 @@ struct NamedImport {
     existing: BTreeSet<String>,
     /// New names to add, accumulated during the deps walk.
     additions: BTreeSet<String>,
-    /// Source path string, e.g. `@angular/forms`. Currently unused in the code
-    /// path — we attribute new names via the owning-import index — but kept
-    /// for future use (e.g. adding a new import statement when no owning import
-    /// exists) and for debugging.
-    #[allow(dead_code)]
+    /// Source specifier string, e.g. `@angular/forms`.
     source: String,
+}
+
+/// A brand-new named-import statement we need to add to the file because no
+/// existing import has the right source.
+#[derive(Debug, Default)]
+struct NewImport {
+    names: BTreeSet<String>,
 }
 
 /// Walk every module and expand NgModule references in component
@@ -72,6 +76,7 @@ struct NamedImport {
 pub fn flatten_component_dependencies(
     modules: &mut HashMap<PathBuf, String>,
     registry: &ModuleRegistry,
+    public_exports: &PublicExports,
 ) -> NgcResult<usize> {
     if registry.is_empty() {
         return Ok(0);
@@ -88,7 +93,7 @@ pub fn flatten_component_dependencies(
             Some(s) => s.clone(),
             None => continue,
         };
-        if let Some(updated) = flatten_one(&source, &path, registry)? {
+        if let Some(updated) = flatten_one(&source, &path, registry, public_exports)? {
             modules.insert(path.clone(), updated);
             rewritten += 1;
             tracing::debug!(path = %path.display(), "flattened component dependencies");
@@ -97,7 +102,12 @@ pub fn flatten_component_dependencies(
     Ok(rewritten)
 }
 
-fn flatten_one(source: &str, path: &Path, registry: &ModuleRegistry) -> NgcResult<Option<String>> {
+fn flatten_one(
+    source: &str,
+    path: &Path,
+    registry: &ModuleRegistry,
+    public_exports: &PublicExports,
+) -> NgcResult<Option<String>> {
     let alloc = Allocator::default();
     let parsed = Parser::new(&alloc, source, SourceType::mjs()).parse();
     if !parsed.errors.is_empty() {
@@ -108,13 +118,16 @@ fn flatten_one(source: &str, path: &Path, registry: &ModuleRegistry) -> NgcResul
     }
 
     let mut imports = collect_named_imports(&parsed.program);
+    let mut new_imports: HashMap<String, NewImport> = HashMap::new();
 
     let mut deps_replacements = Vec::new();
     visit_program_deps(
         &parsed.program,
         source,
         registry,
+        public_exports,
         &mut imports,
+        &mut new_imports,
         &mut deps_replacements,
     );
 
@@ -122,7 +135,7 @@ fn flatten_one(source: &str, path: &Path, registry: &ModuleRegistry) -> NgcResul
         return Ok(None);
     }
 
-    // Build replacements for each import that gained additions.
+    // Extend existing imports with added names.
     let mut all_replacements: Vec<Replacement> = deps_replacements;
     for imp in &imports {
         let truly_new: Vec<&String> = imp
@@ -150,6 +163,31 @@ fn flatten_one(source: &str, path: &Path, registry: &ModuleRegistry) -> NgcResul
     for r in &all_replacements {
         result.replace_range(r.start as usize..r.end as usize, &r.text);
     }
+
+    // Prepend any brand-new import statements at the top of the file. Grouped
+    // by source path. Placed before any existing content so ES module imports
+    // stay at the top of the file.
+    if !new_imports.is_empty() {
+        let mut prefix = String::new();
+        let mut sources: Vec<&String> = new_imports.keys().collect();
+        sources.sort();
+        for src_spec in sources {
+            let ni = &new_imports[src_spec];
+            if ni.names.is_empty() {
+                continue;
+            }
+            let names: Vec<String> = ni.names.iter().cloned().collect();
+            prefix.push_str(&format!(
+                "import {{ {} }} from '{}';\n",
+                names.join(", "),
+                src_spec
+            ));
+        }
+        if !prefix.is_empty() {
+            result.insert_str(0, &prefix);
+        }
+    }
+
     Ok(Some(result))
 }
 
@@ -204,11 +242,21 @@ fn visit_program_deps(
     program: &Program<'_>,
     source: &str,
     registry: &ModuleRegistry,
+    public_exports: &PublicExports,
     imports: &mut [NamedImport],
+    new_imports: &mut HashMap<String, NewImport>,
     out: &mut Vec<Replacement>,
 ) {
     for stmt in &program.body {
-        visit_stmt(stmt, source, registry, imports, out);
+        visit_stmt(
+            stmt,
+            source,
+            registry,
+            public_exports,
+            imports,
+            new_imports,
+            out,
+        );
     }
 }
 
@@ -216,17 +264,33 @@ fn visit_stmt(
     stmt: &Statement<'_>,
     source: &str,
     registry: &ModuleRegistry,
+    public_exports: &PublicExports,
     imports: &mut [NamedImport],
+    new_imports: &mut HashMap<String, NewImport>,
     out: &mut Vec<Replacement>,
 ) {
     match stmt {
-        Statement::ExpressionStatement(s) => {
-            visit_expr(&s.expression, source, registry, imports, out)
-        }
+        Statement::ExpressionStatement(s) => visit_expr(
+            &s.expression,
+            source,
+            registry,
+            public_exports,
+            imports,
+            new_imports,
+            out,
+        ),
         Statement::VariableDeclaration(decl) => {
             for declarator in &decl.declarations {
                 if let Some(init) = &declarator.init {
-                    visit_expr(init, source, registry, imports, out);
+                    visit_expr(
+                        init,
+                        source,
+                        registry,
+                        public_exports,
+                        imports,
+                        new_imports,
+                        out,
+                    );
                 }
             }
         }
@@ -236,12 +300,28 @@ fn visit_stmt(
                     Declaration::VariableDeclaration(var_decl) => {
                         for declarator in &var_decl.declarations {
                             if let Some(init) = &declarator.init {
-                                visit_expr(init, source, registry, imports, out);
+                                visit_expr(
+                                    init,
+                                    source,
+                                    registry,
+                                    public_exports,
+                                    imports,
+                                    new_imports,
+                                    out,
+                                );
                             }
                         }
                     }
                     Declaration::ClassDeclaration(class) => {
-                        visit_class(class, source, registry, imports, out);
+                        visit_class(
+                            class,
+                            source,
+                            registry,
+                            public_exports,
+                            imports,
+                            new_imports,
+                            out,
+                        );
                     }
                     _ => {}
                 }
@@ -249,10 +329,26 @@ fn visit_stmt(
         }
         Statement::ExportDefaultDeclaration(export) => {
             if let ExportDefaultDeclarationKind::ClassDeclaration(class) = &export.declaration {
-                visit_class(class, source, registry, imports, out);
+                visit_class(
+                    class,
+                    source,
+                    registry,
+                    public_exports,
+                    imports,
+                    new_imports,
+                    out,
+                );
             }
         }
-        Statement::ClassDeclaration(class) => visit_class(class, source, registry, imports, out),
+        Statement::ClassDeclaration(class) => visit_class(
+            class,
+            source,
+            registry,
+            public_exports,
+            imports,
+            new_imports,
+            out,
+        ),
         _ => {}
     }
 }
@@ -261,19 +357,37 @@ fn visit_class(
     class: &oxc_ast::ast::Class<'_>,
     source: &str,
     registry: &ModuleRegistry,
+    public_exports: &PublicExports,
     imports: &mut [NamedImport],
+    new_imports: &mut HashMap<String, NewImport>,
     out: &mut Vec<Replacement>,
 ) {
     for element in &class.body.body {
         match element {
             oxc_ast::ast::ClassElement::PropertyDefinition(prop) => {
                 if let Some(ref init) = prop.value {
-                    visit_expr(init, source, registry, imports, out);
+                    visit_expr(
+                        init,
+                        source,
+                        registry,
+                        public_exports,
+                        imports,
+                        new_imports,
+                        out,
+                    );
                 }
             }
             oxc_ast::ast::ClassElement::StaticBlock(block) => {
                 for stmt in &block.body {
-                    visit_stmt(stmt, source, registry, imports, out);
+                    visit_stmt(
+                        stmt,
+                        source,
+                        registry,
+                        public_exports,
+                        imports,
+                        new_imports,
+                        out,
+                    );
                 }
             }
             _ => {}
@@ -285,31 +399,72 @@ fn visit_expr(
     expr: &Expression<'_>,
     source: &str,
     registry: &ModuleRegistry,
+    public_exports: &PublicExports,
     imports: &mut [NamedImport],
+    new_imports: &mut HashMap<String, NewImport>,
     out: &mut Vec<Replacement>,
 ) {
     match expr {
         Expression::CallExpression(call) => {
             if is_define_component(call) {
                 if let Some(obj) = first_object_arg(call) {
-                    if let Some(repl) = rewrite_dependencies(obj, source, registry, imports) {
+                    if let Some(repl) = rewrite_dependencies(
+                        obj,
+                        source,
+                        registry,
+                        public_exports,
+                        imports,
+                        new_imports,
+                    ) {
                         out.push(repl);
                     }
                 }
             }
             for arg in &call.arguments {
                 if let Some(inner) = arg.as_expression() {
-                    visit_expr(inner, source, registry, imports, out);
+                    visit_expr(
+                        inner,
+                        source,
+                        registry,
+                        public_exports,
+                        imports,
+                        new_imports,
+                        out,
+                    );
                 }
             }
         }
-        Expression::AssignmentExpression(a) => visit_expr(&a.right, source, registry, imports, out),
+        Expression::AssignmentExpression(a) => visit_expr(
+            &a.right,
+            source,
+            registry,
+            public_exports,
+            imports,
+            new_imports,
+            out,
+        ),
         Expression::SequenceExpression(seq) => {
             for e in &seq.expressions {
-                visit_expr(e, source, registry, imports, out);
+                visit_expr(
+                    e,
+                    source,
+                    registry,
+                    public_exports,
+                    imports,
+                    new_imports,
+                    out,
+                );
             }
         }
-        Expression::ClassExpression(class) => visit_class(class, source, registry, imports, out),
+        Expression::ClassExpression(class) => visit_class(
+            class,
+            source,
+            registry,
+            public_exports,
+            imports,
+            new_imports,
+            out,
+        ),
         _ => {}
     }
 }
@@ -334,10 +489,19 @@ fn rewrite_dependencies(
     obj: &ObjectExpression<'_>,
     source: &str,
     registry: &ModuleRegistry,
+    public_exports: &PublicExports,
     imports: &mut [NamedImport],
+    new_imports: &mut HashMap<String, NewImport>,
 ) -> Option<Replacement> {
     let array = find_dependencies_array(obj)?;
-    let (new_items, any_expanded) = flatten_array_items(array, source, registry, imports);
+    let (new_items, any_expanded) = flatten_array_items(
+        array,
+        source,
+        registry,
+        public_exports,
+        imports,
+        new_imports,
+    );
     if !any_expanded {
         return None;
     }
@@ -381,7 +545,9 @@ fn flatten_array_items(
     array: &ArrayExpression<'_>,
     source: &str,
     registry: &ModuleRegistry,
+    public_exports: &PublicExports,
     imports: &mut [NamedImport],
+    new_imports: &mut HashMap<String, NewImport>,
 ) -> (Vec<String>, bool) {
     let mut items: Vec<String> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -400,27 +566,45 @@ fn flatten_array_items(
                 if registry.is_module(name) {
                     any_expanded = true;
                     let flat = registry.flatten(name);
-                    let owner_idx = find_import_owning(imports, name);
                     for new_name in &flat {
-                        // Skip identifiers that start with an underscore — by JS
-                        // convention they are package-private. Some Angular
-                        // modules (notably `RouterModule`) list such classes in
-                        // `ɵmod.exports` for their own internal resolution, but
-                        // the classes are *not* publicly exported from the npm
-                        // package. Adding them to a project file's import would
-                        // bind to `undefined` at runtime → `NG0919 — Cannot
-                        // read @Component metadata`. The ɵ-prefix convention
-                        // (e.g. `ɵNgNoValidate`) *is* publicly exported and
-                        // passes through normally.
+                        // Skip underscore-prefixed names — these are JS-private
+                        // by convention and typically not publicly exported from
+                        // any npm package (e.g. `_EmptyOutletComponent` from
+                        // `@angular/router`).
                         if new_name.starts_with('_') {
                             continue;
                         }
-                        push_unique(&mut items, &mut seen, new_name.clone());
-                        if let Some(idx) = owner_idx {
-                            if !any_import_has(imports, new_name) {
-                                imports[idx].additions.insert(new_name.clone());
-                            }
+                        // If the name is already in scope via any existing
+                        // import (original or already-scheduled addition), just
+                        // emit it — no import rewrite needed.
+                        if any_import_has(imports, new_name) {
+                            push_unique(&mut items, &mut seen, new_name.clone());
+                            continue;
                         }
+                        // Find the npm specifier that publicly exports this
+                        // name. If none is known, we cannot safely add it —
+                        // including it in deps would bind to `undefined` and
+                        // trigger NG0919. Drop it silently (matches what ng
+                        // build effectively does when a directive is not
+                        // reachable).
+                        let Some(spec) = public_exports.specifier_for(new_name) else {
+                            tracing::debug!(
+                                name = %new_name,
+                                "flatten: dropping directive — no public npm export found"
+                            );
+                            continue;
+                        };
+                        // Prefer extending an existing same-source import.
+                        if let Some(idx) = find_import_by_source(imports, &spec) {
+                            imports[idx].additions.insert(new_name.clone());
+                        } else {
+                            new_imports
+                                .entry(spec)
+                                .or_default()
+                                .names
+                                .insert(new_name.clone());
+                        }
+                        push_unique(&mut items, &mut seen, new_name.clone());
                     }
                 } else {
                     push_unique(&mut items, &mut seen, name.to_string());
@@ -430,8 +614,6 @@ fn flatten_array_items(
             other => {
                 let span = other.span();
                 let text = &source[span.start as usize..span.end as usize];
-                // Non-identifier elements (spreads, calls, etc.) keep verbatim
-                // text and don't participate in dedup.
                 items.push(text.to_string());
             }
         }
@@ -439,8 +621,8 @@ fn flatten_array_items(
     (items, any_expanded)
 }
 
-fn find_import_owning(imports: &[NamedImport], name: &str) -> Option<usize> {
-    imports.iter().position(|i| i.existing.contains(name))
+fn find_import_by_source(imports: &[NamedImport], source: &str) -> Option<usize> {
+    imports.iter().position(|i| i.source == source)
 }
 
 fn any_import_has(imports: &[NamedImport], name: &str) -> bool {
@@ -452,6 +634,30 @@ fn any_import_has(imports: &[NamedImport], name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_public_exports() -> PublicExports {
+        // Populate with all the names the tests expand to, from plausible
+        // specifier origins. Tests that specifically want to exercise the
+        // "name not publicly exported" case use a separate, empty registry.
+        let pe = PublicExports::new();
+        let forms = "/project/node_modules/@angular/forms/fesm2022/forms.mjs";
+        let exports = "export { DefaultValueAccessor, NgControlStatus, FormGroupDirective, FormControlName, NgModel, \u{0275}NgNoValidate };";
+        pe.scan_file(exports, Path::new(forms));
+        let router = "/project/node_modules/@angular/router/fesm2022/router.mjs";
+        pe.scan_file(
+            "export { RouterOutlet, RouterLink, RouterLinkActive };",
+            Path::new(router),
+        );
+        let dialog = "/project/node_modules/@angular/cdk/fesm2022/dialog.mjs";
+        pe.scan_file("export { CdkDialogContainer };", Path::new(dialog));
+        let portal = "/project/node_modules/@angular/cdk/fesm2022/portal.mjs";
+        pe.scan_file("export { CdkPortal, CdkPortalOutlet };", Path::new(portal));
+        let cdk_dialog_for_cdkdialog = "/project/node_modules/@angular/cdk/fesm2022/dialog.mjs";
+        pe.scan_file("export { CdkDialog };", Path::new(cdk_dialog_for_cdkdialog));
+        let x_mod = "/project/node_modules/x/fesm2022/x.mjs";
+        pe.scan_file("export { SomeDir, OtherPipe };", Path::new(x_mod));
+        pe
+    }
 
     fn make_registry() -> ModuleRegistry {
         let reg = ModuleRegistry::new();
@@ -481,7 +687,9 @@ class C {}\n\
 C.\u{0275}cmp = \u{0275}\u{0275}defineComponent({ type: C, dependencies: [ReactiveFormsModule, MyStandaloneDir] });";
         modules.insert(PathBuf::from("/app/c.js"), source.to_string());
 
-        let rewritten = flatten_component_dependencies(&mut modules, &registry).unwrap();
+        let rewritten =
+            flatten_component_dependencies(&mut modules, &registry, &make_public_exports())
+                .unwrap();
         assert_eq!(rewritten, 1);
         let out = modules.get(Path::new("/app/c.js")).unwrap();
         assert!(
@@ -532,7 +740,9 @@ C.\u{0275}cmp = \u{0275}\u{0275}defineComponent({ type: C, dependencies: [Reacti
 X.\u{0275}cmp = \u{0275}\u{0275}defineComponent({ type: X, dependencies: [SomeDir, OtherPipe] });";
         modules.insert(PathBuf::from("/app/x.js"), source.to_string());
 
-        let rewritten = flatten_component_dependencies(&mut modules, &registry).unwrap();
+        let rewritten =
+            flatten_component_dependencies(&mut modules, &registry, &make_public_exports())
+                .unwrap();
         assert_eq!(rewritten, 0);
     }
 
@@ -544,7 +754,9 @@ X.\u{0275}cmp = \u{0275}\u{0275}defineComponent({ type: X, dependencies: [SomeDi
 Y.\u{0275}cmp = \u{0275}\u{0275}defineComponent({ type: Y, dependencies: [ReactiveFormsModule, ...extraDeps, someFn()] });";
         modules.insert(PathBuf::from("/app/y.js"), source.to_string());
 
-        let rewritten = flatten_component_dependencies(&mut modules, &registry).unwrap();
+        let rewritten =
+            flatten_component_dependencies(&mut modules, &registry, &make_public_exports())
+                .unwrap();
         assert_eq!(rewritten, 1);
         let out = modules.get(Path::new("/app/y.js")).unwrap();
         assert!(out.contains("...extraDeps"));
@@ -561,7 +773,9 @@ Y.\u{0275}cmp = \u{0275}\u{0275}defineComponent({ type: Y, dependencies: [Reacti
 Z.\u{0275}cmp = \u{0275}\u{0275}defineComponent({ type: Z, dependencies: [ReactiveFormsModule] });";
         modules.insert(PathBuf::from("/app/z.js"), source.to_string());
 
-        let rewritten = flatten_component_dependencies(&mut modules, &registry).unwrap();
+        let rewritten =
+            flatten_component_dependencies(&mut modules, &registry, &make_public_exports())
+                .unwrap();
         assert_eq!(rewritten, 1);
         let out = modules.get(Path::new("/app/z.js")).unwrap();
         let forms_line = out
@@ -581,7 +795,9 @@ Z.\u{0275}cmp = \u{0275}\u{0275}defineComponent({ type: Z, dependencies: [Reacti
 Z.\u{0275}cmp = \u{0275}\u{0275}defineComponent({ type: Z, dependencies: [X] });";
         modules.insert(PathBuf::from("/app/z.js"), source.to_string());
 
-        let rewritten = flatten_component_dependencies(&mut modules, &registry).unwrap();
+        let rewritten =
+            flatten_component_dependencies(&mut modules, &registry, &make_public_exports())
+                .unwrap();
         assert_eq!(rewritten, 0);
     }
 
@@ -593,7 +809,9 @@ Z.\u{0275}cmp = \u{0275}\u{0275}defineComponent({ type: Z, dependencies: [X] });
             PathBuf::from("/app/plain.js"),
             "export function f() { return 42; }".to_string(),
         );
-        let rewritten = flatten_component_dependencies(&mut modules, &registry).unwrap();
+        let rewritten =
+            flatten_component_dependencies(&mut modules, &registry, &make_public_exports())
+                .unwrap();
         assert_eq!(rewritten, 0);
     }
 
@@ -605,7 +823,9 @@ Z.\u{0275}cmp = \u{0275}\u{0275}defineComponent({ type: Z, dependencies: [X] });
 C.\u{0275}cmp = i0.\u{0275}\u{0275}defineComponent({ type: C, dependencies: [DialogModule] });";
         modules.insert(PathBuf::from("/app/c.js"), source.to_string());
 
-        let rewritten = flatten_component_dependencies(&mut modules, &registry).unwrap();
+        let rewritten =
+            flatten_component_dependencies(&mut modules, &registry, &make_public_exports())
+                .unwrap();
         assert_eq!(rewritten, 1);
         let out = modules.get(Path::new("/app/c.js")).unwrap();
         assert!(out.contains("dependencies: [CdkDialog]"));
@@ -641,7 +861,8 @@ C.\u{0275}cmp = i0.\u{0275}\u{0275}defineComponent({ type: C, dependencies: [Dia
 C.\u{0275}cmp = \u{0275}\u{0275}defineComponent({ type: C, dependencies: [FormsModule, ReactiveFormsModule] });";
         modules.insert(PathBuf::from("/app/c.js"), source.to_string());
 
-        let rewritten = flatten_component_dependencies(&mut modules, &reg).unwrap();
+        let rewritten =
+            flatten_component_dependencies(&mut modules, &reg, &make_public_exports()).unwrap();
         assert_eq!(rewritten, 1);
         let out = modules.get(Path::new("/app/c.js")).unwrap();
 
@@ -684,7 +905,8 @@ C.\u{0275}cmp = \u{0275}\u{0275}defineComponent({ type: C, dependencies: [FormsM
 S.\u{0275}cmp = \u{0275}\u{0275}defineComponent({ type: S, dependencies: [RouterModule] });";
         modules.insert(PathBuf::from("/app/s.js"), source.to_string());
 
-        let rewritten = flatten_component_dependencies(&mut modules, &reg).unwrap();
+        let rewritten =
+            flatten_component_dependencies(&mut modules, &reg, &make_public_exports()).unwrap();
         assert_eq!(rewritten, 1);
         let out = modules.get(Path::new("/app/s.js")).unwrap();
         assert!(out.contains("dependencies: [RouterOutlet, RouterLink, RouterLinkActive]"));
@@ -720,30 +942,119 @@ S.\u{0275}cmp = \u{0275}\u{0275}defineComponent({ type: S, dependencies: [Router
 C.\u{0275}cmp = \u{0275}\u{0275}defineComponent({ type: C, dependencies: [ReactiveFormsModule] });";
         modules.insert(PathBuf::from("/app/c.js"), source.to_string());
 
-        let _ = flatten_component_dependencies(&mut modules, &reg).unwrap();
+        let _ = flatten_component_dependencies(&mut modules, &reg, &make_public_exports()).unwrap();
         let out = modules.get(Path::new("/app/c.js")).unwrap();
         assert!(out.contains("\u{0275}NgNoValidate"));
         assert!(out.contains("FormGroupDirective"));
     }
 
     #[test]
-    fn skips_import_extension_when_module_not_imported_in_file() {
+    fn adds_new_import_when_module_not_imported_in_file() {
         // Edge case: the dependencies array names a module that the file doesn't
-        // import directly. We still flatten the array but we cannot guess where
-        // to import the directives from. Currently we only extend imports we can
-        // attribute; the bundler may leave the names unresolved — caller's
-        // responsibility to ensure the source brings the module in.
+        // import directly. Now that we know each directive's public npm
+        // specifier (via PublicExports), we can emit a brand-new import
+        // statement so the flattened names are actually in scope.
         let registry = make_registry();
         let mut modules = HashMap::new();
         let source = "Q.\u{0275}cmp = \u{0275}\u{0275}defineComponent({ type: Q, dependencies: [ReactiveFormsModule] });";
         modules.insert(PathBuf::from("/app/q.js"), source.to_string());
 
-        let rewritten = flatten_component_dependencies(&mut modules, &registry).unwrap();
+        let rewritten =
+            flatten_component_dependencies(&mut modules, &registry, &make_public_exports())
+                .unwrap();
         assert_eq!(rewritten, 1);
         let out = modules.get(Path::new("/app/q.js")).unwrap();
         // deps array got flattened
         assert!(out.contains("FormControlName"));
-        // no import lines were touched (none existed)
-        assert!(!out.contains("from '@angular/forms'"));
+        // A new import statement is prepended for the flattened names, from
+        // the correct source package inferred via PublicExports.
+        assert!(
+            out.contains("from '@angular/forms'"),
+            "expected injected import, got: {out}"
+        );
+    }
+
+    #[test]
+    fn drops_name_without_known_public_export() {
+        // Edge case: a flattened name has no entry in PublicExports — we must
+        // not include it in deps (would be undefined at runtime) and must not
+        // fabricate an import (we don't know where from).
+        let reg = ModuleRegistry::new();
+        reg.register(
+            "MysteryModule",
+            vec!["KnownDir".into(), "UnknownDir".into()],
+        );
+
+        // PublicExports that knows about KnownDir but not UnknownDir.
+        let pe = PublicExports::new();
+        pe.scan_file(
+            "export { KnownDir };",
+            Path::new("/proj/node_modules/pkg/fesm2022/pkg.mjs"),
+        );
+
+        let mut modules = HashMap::new();
+        let source = "C.\u{0275}cmp = \u{0275}\u{0275}defineComponent({ type: C, dependencies: [MysteryModule] });";
+        modules.insert(PathBuf::from("/app/c.js"), source.to_string());
+
+        let rewritten = flatten_component_dependencies(&mut modules, &reg, &pe).unwrap();
+        assert_eq!(rewritten, 1);
+        let out = modules.get(Path::new("/app/c.js")).unwrap();
+        assert!(out.contains("KnownDir"));
+        assert!(!out.contains("UnknownDir"), "UnknownDir leaked: {out}");
+    }
+
+    #[test]
+    fn adds_to_different_import_when_directive_lives_in_different_subpath() {
+        // Real-world case: DialogModule re-exports PortalModule (whose exports
+        // live in @angular/cdk/portal), but the project only imports DialogModule
+        // from @angular/cdk/dialog. Flatten must add CdkPortal/CdkPortalOutlet
+        // via a NEW import from @angular/cdk/portal, not the existing
+        // @angular/cdk/dialog one (which doesn't export those names).
+        let reg = ModuleRegistry::new();
+        reg.register(
+            "PortalModule",
+            vec!["CdkPortal".into(), "CdkPortalOutlet".into()],
+        );
+        reg.register(
+            "DialogModule",
+            vec!["PortalModule".into(), "CdkDialogContainer".into()],
+        );
+
+        let pe = PublicExports::new();
+        pe.scan_file(
+            "export { CdkPortal, CdkPortalOutlet };",
+            Path::new("/proj/node_modules/@angular/cdk/fesm2022/portal.mjs"),
+        );
+        pe.scan_file(
+            "export { CdkDialogContainer, DialogModule };",
+            Path::new("/proj/node_modules/@angular/cdk/fesm2022/dialog.mjs"),
+        );
+
+        let mut modules = HashMap::new();
+        let source = "import { DialogModule } from '@angular/cdk/dialog';\n\
+D.\u{0275}cmp = \u{0275}\u{0275}defineComponent({ type: D, dependencies: [DialogModule] });";
+        modules.insert(PathBuf::from("/app/d.js"), source.to_string());
+
+        flatten_component_dependencies(&mut modules, &reg, &pe).unwrap();
+        let out = modules.get(Path::new("/app/d.js")).unwrap();
+        assert!(out.contains("dependencies: [CdkPortal, CdkPortalOutlet, CdkDialogContainer]"));
+        // CdkDialogContainer was added to the existing @angular/cdk/dialog import.
+        let dialog_line = out
+            .lines()
+            .find(|l| l.contains("from '@angular/cdk/dialog'"))
+            .expect("dialog import");
+        assert!(dialog_line.contains("CdkDialogContainer"), "{dialog_line}");
+        assert!(
+            !dialog_line.contains("CdkPortal"),
+            "CdkPortal must NOT be added to dialog import: {dialog_line}"
+        );
+        // CdkPortal + CdkPortalOutlet were added via a NEW import from
+        // @angular/cdk/portal.
+        let portal_line = out
+            .lines()
+            .find(|l| l.contains("from '@angular/cdk/portal'"))
+            .expect("portal import injected");
+        assert!(portal_line.contains("CdkPortal"));
+        assert!(portal_line.contains("CdkPortalOutlet"));
     }
 }

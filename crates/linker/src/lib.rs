@@ -32,6 +32,8 @@ mod metadata;
 pub mod module_registry;
 mod ng_module;
 mod pipe;
+/// Map of publicly-exported npm identifier → best import specifier.
+pub mod public_exports;
 mod selector;
 /// Low-level linking API for transforming a single source file.
 pub mod transform;
@@ -42,6 +44,7 @@ use std::path::{Path, PathBuf};
 use ngc_diagnostics::NgcResult;
 
 pub use module_registry::ModuleRegistry;
+pub use public_exports::PublicExports;
 
 /// Statistics from the linking process.
 #[derive(Debug, Clone, Default)]
@@ -129,9 +132,22 @@ pub fn link_modules(
     project_root: &Path,
 ) -> NgcResult<LinkerStats> {
     let registry = ModuleRegistry::new();
+    let public_exports = PublicExports::new();
     let mut stats = link_npm_modules(modules, project_root, &registry)?;
+
+    // Build the public-exports index by scanning every npm file's top-level
+    // `export { … }` statements. Needed so the flatten pass can target the
+    // correct import specifier for each directive it adds.
+    for (path, source) in modules.iter() {
+        if !is_npm_module(path) {
+            continue;
+        }
+        public_exports.scan_file(source, path);
+    }
+
     stats.modules_registered = module_registry::scan_define_ng_modules(modules, &registry)?;
-    stats.components_flattened = flatten::flatten_component_dependencies(modules, &registry)?;
+    stats.components_flattened =
+        flatten::flatten_component_dependencies(modules, &registry, &public_exports)?;
     Ok(stats)
 }
 
