@@ -402,6 +402,19 @@ fn flatten_array_items(
                     let flat = registry.flatten(name);
                     let owner_idx = find_import_owning(imports, name);
                     for new_name in &flat {
+                        // Skip identifiers that start with an underscore — by JS
+                        // convention they are package-private. Some Angular
+                        // modules (notably `RouterModule`) list such classes in
+                        // `ɵmod.exports` for their own internal resolution, but
+                        // the classes are *not* publicly exported from the npm
+                        // package. Adding them to a project file's import would
+                        // bind to `undefined` at runtime → `NG0919 — Cannot
+                        // read @Component metadata`. The ɵ-prefix convention
+                        // (e.g. `ɵNgNoValidate`) *is* publicly exported and
+                        // passes through normally.
+                        if new_name.starts_with('_') {
+                            continue;
+                        }
                         push_unique(&mut items, &mut seen, new_name.clone());
                         if let Some(idx) = owner_idx {
                             if !any_import_has(imports, new_name) {
@@ -647,6 +660,70 @@ C.\u{0275}cmp = \u{0275}\u{0275}defineComponent({ type: C, dependencies: [FormsM
             let count = items.iter().filter(|x| **x == needed).count();
             assert_eq!(count, 1, "{needed} appeared {count} times in {arr}");
         }
+    }
+
+    #[test]
+    fn skips_underscore_prefixed_private_exports() {
+        // Mirrors the RouterModule case: its ɵmod.exports list contains
+        // `_EmptyOutletComponent`, an internal class not publicly exported
+        // from @angular/router. We must not emit such names in project
+        // dependency arrays — they bind to `undefined` and throw NG0919.
+        let reg = ModuleRegistry::new();
+        reg.register(
+            "RouterModule",
+            vec![
+                "RouterOutlet".into(),
+                "RouterLink".into(),
+                "RouterLinkActive".into(),
+                "_EmptyOutletComponent".into(),
+            ],
+        );
+
+        let mut modules = HashMap::new();
+        let source = "import { RouterModule } from '@angular/router';\n\
+S.\u{0275}cmp = \u{0275}\u{0275}defineComponent({ type: S, dependencies: [RouterModule] });";
+        modules.insert(PathBuf::from("/app/s.js"), source.to_string());
+
+        let rewritten = flatten_component_dependencies(&mut modules, &reg).unwrap();
+        assert_eq!(rewritten, 1);
+        let out = modules.get(Path::new("/app/s.js")).unwrap();
+        assert!(out.contains("dependencies: [RouterOutlet, RouterLink, RouterLinkActive]"));
+        assert!(!out.contains("_EmptyOutletComponent"));
+        // The import line should include the three public directives but not the
+        // private one.
+        let router_line = out
+            .lines()
+            .find(|l| l.contains("from '@angular/router'"))
+            .expect("router import line");
+        for needed in ["RouterOutlet", "RouterLink", "RouterLinkActive"] {
+            assert!(router_line.contains(needed), "{router_line}");
+        }
+        assert!(
+            !router_line.contains("_EmptyOutletComponent"),
+            "{router_line}"
+        );
+    }
+
+    #[test]
+    fn keeps_theta_prefixed_public_exports() {
+        // ɵ-prefix is the Angular convention for "internal but still publicly
+        // exported" (e.g. `ɵNgNoValidate` from @angular/forms). We must not
+        // filter these — they ARE importable.
+        let reg = ModuleRegistry::new();
+        reg.register(
+            "ReactiveFormsModule",
+            vec!["\u{0275}NgNoValidate".into(), "FormGroupDirective".into()],
+        );
+
+        let mut modules = HashMap::new();
+        let source = "import { ReactiveFormsModule } from '@angular/forms';\n\
+C.\u{0275}cmp = \u{0275}\u{0275}defineComponent({ type: C, dependencies: [ReactiveFormsModule] });";
+        modules.insert(PathBuf::from("/app/c.js"), source.to_string());
+
+        let _ = flatten_component_dependencies(&mut modules, &reg).unwrap();
+        let out = modules.get(Path::new("/app/c.js")).unwrap();
+        assert!(out.contains("\u{0275}NgNoValidate"));
+        assert!(out.contains("FormGroupDirective"));
     }
 
     #[test]
