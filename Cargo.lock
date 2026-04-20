@@ -762,6 +762,7 @@ dependencies = [
  "clap",
  "colored",
  "glob",
+ "insta",
  "ngc-bundler",
  "ngc-diagnostics",
  "ngc-linker",
