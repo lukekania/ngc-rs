@@ -2995,6 +2995,59 @@ mod tests {
     }
 
     #[test]
+    fn test_template_reference_var_resolves_via_ivy_reference() {
+        // `<form #profileForm="ngForm"><button [disabled]="!profileForm.form.valid"></button></form>`
+        // The ref must:
+        //   - appear in consts as ['profileForm','ngForm']
+        //   - be passed as the 4th arg to elementStart on the form
+        //   - resolve in the update block via ɵɵreference(slot) — NOT ctx.profileForm
+        let comp = test_component();
+        let nodes = vec![TemplateNode::Element(ElementNode {
+            tag: "form".to_string(),
+            attributes: vec![TemplateAttribute::Reference {
+                name: "profileForm".to_string(),
+                export_as: Some("ngForm".to_string()),
+            }],
+            children: vec![TemplateNode::Element(ElementNode {
+                tag: "button".to_string(),
+                attributes: vec![TemplateAttribute::Property {
+                    name: "disabled".to_string(),
+                    expression: "!profileForm.form.valid".to_string(),
+                }],
+                children: vec![],
+                is_void: false,
+            })],
+            is_void: false,
+        })];
+        let output = generate_ivy(&comp, &nodes).expect("should generate");
+        let dc = &output.static_fields[0];
+        assert!(
+            output
+                .consts
+                .iter()
+                .any(|c| c.contains("'profileForm'") && c.contains("'ngForm'")),
+            "consts should include ref entry ['profileForm','ngForm']: {:?}",
+            output.consts
+        );
+        let form_start = dc
+            .lines()
+            .find(|l| l.contains("elementStart") && l.contains("'form'"))
+            .unwrap_or("");
+        assert!(
+            form_start.matches(',').count() >= 3,
+            "form elementStart must pass refsIdx as 4th arg: {form_start}"
+        );
+        assert!(
+            dc.contains("\u{0275}\u{0275}reference("),
+            "update block should emit ɵɵreference(slot) for ref use: {dc}"
+        );
+        assert!(
+            !dc.contains("ctx.profileForm"),
+            "ref name must not be prefixed with ctx.: {dc}"
+        );
+    }
+
+    #[test]
     fn test_valueless_attribute_included_in_consts() {
         // Value-less attributes (e.g. `baseChart` on `<canvas baseChart>`)
         // must appear in the consts array with an empty-string value so that
