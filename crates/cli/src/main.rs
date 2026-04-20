@@ -228,7 +228,8 @@ fn run_build(
             bare_specifiers.push(spec);
         }
     }
-    let npm_resolution = ngc_npm_resolver::resolve_npm_dependencies(&bare_specifiers, &config_dir)?;
+    let mut npm_resolution =
+        ngc_npm_resolver::resolve_npm_dependencies(&bare_specifiers, &config_dir)?;
 
     // Merge npm modules into the modules map (they're already JS — no transform needed)
     for (path, source) in &npm_resolution.modules {
@@ -250,6 +251,49 @@ fn run_build(
             linker_stats.components_flattened,
             linker_stats.modules_registered
         );
+    }
+
+    // Step 6.7: Resolve any bare specifiers the flatten pass introduced. When
+    // it injects an `import { CdkPortal } from '@angular/cdk/portal'` into a
+    // project file, that specifier wasn't known to the initial npm resolution
+    // — so we re-scan and resolve the delta, folding the new modules +
+    // internal edges into `npm_resolution` so the graph-construction below
+    // picks them up.
+    let post_link_specifiers = scan_transformed_bare_specifiers(&modules, &local_prefixes);
+    let mut new_specifiers: Vec<String> = Vec::new();
+    for spec in post_link_specifiers {
+        if !bare_specifiers.contains(&spec) {
+            new_specifiers.push(spec);
+        }
+    }
+    if !new_specifiers.is_empty() {
+        tracing::info!(
+            "resolving {} additional specifier(s) introduced by flatten pass: {:?}",
+            new_specifiers.len(),
+            new_specifiers
+        );
+        bare_specifiers.extend(new_specifiers.iter().cloned());
+        let extra = ngc_npm_resolver::resolve_npm_dependencies(&new_specifiers, &config_dir)?;
+        tracing::info!(
+            "post-flatten npm resolution pulled in {} file(s)",
+            extra.modules.len()
+        );
+        for (path, source) in &extra.modules {
+            modules.entry(path.clone()).or_insert_with(|| source.clone());
+            npm_resolution
+                .modules
+                .entry(path.clone())
+                .or_insert_with(|| source.clone());
+        }
+        for spec in &new_specifiers {
+            npm_resolution.resolved_specifiers.insert(spec.clone());
+        }
+        for edge in extra.edges {
+            npm_resolution.edges.push(edge);
+        }
+        // Re-run the linker on any newly-pulled-in npm files so their
+        // ɵɵngDeclare calls are transformed too.
+        let _ = ngc_linker::link_modules(&mut modules, &config_dir)?;
     }
 
     // Inject vendored helpers for oxc runtime (not an npm dependency of the project)
