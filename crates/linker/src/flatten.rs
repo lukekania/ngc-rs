@@ -33,6 +33,7 @@ use oxc_ast::ast::{
 };
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
+use rayon::prelude::*;
 
 use crate::module_registry::ModuleRegistry;
 use crate::public_exports::PublicExports;
@@ -81,19 +82,27 @@ pub fn flatten_component_dependencies(
     if registry.is_empty() {
         return Ok(0);
     }
-    let paths: Vec<PathBuf> = modules
+
+    // Snapshot the (path, source) pairs for every file that contains a
+    // ɵɵdefineComponent call so the parallel transform phase owns its inputs
+    // and the module map stays immutable during the fan-out.
+    let work: Vec<(PathBuf, String)> = modules
         .iter()
         .filter(|(_, source)| source.contains("\u{0275}\u{0275}defineComponent"))
-        .map(|(path, _)| path.clone())
+        .map(|(path, source)| (path.clone(), source.clone()))
         .collect();
 
+    let results: Vec<(PathBuf, Option<String>)> = work
+        .par_iter()
+        .map(|(path, source)| -> NgcResult<(PathBuf, Option<String>)> {
+            let updated = flatten_one(source, path, registry, public_exports)?;
+            Ok((path.clone(), updated))
+        })
+        .collect::<NgcResult<Vec<_>>>()?;
+
     let mut rewritten = 0;
-    for path in paths {
-        let source = match modules.get(&path) {
-            Some(s) => s.clone(),
-            None => continue,
-        };
-        if let Some(updated) = flatten_one(&source, &path, registry, public_exports)? {
+    for (path, maybe_updated) in results {
+        if let Some(updated) = maybe_updated {
             modules.insert(path.clone(), updated);
             rewritten += 1;
             tracing::debug!(path = %path.display(), "flattened component dependencies");

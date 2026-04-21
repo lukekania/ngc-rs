@@ -14,6 +14,7 @@ oxc_allocator = "0.122"
 oxc_parser = "0.122"
 oxc_ast = "0.122"
 oxc_span = "0.122"
+rayon = "1.11"
 tracing = "0.1"
 
 [dev-dependencies]

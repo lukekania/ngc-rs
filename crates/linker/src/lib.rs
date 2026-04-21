@@ -42,6 +42,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use ngc_diagnostics::NgcResult;
+use rayon::prelude::*;
 
 pub use module_registry::ModuleRegistry;
 pub use public_exports::PublicExports;
@@ -74,36 +75,39 @@ pub fn link_npm_modules(
     _project_root: &Path,
     registry: &ModuleRegistry,
 ) -> NgcResult<LinkerStats> {
-    let mut files_scanned = 0;
-    let mut files_linked = 0;
-
-    // Collect paths that need linking (can't mutate while iterating)
-    let paths_to_link: Vec<PathBuf> = modules
+    // Snapshot (path, source) for every npm file, then narrow to those whose
+    // source contains ɵɵngDeclare. Two-step so we can report accurate
+    // scan/link counts and so the parallel transform phase owns its inputs.
+    let npm_files: Vec<(&PathBuf, &String)> = modules
         .iter()
-        .filter(|(path, source)| {
-            if !is_npm_module(path) {
-                return false;
-            }
-            files_scanned += 1;
-            needs_linking(source)
-        })
-        .map(|(path, _)| path.clone())
+        .filter(|(path, _)| is_npm_module(path))
+        .collect();
+    let files_scanned = npm_files.len();
+
+    let work: Vec<(PathBuf, String)> = npm_files
+        .into_iter()
+        .filter(|(_, source)| needs_linking(source))
+        .map(|(p, s)| (p.clone(), s.clone()))
         .collect();
 
-    for path in paths_to_link {
-        if let Some(source) = modules.get(&path) {
-            let source = source.clone();
-            match transform::link_source(&source, &path, registry)? {
-                Some(linked) => {
-                    modules.insert(path.clone(), linked);
-                    files_linked += 1;
-                    tracing::debug!(path = %path.display(), "linked Angular declarations");
-                }
-                None => {
-                    // Detection said yes but transform found nothing — shouldn't happen
-                    // but harmless
-                }
-            }
+    // Transform in parallel. `transform::link_source` only reads the source
+    // and writes into `ModuleRegistry` (internally RwLock-protected), so
+    // per-file work is independent.
+    let results: Vec<(PathBuf, Option<String>)> = work
+        .par_iter()
+        .map(|(path, source)| -> NgcResult<(PathBuf, Option<String>)> {
+            let linked = transform::link_source(source, path, registry)?;
+            Ok((path.clone(), linked))
+        })
+        .collect::<NgcResult<Vec<_>>>()?;
+
+    // Apply the rewrites back to the module map serially.
+    let mut files_linked = 0;
+    for (path, maybe_new) in results {
+        if let Some(new_source) = maybe_new {
+            modules.insert(path.clone(), new_source);
+            files_linked += 1;
+            tracing::debug!(path = %path.display(), "linked Angular declarations");
         }
     }
 
@@ -136,14 +140,14 @@ pub fn link_modules(
     let mut stats = link_npm_modules(modules, project_root, &registry)?;
 
     // Build the public-exports index by scanning every npm file's top-level
-    // `export { … }` statements. Needed so the flatten pass can target the
-    // correct import specifier for each directive it adds.
-    for (path, source) in modules.iter() {
-        if !is_npm_module(path) {
-            continue;
-        }
-        public_exports.scan_file(source, path);
-    }
+    // `export { … }` statements. `PublicExports` is RwLock-protected so the
+    // scan loop is a clean `par_iter` candidate.
+    modules
+        .par_iter()
+        .filter(|(path, _)| is_npm_module(path))
+        .for_each(|(path, source)| {
+            public_exports.scan_file(source, path);
+        });
 
     stats.modules_registered = module_registry::scan_define_ng_modules(modules, &registry)?;
     stats.components_flattened =
