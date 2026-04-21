@@ -451,192 +451,108 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<ChunkBundleResult> {
         }
     }
 
-    // Process each module
-    for module_path in p.module_paths {
-        let js_code = p
-            .all_modules
-            .get(module_path)
-            .ok_or_else(|| NgcError::BundleError {
-                message: format!(
-                    "module {} is in the graph but has no transformed code",
-                    module_path.display()
-                ),
-            })?;
+    // Per-module work is independent: each module only reads immutable
+    // pre-built maps (`file_to_namespace`, `specifier_to_namespace`, chunk
+    // params) plus its own source code, and emits an optional ModuleSection
+    // plus zero or more ExternalImports. Fan out across rayon workers and
+    // merge the results back into `sections` / `all_externals` afterwards.
+    let empty_specifiers: HashSet<String> = HashSet::new();
+    let empty_ns_map: HashMap<String, String> = HashMap::new();
+    let empty_prefixes: Vec<&str> = Vec::new();
 
-        let is_npm = file_to_namespace.contains_key(module_path);
-        let file_name = module_path.to_string_lossy();
+    let per_module: Vec<(Option<ModuleSection>, Vec<ExternalImport>)> = p
+        .module_paths
+        .par_iter()
+        .map(
+            |module_path| -> NgcResult<(Option<ModuleSection>, Vec<ExternalImport>)> {
+                let js_code =
+                    p.all_modules
+                        .get(module_path)
+                        .ok_or_else(|| NgcError::BundleError {
+                            message: format!(
+                                "module {} is in the graph but has no transformed code",
+                                module_path.display()
+                            ),
+                        })?;
 
-        if is_npm {
-            // NPM module: wrap in IIFE with namespace isolation
-            let namespace = &file_to_namespace[module_path];
-            let ft_ns = file_to_namespace.clone();
+                let is_npm = file_to_namespace.contains_key(module_path);
+                let file_name = module_path.to_string_lossy();
 
-            let wrapped =
-                crate::npm_wrap::wrap_npm_module(js_code, &file_name, namespace, |specifier| {
-                    // Resolve import specifier to target namespace
-                    if specifier.starts_with('.') {
-                        // Relative import within npm — resolve to a file path
-                        let from_dir = module_path.parent()?;
-                        let target = from_dir.join(specifier);
-                        // Try exact, then with extensions
-                        for candidate in &[
-                            target.clone(),
-                            target.with_extension("mjs"),
-                            target.with_extension("js"),
-                            target.join("index.mjs"),
-                            target.join("index.js"),
-                        ] {
-                            if let Ok(canonical) = candidate.canonicalize() {
-                                if let Some(ns) = ft_ns.get(&canonical) {
-                                    return Some(ns.clone());
-                                }
-                            }
-                        }
-                        None
-                    } else {
-                        // Bare specifier — look up in specifier map
-                        specifier_to_namespace.get(specifier).cloned()
-                    }
-                })?;
-
-            // Collect external imports from unresolvable bare specifiers in npm code
-            // (these become hoisted imports at the top of the bundle)
-            // For now, npm modules' external imports are handled by wrap_npm_module
-            // which strips them.
-
-            let code = &wrapped.wrapped_code;
-            let trimmed = code.trim();
-            if !trimmed.is_empty() {
-                let relative = module_path.strip_prefix(p.root_dir).unwrap_or(module_path);
-                let display_path = relative.with_extension("js");
-                let section_code = format!("// {}\n{}", display_path.display(), trimmed);
-                let line_count = section_code.chars().filter(|&c| c == '\n').count() as u32 + 1;
-                sections.push(ModuleSection {
-                    code: section_code,
-                    line_count,
-                    source_path: module_path.clone(),
-                });
-            }
-        } else {
-            // Project module: use existing rewriter with namespace map.
-            // For lazy/shared chunks, pass empty prefixes and bundled_specifiers
-            // so ALL imports are collected as external (for cross-chunk resolution).
-            let empty_specifiers = HashSet::new();
-            let empty_ns_map = HashMap::new();
-            let empty_prefixes: Vec<&str> = Vec::new();
-            let (effective_prefixes, effective_bundled, effective_ns_map) = if is_lazy {
-                (empty_prefixes.as_slice(), &empty_specifiers, &empty_ns_map)
-            } else {
-                (p.prefix_refs, p.bundled_specifiers, &specifier_to_namespace)
-            };
-
-            let module_unused = p.unused_exports.get(module_path);
-            let is_chunk_entry = module_path == p.chunk_entry;
-            let rewritten = rewrite::rewrite_module_with_shaking(
-                js_code,
-                &file_name,
-                effective_prefixes,
-                p.specifier_rewrites,
-                module_unused,
-                effective_bundled,
-                effective_ns_map,
-                is_chunk_entry,
-            )?;
-
-            if is_lazy {
-                // For lazy chunks, classify each external import per-module
-                // so relative paths can be resolved from the correct source.
-                let module_dir = module_path.parent();
-                let is_npm_module = module_path
-                    .components()
-                    .any(|c| c.as_os_str() == "node_modules");
-                for ext in rewritten.external_imports {
-                    if p.bundled_specifiers.contains(&ext.source) {
-                        // npm bare specifier → cross-chunk from main
-                        all_externals.push(ext);
-                    } else if ext.source.starts_with('.') {
-                        if is_npm_module {
-                            // Relative import from an npm module to another npm module.
-                            // Resolve to find the target's namespace in the main chunk.
-                            let mut resolved_ext = ext.clone();
-                            if let Some(dir) = module_dir {
-                                let target = dir.join(&ext.source);
-                                for c in &[
+                if is_npm {
+                    // NPM module: wrap in IIFE with namespace isolation.
+                    let namespace = &file_to_namespace[module_path];
+                    let wrapped = crate::npm_wrap::wrap_npm_module(
+                        js_code,
+                        &file_name,
+                        namespace,
+                        |specifier| {
+                            if specifier.starts_with('.') {
+                                let from_dir = module_path.parent()?;
+                                let target = from_dir.join(specifier);
+                                for candidate in &[
                                     target.clone(),
-                                    target.with_extension("js"),
                                     target.with_extension("mjs"),
-                                    target.join("index.js"),
+                                    target.with_extension("js"),
                                     target.join("index.mjs"),
+                                    target.join("index.js"),
                                 ] {
-                                    if let Ok(canon) = c.canonicalize() {
-                                        if let Some(ns) = p.main_file_to_ns.get(&canon) {
-                                            resolved_ext.source = format!("__resolved_ns__{ns}");
-                                            break;
+                                    if let Ok(canonical) = candidate.canonicalize() {
+                                        if let Some(ns) = file_to_namespace.get(&canonical) {
+                                            return Some(ns.clone());
                                         }
                                     }
                                 }
+                                None
+                            } else {
+                                specifier_to_namespace.get(specifier).cloned()
                             }
-                            // If resolution failed, still mark as npm-sourced so it
-                            // doesn't get misclassified as a project symbol
-                            if !resolved_ext.source.starts_with("__resolved_ns__") {
-                                resolved_ext.source = "__npm_unresolved__".to_string();
-                            }
-                            all_externals.push(resolved_ext);
-                            continue;
-                        }
-                        // Relative import from project module — resolve from this module's directory
-                        let resolved = module_dir.and_then(|dir| {
-                            let candidate = dir.join(&ext.source);
-                            let candidate_str = candidate.to_string_lossy().to_string();
-                            // Append extensions (not replace) to handle paths like
-                            // ./logto-auth.service where .service is NOT an extension.
-                            for suffix in &["", ".ts", ".js", ".mjs"] {
-                                let full = PathBuf::from(format!("{candidate_str}{suffix}"));
-                                if let Ok(canon) = full.canonicalize() {
-                                    return Some(canon);
-                                }
-                            }
-                            None
-                        });
-                        match resolved {
-                            Some(ref resolved_path) => {
-                                if p.chunk_module_set.contains(resolved_path) {
-                                    continue; // Same chunk — discard
-                                }
-                                if p.main_chunk_module_set.contains(resolved_path) {
-                                    all_externals.push(ext); // Verified in main
-                                }
-                                // else: in another lazy/shared chunk — discard
-                            }
-                            None => {
-                                // Unresolved relative import — discard (can't verify main)
-                            }
-                        }
-                    } else if p.prefix_refs.iter().any(|pfx| ext.source.starts_with(pfx)) {
-                        // Path alias import — cross-chunk from main
-                        all_externals.push(ext);
-                    } else {
-                        // Unknown bare specifier — treat as npm
-                        all_externals.push(ext);
-                    }
-                }
-            } else {
-                all_externals.extend(rewritten.external_imports);
-            }
+                        },
+                    )?;
 
-            let trimmed = rewritten.code.trim();
-            if !trimmed.is_empty() {
-                let relative = module_path.strip_prefix(p.root_dir).unwrap_or(module_path);
-                let display_path = relative.with_extension("js");
-                let section_code = format!("// {}\n{}", display_path.display(), trimmed);
-                let line_count = section_code.chars().filter(|&c| c == '\n').count() as u32 + 1;
-                sections.push(ModuleSection {
-                    code: section_code,
-                    line_count,
-                    source_path: module_path.clone(),
-                });
-            }
+                    let section = build_section(&wrapped.wrapped_code, module_path, p.root_dir);
+                    Ok((section, Vec::new()))
+                } else {
+                    // Project module: use existing rewriter with namespace map.
+                    // For lazy/shared chunks, pass empty prefixes/bundled so ALL
+                    // imports are collected as external (for cross-chunk
+                    // resolution).
+                    let (effective_prefixes, effective_bundled, effective_ns_map) = if is_lazy {
+                        (empty_prefixes.as_slice(), &empty_specifiers, &empty_ns_map)
+                    } else {
+                        (p.prefix_refs, p.bundled_specifiers, &specifier_to_namespace)
+                    };
+
+                    let module_unused = p.unused_exports.get(module_path);
+                    let is_chunk_entry = module_path == p.chunk_entry;
+                    let rewritten = rewrite::rewrite_module_with_shaking(
+                        js_code,
+                        &file_name,
+                        effective_prefixes,
+                        p.specifier_rewrites,
+                        module_unused,
+                        effective_bundled,
+                        effective_ns_map,
+                        is_chunk_entry,
+                    )?;
+
+                    let module_externals = if is_lazy {
+                        classify_lazy_externals(rewritten.external_imports, module_path, p)
+                    } else {
+                        rewritten.external_imports
+                    };
+
+                    let section = build_section(&rewritten.code, module_path, p.root_dir);
+                    Ok((section, module_externals))
+                }
+            },
+        )
+        .collect::<NgcResult<Vec<_>>>()?;
+
+    for (section, externals) in per_module {
+        if let Some(section) = section {
+            sections.push(section);
         }
+        all_externals.extend(externals);
     }
 
     // For lazy/shared chunks, all remaining externals are cross-chunk imports
@@ -768,6 +684,113 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<ChunkBundleResult> {
         specifier_to_namespace,
         file_to_namespace,
     })
+}
+
+/// Build a `// path\n<code>` section from a rewritten module's code, or
+/// `None` if the code was empty after trimming.
+fn build_section(code: &str, module_path: &Path, root_dir: &Path) -> Option<ModuleSection> {
+    let trimmed = code.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let relative = module_path.strip_prefix(root_dir).unwrap_or(module_path);
+    let display_path = relative.with_extension("js");
+    let section_code = format!("// {}\n{}", display_path.display(), trimmed);
+    let line_count = section_code.chars().filter(|&c| c == '\n').count() as u32 + 1;
+    Some(ModuleSection {
+        code: section_code,
+        line_count,
+        source_path: module_path.to_path_buf(),
+    })
+}
+
+/// Classify a lazy/shared chunk module's external imports into the ones that
+/// actually need to be hoisted as cross-chunk references (import from
+/// `./main.js`) vs. the ones that can be dropped because they resolve to
+/// another module in the same lazy chunk or a different lazy chunk.
+fn classify_lazy_externals(
+    externals: Vec<ExternalImport>,
+    module_path: &Path,
+    p: &ChunkBundleParams<'_>,
+) -> Vec<ExternalImport> {
+    let module_dir = module_path.parent();
+    let is_npm_module = module_path
+        .components()
+        .any(|c| c.as_os_str() == "node_modules");
+
+    let mut out: Vec<ExternalImport> = Vec::with_capacity(externals.len());
+    for ext in externals {
+        if p.bundled_specifiers.contains(&ext.source) {
+            // npm bare specifier → cross-chunk from main
+            out.push(ext);
+        } else if ext.source.starts_with('.') {
+            if is_npm_module {
+                // Relative import from an npm module to another npm module.
+                // Resolve to find the target's namespace in the main chunk.
+                let mut resolved_ext = ext.clone();
+                if let Some(dir) = module_dir {
+                    let target = dir.join(&ext.source);
+                    for c in &[
+                        target.clone(),
+                        target.with_extension("js"),
+                        target.with_extension("mjs"),
+                        target.join("index.js"),
+                        target.join("index.mjs"),
+                    ] {
+                        if let Ok(canon) = c.canonicalize() {
+                            if let Some(ns) = p.main_file_to_ns.get(&canon) {
+                                resolved_ext.source = format!("__resolved_ns__{ns}");
+                                break;
+                            }
+                        }
+                    }
+                }
+                // If resolution failed, still mark as npm-sourced so it
+                // doesn't get misclassified as a project symbol.
+                if !resolved_ext.source.starts_with("__resolved_ns__") {
+                    resolved_ext.source = "__npm_unresolved__".to_string();
+                }
+                out.push(resolved_ext);
+                continue;
+            }
+            // Relative import from project module — resolve from this
+            // module's directory.
+            let resolved = module_dir.and_then(|dir| {
+                let candidate = dir.join(&ext.source);
+                let candidate_str = candidate.to_string_lossy().to_string();
+                // Append extensions (not replace) to handle paths like
+                // ./logto-auth.service where .service is NOT an extension.
+                for suffix in &["", ".ts", ".js", ".mjs"] {
+                    let full = PathBuf::from(format!("{candidate_str}{suffix}"));
+                    if let Ok(canon) = full.canonicalize() {
+                        return Some(canon);
+                    }
+                }
+                None
+            });
+            match resolved {
+                Some(ref resolved_path) => {
+                    if p.chunk_module_set.contains(resolved_path) {
+                        continue; // Same chunk — discard
+                    }
+                    if p.main_chunk_module_set.contains(resolved_path) {
+                        out.push(ext); // Verified in main
+                    }
+                    // else: in another lazy/shared chunk — discard
+                }
+                None => {
+                    // Unresolved relative import — discard (can't verify main)
+                }
+            }
+        } else if p.prefix_refs.iter().any(|pfx| ext.source.starts_with(pfx)) {
+            // Path alias import — cross-chunk from main
+            out.push(ext);
+        } else {
+            // Unknown bare specifier — treat as npm
+            out.push(ext);
+        }
+    }
+    out
 }
 
 /// Generate export statements on the main chunk for symbols that lazy chunks need.
