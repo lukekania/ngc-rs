@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/cli", "crates/diagnostics", "crates/project-resolver", "crates/ts-transform", "crates/bundler", "crates/template-compiler", "crates/npm-resolver", "crates/linker"]
 
 [workspace.package]
-version = "0.7.18"
+version = "0.7.19"
 edition = "2021"
 license = "MIT"
 authors = ["lukekania"]
