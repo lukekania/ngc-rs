@@ -117,36 +117,79 @@ pub fn build_file_graph(config: &ResolvedTsConfig) -> NgcResult<FileGraph> {
         })
         .collect();
 
+    // Resolve every import in parallel — `resolve_specifier` does ~5
+    // `is_file` + `canonicalize` probes per import and is the dominant cost.
+    // We emit one `ResolutionOutcome` per scanned import, then serially fold
+    // them into the graph (petgraph edges require `&mut`), the unresolved
+    // list, and the npm-import-site map.
+    enum ResolutionOutcome {
+        Edge(NodeIndex, NodeIndex, ImportKind),
+        Unresolved(UnresolvedImport),
+        Npm {
+            specifier: String,
+            from_file: PathBuf,
+            kind: ImportKind,
+        },
+        /// Resolved but points outside the file set — nothing to record.
+        External,
+    }
+
+    let outcomes: Vec<ResolutionOutcome> = scan_results
+        .par_iter()
+        .flat_map_iter(|(from_file, scanned_imports)| {
+            let from_idx = path_index[from_file];
+            let resolver_config = &resolver_config;
+            let path_index = &path_index;
+            scanned_imports
+                .iter()
+                .map(move |scanned| {
+                    match resolve_specifier(&scanned.specifier, from_file, resolver_config) {
+                        Some(resolved_path) => {
+                            if let Some(&to_idx) = path_index.get(&resolved_path) {
+                                ResolutionOutcome::Edge(from_idx, to_idx, scanned.kind)
+                            } else {
+                                ResolutionOutcome::External
+                            }
+                        }
+                        None => {
+                            if is_project_local(&scanned.specifier, resolver_config) {
+                                ResolutionOutcome::Unresolved(UnresolvedImport {
+                                    from_file: from_file.clone(),
+                                    specifier: scanned.specifier.clone(),
+                                })
+                            } else {
+                                ResolutionOutcome::Npm {
+                                    specifier: scanned.specifier.clone(),
+                                    from_file: from_file.clone(),
+                                    kind: scanned.kind,
+                                }
+                            }
+                        }
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
     let mut unresolved = Vec::new();
     let mut npm_import_sites: HashMap<String, Vec<(PathBuf, ImportKind)>> = HashMap::new();
-
-    // Resolve imports and add edges (single-threaded for graph mutation)
-    for (from_file, scanned_imports) in &scan_results {
-        let from_idx = path_index[from_file];
-        for scanned in scanned_imports {
-            match resolve_specifier(&scanned.specifier, from_file, &resolver_config) {
-                Some(resolved_path) => {
-                    if let Some(&to_idx) = path_index.get(&resolved_path) {
-                        graph.add_edge(from_idx, to_idx, scanned.kind);
-                    }
-                    // If resolved but not in our file set, it's an external file — skip
-                }
-                None => {
-                    if is_project_local(&scanned.specifier, &resolver_config) {
-                        // Project-local import that failed to resolve
-                        unresolved.push(UnresolvedImport {
-                            from_file: from_file.clone(),
-                            specifier: scanned.specifier.clone(),
-                        });
-                    } else {
-                        // Bare module specifier — record for npm resolution
-                        npm_import_sites
-                            .entry(scanned.specifier.clone())
-                            .or_default()
-                            .push((from_file.clone(), scanned.kind));
-                    }
-                }
+    for outcome in outcomes {
+        match outcome {
+            ResolutionOutcome::Edge(from_idx, to_idx, kind) => {
+                graph.add_edge(from_idx, to_idx, kind);
             }
+            ResolutionOutcome::Unresolved(u) => unresolved.push(u),
+            ResolutionOutcome::Npm {
+                specifier,
+                from_file,
+                kind,
+            } => {
+                npm_import_sites
+                    .entry(specifier)
+                    .or_default()
+                    .push((from_file, kind));
+            }
+            ResolutionOutcome::External => {}
         }
     }
 
