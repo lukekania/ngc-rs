@@ -1036,8 +1036,8 @@ C.\u{0275}cmp = \u{0275}\u{0275}defineComponent({ type: C, dependencies: [Reacti
         // Regression: early implementations assumed `{ A, B }` fixed-offset
         // braces and corrupted multi-line imports (which Prettier produces
         // for long lists). The file would end up with a truncated import
-        // and stale code bleeding into the rewritten span — visible in the
-        // treasr-frontend dialog as "backdrop renders, container doesn't".
+        // and stale code bleeding into the rewritten span — observed at
+        // runtime as a dialog rendering its backdrop but not its container.
         let reg = make_registry();
         let mut modules = HashMap::new();
         let source = "import {\n  ReactiveFormsModule,\n  FormBuilder,\n  FormGroup,\n  Validators,\n} from '@angular/forms';\n\

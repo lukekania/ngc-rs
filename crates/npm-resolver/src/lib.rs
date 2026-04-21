@@ -54,12 +54,12 @@ pub fn resolve_npm_dependencies(
     let mut resolved_specifiers: HashSet<String> = HashSet::new();
     let mut visited: HashSet<PathBuf> = HashSet::new();
 
-    // Shared canonicalize cache. On treasr-frontend roughly 800 import-target
-    // paths turn into ~3× that in `canonicalize()` calls (each import probes
-    // the same target from multiple importers) — each call is a macOS
-    // `__getattrlist` syscall which the flame graph ranks as the single
-    // largest self-time cost of the build. Caching results across rayon
-    // workers collapses the duplicates into one syscall per unique path.
+    // Shared canonicalize cache. On a typical real-world app, unique import
+    // targets get probed ~3× — each import site canonicalises the same
+    // target path independently. Every call is a `__getattrlist` / `stat`
+    // syscall which the flame graph ranks as the single largest self-time
+    // cost of the build. Caching results across rayon workers collapses the
+    // duplicates into one syscall per unique path.
     let canon_cache: DashMap<PathBuf, PathBuf> = DashMap::new();
     let canonicalize_cached = |p: PathBuf| -> PathBuf {
         if let Some(hit) = canon_cache.get(&p) {

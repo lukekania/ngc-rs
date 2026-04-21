@@ -298,7 +298,7 @@ fn run_build(
     // spurious specifiers from packages' embedded test/dev code (e.g.
     // `@vitest/*`, `pathe`, `tinyrainbow`) that the app never reaches but
     // which, once linked, can corrupt the evaluation order of unrelated
-    // modules — observed in treasr-frontend as a silent dialog failure.
+    // modules — observed as a silent dialog failure in a real-world app.
     let project_modules: HashMap<PathBuf, String> = modules
         .iter()
         .filter(|(path, _)| !ngc_linker::is_npm_path(path))
@@ -1108,8 +1108,8 @@ struct CssJob {
 /// plugin is installed, spawn the Node subprocess to process it.
 ///
 /// Called early in the build so the subprocess overlaps with the bundler
-/// (Node startup + Tailwind compile is ~200 ms on treasr-frontend). The
-/// returned [`CssJob`] is awaited later during the output phase.
+/// (Node startup + Tailwind compile typically costs ~200 ms on a real-world
+/// app). The returned [`CssJob`] is awaited later during the output phase.
 fn start_css_job(
     angular_project: Option<&ResolvedAngularProject>,
     out_dir: &Path,
@@ -1486,7 +1486,7 @@ mod tests {
         assert_eq!(result[0].0, env_file);
     }
 
-    /// Scaffold a `public/` tree mirroring the treasr-frontend shape.
+    /// Scaffold a `public/` tree mirroring a typical Angular 17+ app layout.
     fn scaffold_public_tree(root: &Path) -> PathBuf {
         let public = root.join("public");
         std::fs::create_dir_all(public.join("i18n")).unwrap();
