@@ -1424,10 +1424,14 @@ impl IvyCodegen {
             let compiled_base = self.replace_pipes_in_expr(&base);
             let pipe_slot = self.slot_index;
             self.slot_index += 1;
-            // Capture binding start BEFORE incrementing
-            let pipe_var_slot = self.var_count;
-            // Each pipe uses 2 + args binding slots: input + pure cache + extra args
-            self.var_count += 2 + args.len() as u32;
+            // Use the pipe-specific offset counter so pipe binding slots are
+            // packed contiguously (0, 2, 5, …) across the whole template.
+            // `rewrite_pipe_offsets` later shifts these by the sequential
+            // binding count so they sit after all sequential bindings in LView.
+            let pipe_var_slot = self.pipe_var_offset;
+            let slots = 2 + args.len() as u32;
+            self.pipe_var_offset += slots;
+            self.var_count += slots;
             self.ivy_imports.insert("\u{0275}\u{0275}pipe".to_string());
 
             let bind_fn = match args.len() {
@@ -1999,8 +2003,13 @@ fn replace_nested_pipe_parens(expr: &str, gen: &mut IvyCodegen) -> String {
 
                 let pipe_slot = gen.slot_index;
                 gen.slot_index += 1;
-                let pipe_var_slot = gen.var_count;
-                gen.var_count += 2 + args.len() as u32;
+                // Same pipe-offset counter as replace_pipes_in_expr /
+                // wrap_with_pipes — keep all three paths consistent so
+                // rewrite_pipe_offsets shifts every pipe slot uniformly.
+                let pipe_var_slot = gen.pipe_var_offset;
+                let slots = 2 + args.len() as u32;
+                gen.pipe_var_offset += slots;
+                gen.var_count += slots;
                 gen.ivy_imports.insert("\u{0275}\u{0275}pipe".to_string());
 
                 let bind_fn = match args.len() {
@@ -3225,5 +3234,129 @@ mod tests {
             dc.contains("elementStart(0, 'canvas', 0)"),
             "elementStart should reference consts index for baseChart attr: {dc}"
         );
+    }
+
+    /// Regression: GitHub #69 — property-binding pipe and interpolation pipe in
+    /// the same template must receive distinct `slotOffset` arguments. Before
+    /// the fix, `replace_pipes_in_expr` used `var_count` as the pipe offset
+    /// while `wrap_with_pipes` used `pipe_var_offset`; `rewrite_pipe_offsets`
+    /// then double-counted the sequential bindings and both pipes landed on
+    /// the same LView slot, triggering NG0100.
+    #[test]
+    fn test_article_shaped_pipes_have_distinct_slot_offsets() {
+        let comp = test_component();
+        let nodes = vec![TemplateNode::Element(ElementNode {
+            tag: "a".to_string(),
+            attributes: vec![TemplateAttribute::Property {
+                name: "href".to_string(),
+                expression: "article.url | safeUrl".to_string(),
+            }],
+            children: vec![TemplateNode::Element(ElementNode {
+                tag: "span".to_string(),
+                attributes: Vec::new(),
+                children: vec![TemplateNode::Interpolation(InterpolationNode {
+                    expression: "article.datetime * 1000".to_string(),
+                    pipes: vec![PipeCall {
+                        name: "date".to_string(),
+                        args: vec!["'short'".to_string()],
+                    }],
+                })],
+                is_void: false,
+            })],
+            is_void: false,
+        })];
+        let output = generate_ivy(&comp, &nodes).expect("should generate");
+        let dc = &output.static_fields[0];
+
+        let offsets = collect_pipe_slot_offsets(dc);
+        assert_eq!(
+            offsets.len(),
+            2,
+            "expected two pipeBind* calls in the template: {dc}"
+        );
+        assert_ne!(
+            offsets[0], offsets[1],
+            "pipeBind slot offsets must be distinct (got {offsets:?}): {dc}"
+        );
+
+        // vars: must cover seq bindings (1 property + 1 textInterpolate = 2)
+        // plus pipe slots (2 for pipeBind1 + 3 for pipeBind2 = 5) = 7.
+        assert!(
+            dc.contains("vars: 7"),
+            "vars: should equal total binding slots (2 seq + 5 pipe = 7): {dc}"
+        );
+
+        // Both pipe offsets must fall inside the binding range, strictly after
+        // the sequential bindings (which occupy slots 0..=1).
+        for off in &offsets {
+            assert!(
+                *off >= 2,
+                "pipe offset {off} must sit after sequential bindings: {dc}"
+            );
+            assert!(
+                *off < 7,
+                "pipe offset {off} must fit in vars: 7 range: {dc}"
+            );
+        }
+    }
+
+    /// Regression: two top-level pipes in successive property bindings on the
+    /// same element (both flowing through `replace_pipes_in_expr`) must also
+    /// receive distinct `slotOffset` values.
+    #[test]
+    fn test_two_property_binding_pipes_have_distinct_slot_offsets() {
+        let comp = test_component();
+        let nodes = vec![TemplateNode::Element(ElementNode {
+            tag: "img".to_string(),
+            attributes: vec![
+                TemplateAttribute::Property {
+                    name: "src".to_string(),
+                    expression: "photo.url | safeUrl".to_string(),
+                },
+                TemplateAttribute::Property {
+                    name: "alt".to_string(),
+                    expression: "photo.caption | translate".to_string(),
+                },
+            ],
+            children: Vec::new(),
+            is_void: true,
+        })];
+        let output = generate_ivy(&comp, &nodes).expect("should generate");
+        let dc = &output.static_fields[0];
+        let offsets = collect_pipe_slot_offsets(dc);
+        assert_eq!(offsets.len(), 2, "expected two pipeBind* calls: {dc}");
+        assert_ne!(
+            offsets[0], offsets[1],
+            "successive property pipes must have distinct offsets (got {offsets:?}): {dc}"
+        );
+    }
+
+    fn collect_pipe_slot_offsets(code: &str) -> Vec<u32> {
+        let mut out = Vec::new();
+        for marker in [
+            "\u{0275}\u{0275}pipeBind1(",
+            "\u{0275}\u{0275}pipeBind2(",
+            "\u{0275}\u{0275}pipeBind3(",
+            "\u{0275}\u{0275}pipeBindV(",
+        ] {
+            let mut cursor = 0;
+            while let Some(rel) = code[cursor..].find(marker) {
+                let after = cursor + rel + marker.len();
+                let rest = &code[after..];
+                let comma = rest.find(',').expect("pipeBind* should have ≥ 2 args");
+                let offset_region = rest[comma + 1..].trim_start();
+                let digits: String = offset_region
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                out.push(
+                    digits
+                        .parse::<u32>()
+                        .expect("second arg to pipeBind* must be a literal offset"),
+                );
+                cursor = after;
+            }
+        }
+        out
     }
 }
