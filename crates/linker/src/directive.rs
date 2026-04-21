@@ -489,32 +489,45 @@ fn compile_host_expression(expr: &str) -> String {
 
     let mut result = expr.to_string();
 
-    // Sort insertions in reverse order to preserve offsets
     ctx_inserts.sort_unstable();
     ctx_inserts.dedup();
 
-    // Apply removals first (sorted reverse)
-    let mut sorted_removes: Vec<(u32, u32)> = remove_ranges
-        .iter()
-        .map(|(s, e)| (s - expr_offset, e - expr_offset))
-        .collect();
-    sorted_removes.sort_by_key(|e| std::cmp::Reverse(e.0));
-    for (s, e) in &sorted_removes {
-        let s = *s as usize;
-        let e = *e as usize;
-        if s <= result.len() && e <= result.len() {
-            result.replace_range(s..e, "");
-        }
+    // Merge inserts and removes into a single edit list, then apply from
+    // rightmost to leftmost so each edit only touches characters to the right
+    // of earlier (already-processed) edits — their positions in the mutated
+    // string still match the original offsets.
+    enum Edit {
+        Insert(u32),
+        Remove(u32, u32),
     }
+    let mut edits: Vec<Edit> = Vec::with_capacity(ctx_inserts.len() + remove_ranges.len());
+    for off in &ctx_inserts {
+        edits.push(Edit::Insert(off - expr_offset));
+    }
+    for (s, e) in &remove_ranges {
+        edits.push(Edit::Remove(s - expr_offset, e - expr_offset));
+    }
+    edits.sort_by_key(|e| {
+        std::cmp::Reverse(match e {
+            Edit::Insert(p) => *p,
+            Edit::Remove(s, _) => *s,
+        })
+    });
 
-    // Apply ctx. insertions (sorted reverse)
-    let mut sorted_inserts: Vec<u32> = ctx_inserts.iter().map(|off| off - expr_offset).collect();
-    sorted_inserts.sort_unstable();
-    sorted_inserts.reverse();
-    for off in &sorted_inserts {
-        let off = *off as usize;
-        if off <= result.len() {
-            result.insert_str(off, "ctx.");
+    for edit in edits {
+        match edit {
+            Edit::Insert(off) => {
+                let off = off as usize;
+                if off <= result.len() {
+                    result.insert_str(off, "ctx.");
+                }
+            }
+            Edit::Remove(s, e) => {
+                let (s, e) = (s as usize, e as usize);
+                if s <= result.len() && e <= result.len() {
+                    result.replace_range(s..e, "");
+                }
+            }
         }
     }
 
@@ -561,6 +574,7 @@ fn collect_ctx_rewrites(
                 | "Map"
                 | "Set"
                 | "$event"
+                | "ctx"
         )
     }
 
@@ -569,6 +583,26 @@ fn collect_ctx_rewrites(
             ctx_inserts.push(id.span.start);
         }
         Expression::CallExpression(call) => {
+            // `$any(x)` is a template-DSL type assertion; compile it as identity
+            // (emit `x` unchanged) rather than a call to a nonexistent ctx.$any.
+            if let Expression::Identifier(id) = &call.callee {
+                if id.name == "$any" && call.arguments.len() == 1 {
+                    if let Some(arg) = call.arguments.first() {
+                        if !matches!(arg, Argument::SpreadElement(_)) {
+                            let inner = arg.to_expression();
+                            remove_ranges.push((call.span.start, inner.span().start));
+                            remove_ranges.push((inner.span().end, call.span.end));
+                            collect_ctx_rewrites(
+                                inner,
+                                ctx_inserts,
+                                remove_ranges,
+                                is_member_property,
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
             collect_ctx_rewrites(&call.callee, ctx_inserts, remove_ranges, false);
             for arg in &call.arguments {
                 if let Argument::SpreadElement(spread) = arg {
@@ -985,6 +1019,30 @@ mod tests {
             compile_host_expression("_getMinDate()!"),
             "ctx._getMinDate()"
         );
+    }
+
+    #[test]
+    fn test_compile_host_expression_any_in_listener() {
+        // `$any($event.target).checked` — the CheckboxControlValueAccessor pattern
+        // that regressed in issue #68.
+        assert_eq!(
+            compile_host_expression("onChange($any($event.target).checked)"),
+            "ctx.onChange($event.target.checked)"
+        );
+    }
+
+    #[test]
+    fn test_compile_host_expression_any_over_ctx() {
+        assert_eq!(
+            compile_host_expression("$any(ctx).foo.bar()"),
+            "ctx.foo.bar()"
+        );
+    }
+
+    #[test]
+    fn test_compile_host_expression_any_bare_identifier() {
+        // Just the argument — no member access, no call on the result.
+        assert_eq!(compile_host_expression("$any(value)"), "ctx.value");
     }
 
     #[test]
