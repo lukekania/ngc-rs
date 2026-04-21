@@ -14,6 +14,7 @@ use oxc_ast::ast::{
 };
 use oxc_parser::Parser;
 use oxc_span::SourceType;
+use rayon::prelude::*;
 use tracing::debug;
 
 /// Information about a module's exports and imports for tree shaking analysis.
@@ -47,18 +48,16 @@ pub fn analyze_unused_exports(
     local_prefixes: &[&str],
     externally_used: Option<&HashSet<String>>,
 ) -> NgcResult<HashMap<PathBuf, HashSet<String>>> {
-    // Step 1: Parse each module and collect export/import information
-    let mut module_infos: HashMap<PathBuf, ModuleInfo> = HashMap::new();
-
-    for module_path in module_paths {
-        let code = match all_code.get(module_path) {
-            Some(c) => c,
-            None => continue,
-        };
-
-        let info = analyze_module(code, module_path)?;
-        module_infos.insert(module_path.clone(), info);
-    }
+    // Step 1: Parse each module in parallel and collect export/import info.
+    // `analyze_module` only reads its inputs, so per-module work is independent.
+    let module_infos: HashMap<PathBuf, ModuleInfo> = module_paths
+        .par_iter()
+        .filter_map(|path| all_code.get(path).map(|code| (path, code)))
+        .map(|(path, code)| -> NgcResult<(PathBuf, ModuleInfo)> {
+            let info = analyze_module(code, path)?;
+            Ok((path.clone(), info))
+        })
+        .collect::<NgcResult<HashMap<_, _>>>()?;
 
     // Step 2: Build usage map — which exports are actually referenced
     let mut used_exports: HashMap<PathBuf, HashSet<String>> = HashMap::new();
@@ -324,43 +323,60 @@ pub fn collect_cross_chunk_used_names(
     all_code: &HashMap<PathBuf, String>,
     local_prefixes: &[&str],
 ) -> NgcResult<HashSet<String>> {
-    let mut used: HashSet<String> = HashSet::new();
     let provider_set: HashSet<&PathBuf> = provider_modules.iter().collect();
 
-    // Cache provider exports so we only parse each once when expanding namespace imports.
-    let mut provider_exports: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+    // Phase A (parallel): parse each consumer and extract the named symbols
+    // it imports from provider modules. The parse dominates, so fanning this
+    // out across rayon workers recovers most of the tree-shake wall time.
+    let per_consumer: Vec<HashSet<String>> = consumer_modules
+        .par_iter()
+        .filter_map(|consumer_path| {
+            all_code
+                .get(consumer_path)
+                .map(|code| (consumer_path, code))
+        })
+        .map(|(consumer_path, code)| -> NgcResult<HashSet<String>> {
+            let info = analyze_module(code, consumer_path)?;
+            let mut local_used: HashSet<String> = HashSet::new();
+            for (specifier, imported_names) in &info.local_imports {
+                let Some(target) = resolve_local_specifier(
+                    specifier,
+                    consumer_path,
+                    provider_modules,
+                    local_prefixes,
+                ) else {
+                    continue;
+                };
+                if !provider_set.contains(&target) {
+                    continue;
+                }
+                for name in imported_names {
+                    if name == "* as " || name.starts_with("* as ") {
+                        // ImportNamespaceSpecifier — `analyze_module` currently
+                        // drops these (returns None). Left defensive; the
+                        // namespace pass below handles the real case.
+                        continue;
+                    }
+                    local_used.insert(name.clone());
+                }
+            }
+            Ok(local_used)
+        })
+        .collect::<NgcResult<Vec<_>>>()?;
 
+    let mut used: HashSet<String> = HashSet::new();
+    for names in per_consumer {
+        used.extend(names);
+    }
+
+    // Phase B (serial): namespace-import expansion. Kept serial so the
+    // `provider_exports` cache parses each provider at most once even when
+    // several consumers import the same namespace.
+    let mut provider_exports: HashMap<PathBuf, HashSet<String>> = HashMap::new();
     for consumer_path in consumer_modules {
         let Some(code) = all_code.get(consumer_path) else {
             continue;
         };
-
-        let info = analyze_module(code, consumer_path)?;
-        for (specifier, imported_names) in &info.local_imports {
-            let Some(target) =
-                resolve_local_specifier(specifier, consumer_path, provider_modules, local_prefixes)
-            else {
-                continue;
-            };
-
-            if !provider_set.contains(&target) {
-                continue;
-            }
-
-            for name in imported_names {
-                if name == "* as " || name.starts_with("* as ") {
-                    // ImportNamespaceSpecifier — `analyze_module` currently drops these
-                    // (returns None), so this branch is defensive. Fall through to the
-                    // dedicated namespace pass below when the signal is present.
-                    continue;
-                }
-                used.insert(name.clone());
-            }
-        }
-
-        // ImportNamespaceSpecifier is not captured by `analyze_module` (which
-        // returns None for namespace imports). Re-parse here to expand them
-        // into the full provider export set for each such import.
         expand_namespace_imports(
             code,
             consumer_path,
