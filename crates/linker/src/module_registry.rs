@@ -28,6 +28,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
+use rayon::prelude::*;
+
 use ngc_diagnostics::{NgcError, NgcResult};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -225,14 +227,13 @@ pub fn scan_define_ng_modules(
     modules: &HashMap<PathBuf, String>,
     registry: &ModuleRegistry,
 ) -> NgcResult<usize> {
-    let mut count = 0;
-    for (path, source) in modules {
-        if !source.contains("\u{0275}\u{0275}defineNgModule") {
-            continue;
-        }
-        count += scan_one(source, path, registry)?;
-    }
-    Ok(count)
+    // `ModuleRegistry` is RwLock-protected, so `scan_one` is thread-safe.
+    // Each file's parse + AST walk is independent, so fan out across rayon.
+    modules
+        .par_iter()
+        .filter(|(_, source)| source.contains("\u{0275}\u{0275}defineNgModule"))
+        .map(|(path, source)| scan_one(source, path, registry))
+        .try_reduce(|| 0, |a, b| Ok(a + b))
 }
 
 fn scan_one(source: &str, path: &Path, registry: &ModuleRegistry) -> NgcResult<usize> {

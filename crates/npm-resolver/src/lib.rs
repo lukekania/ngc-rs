@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use dashmap::DashMap;
 use ngc_diagnostics::NgcResult;
 use ngc_project_resolver::ImportKind;
 use rayon::prelude::*;
@@ -53,6 +54,22 @@ pub fn resolve_npm_dependencies(
     let mut resolved_specifiers: HashSet<String> = HashSet::new();
     let mut visited: HashSet<PathBuf> = HashSet::new();
 
+    // Shared canonicalize cache. On treasr-frontend roughly 800 import-target
+    // paths turn into ~3× that in `canonicalize()` calls (each import probes
+    // the same target from multiple importers) — each call is a macOS
+    // `__getattrlist` syscall which the flame graph ranks as the single
+    // largest self-time cost of the build. Caching results across rayon
+    // workers collapses the duplicates into one syscall per unique path.
+    let canon_cache: DashMap<PathBuf, PathBuf> = DashMap::new();
+    let canonicalize_cached = |p: PathBuf| -> PathBuf {
+        if let Some(hit) = canon_cache.get(&p) {
+            return hit.clone();
+        }
+        let canonical = p.canonicalize().unwrap_or_else(|_| p.clone());
+        canon_cache.insert(p, canonical.clone());
+        canonical
+    };
+
     // Phase 1: Resolve initial bare specifiers to entry files in parallel.
     // Each lookup hits node_modules/<pkg>/package.json plus a few is_file
     // probes — fully independent per specifier.
@@ -61,7 +78,7 @@ pub fn resolve_npm_dependencies(
         .filter_map(
             |spec| match resolve::resolve_bare_specifier(spec, project_root) {
                 Ok(entry_path) => {
-                    let canonical = entry_path.canonicalize().unwrap_or(entry_path);
+                    let canonical = canonicalize_cached(entry_path);
                     Some((spec.clone(), canonical))
                 }
                 Err(e) => {
@@ -136,8 +153,9 @@ pub fn resolve_npm_dependencies(
                         // Canonicalize to avoid duplicate entries from
                         // different relative paths (e.g.
                         // `../Subscription.js` vs
-                        // `../observable/../Subscription.js`).
-                        let canonical = target_path.canonicalize().unwrap_or(target_path);
+                        // `../observable/../Subscription.js`). Shared cache
+                        // across workers means each target is stat'd once.
+                        let canonical = canonicalize_cached(target_path);
                         resolved_imports.push((specifier_tag, canonical, kind));
                     }
                 }

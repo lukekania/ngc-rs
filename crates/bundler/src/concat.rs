@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use dashmap::DashMap;
 use ngc_diagnostics::{NgcError, NgcResult};
 use ngc_project_resolver::ImportKind;
 use oxc_sourcemap::{ConcatSourceMapBuilder, SourceMap};
@@ -12,6 +13,24 @@ use crate::chunk::{build_chunk_graph, ChunkKind};
 use crate::minify;
 use crate::rewrite::{self, ExternalImport};
 use crate::shake;
+
+/// Shared, concurrent cache of `canonicalize()` results. The bundler probes
+/// several candidate paths per import to resolve extensions and `index.*`
+/// fallbacks; each probe is a `__getattrlist` syscall. Caching results
+/// across rayon workers collapses duplicates to one syscall per unique
+/// (attempted path → resolved path) pair.
+type CanonCache = DashMap<PathBuf, Option<PathBuf>>;
+
+/// Look up `p` in the cache, otherwise call `canonicalize()` and store the
+/// result (successful resolution as `Some`, failure as `None`).
+fn cached_canonicalize(cache: &CanonCache, p: &Path) -> Option<PathBuf> {
+    if let Some(hit) = cache.get(p) {
+        return hit.clone();
+    }
+    let canonical = p.canonicalize().ok();
+    cache.insert(p.to_path_buf(), canonical.clone());
+    canonical
+}
 
 /// Options controlling bundle output behavior.
 #[derive(Debug, Clone, Copy, Default)]
@@ -90,6 +109,7 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
     let prefix_refs: Vec<&str> = input.local_prefixes.iter().map(|s| s.as_str()).collect();
     let mut output_chunks: HashMap<String, String> = HashMap::new();
     let mut chunk_source_maps: HashMap<String, SourceMap> = HashMap::new();
+    let canon_cache: CanonCache = DashMap::new();
 
     // Process main chunk first to get specifier→namespace mapping
     let main_chunk = &chunk_graph.chunks[0];
@@ -135,6 +155,7 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
         chunk_module_set: &main_module_set,
         main_file_to_ns: &HashMap::new(),
         main_chunk_module_set: &main_module_set,
+        canon_cache: &canon_cache,
     })?;
     let main_spec_to_ns = main_result.specifier_to_namespace;
     let main_file_to_ns = main_result.file_to_namespace;
@@ -178,6 +199,7 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
                 chunk_module_set: &lazy_module_set,
                 main_file_to_ns: &main_file_to_ns,
                 main_chunk_module_set: &main_module_set,
+                canon_cache: &canon_cache,
             })?;
             Ok((chunk.filename.clone(), result))
         })
@@ -374,6 +396,8 @@ struct ChunkBundleParams<'a> {
     main_file_to_ns: &'a HashMap<PathBuf, String>,
     /// Set of canonical module paths in the main chunk.
     main_chunk_module_set: &'a HashSet<PathBuf>,
+    /// Shared cache of `canonicalize()` results across all per-chunk work.
+    canon_cache: &'a CanonCache,
 }
 
 /// Result of bundling a single chunk, including cross-chunk dependency info.
@@ -432,7 +456,8 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<ChunkBundleResult> {
                 spec,
                 node_modules_dir.parent().unwrap_or(&node_modules_dir),
             ) {
-                let canonical = entry_path.canonicalize().unwrap_or(entry_path);
+                let canonical =
+                    cached_canonicalize(p.canon_cache, &entry_path).unwrap_or(entry_path);
                 if let Some(ns) = file_to_namespace.get(&canonical) {
                     specifier_to_namespace.insert(spec.clone(), ns.clone());
                     continue;
@@ -496,7 +521,9 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<ChunkBundleResult> {
                                     target.join("index.mjs"),
                                     target.join("index.js"),
                                 ] {
-                                    if let Ok(canonical) = candidate.canonicalize() {
+                                    if let Some(canonical) =
+                                        cached_canonicalize(p.canon_cache, candidate)
+                                    {
                                         if let Some(ns) = file_to_namespace.get(&canonical) {
                                             return Some(ns.clone());
                                         }
@@ -737,7 +764,7 @@ fn classify_lazy_externals(
                         target.join("index.js"),
                         target.join("index.mjs"),
                     ] {
-                        if let Ok(canon) = c.canonicalize() {
+                        if let Some(canon) = cached_canonicalize(p.canon_cache, c) {
                             if let Some(ns) = p.main_file_to_ns.get(&canon) {
                                 resolved_ext.source = format!("__resolved_ns__{ns}");
                                 break;
@@ -762,7 +789,7 @@ fn classify_lazy_externals(
                 // ./logto-auth.service where .service is NOT an extension.
                 for suffix in &["", ".ts", ".js", ".mjs"] {
                     let full = PathBuf::from(format!("{candidate_str}{suffix}"));
-                    if let Ok(canon) = full.canonicalize() {
+                    if let Some(canon) = cached_canonicalize(p.canon_cache, &full) {
                         return Some(canon);
                     }
                 }
