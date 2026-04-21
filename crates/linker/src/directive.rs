@@ -879,9 +879,8 @@ mod tests {
         // (e.g. @angular/forms' NgForm).  The linker must transfer it into
         // the emitted `ɵɵdefineDirective` call, otherwise runtime
         // ref lookups with `#ref="exportAsName"` fail with NG0301.
-        let result = parse_and_transform(
-            "{ type: NgForm, selector: 'form', exportAs: ['ngForm'] }",
-        );
+        let result =
+            parse_and_transform("{ type: NgForm, selector: 'form', exportAs: ['ngForm'] }");
         assert!(
             result.contains("exportAs: [\"ngForm\"]"),
             "expected exportAs emitted from array form: {result}"
@@ -890,9 +889,8 @@ mod tests {
 
     #[test]
     fn test_directive_export_as_string_array_multiple() {
-        let result = parse_and_transform(
-            "{ type: MyDir, selector: '[myDir]', exportAs: ['a', 'b'] }",
-        );
+        let result =
+            parse_and_transform("{ type: MyDir, selector: '[myDir]', exportAs: ['a', 'b'] }");
         assert!(
             result.contains("exportAs: [\"a\", \"b\"]"),
             "expected multi-name exportAs array: {result}"
