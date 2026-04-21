@@ -5,6 +5,7 @@ use ngc_diagnostics::{NgcError, NgcResult};
 use ngc_project_resolver::ImportKind;
 use oxc_sourcemap::{ConcatSourceMapBuilder, SourceMap};
 use petgraph::graph::DiGraph;
+use rayon::prelude::*;
 use tracing::debug;
 
 use crate::chunk::{build_chunk_graph, ChunkKind};
@@ -142,40 +143,49 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
         chunk_source_maps.insert(main_chunk.filename.clone(), map);
     }
 
-    // Process lazy/shared chunks, collecting symbols they need from main
+    // Process lazy/shared chunks in parallel. Each chunk only reads shared
+    // state (module map, rewrite map, main-chunk namespaces) so per-chunk
+    // work is independent; we fan out with rayon and fold the results
+    // afterwards to preserve the original aggregation semantics.
+    let lazy_outputs: Vec<(String, ChunkBundleResult)> = chunk_graph.chunks[1..]
+        .par_iter()
+        .map(|chunk| -> NgcResult<(String, ChunkBundleResult)> {
+            let unused_exports = if input.options.tree_shake {
+                shake::analyze_unused_exports(
+                    &chunk.modules,
+                    &input.modules,
+                    &chunk.entry,
+                    &prefix_refs,
+                    None,
+                )?
+            } else {
+                HashMap::new()
+            };
+
+            let lazy_module_set: HashSet<PathBuf> = chunk.modules.iter().cloned().collect();
+            let result = bundle_chunk(&ChunkBundleParams {
+                module_paths: &chunk.modules,
+                all_modules: &input.modules,
+                root_dir: &input.root_dir,
+                prefix_refs: &prefix_refs,
+                specifier_rewrites: &specifier_rewrites,
+                per_module_maps: &input.per_module_maps,
+                generate_source_maps: input.options.source_maps,
+                unused_exports: &unused_exports,
+                bundled_specifiers: &input.bundled_specifiers,
+                chunk_entry: &chunk.entry,
+                chunk_kind: &chunk.kind,
+                chunk_module_set: &lazy_module_set,
+                main_file_to_ns: &main_file_to_ns,
+                main_chunk_module_set: &main_module_set,
+            })?;
+            Ok((chunk.filename.clone(), result))
+        })
+        .collect::<NgcResult<Vec<_>>>()?;
+
     let mut all_needed_npm: HashMap<String, BTreeSet<String>> = HashMap::new();
     let mut all_needed_project: BTreeSet<String> = BTreeSet::new();
-    for chunk in &chunk_graph.chunks[1..] {
-        let unused_exports = if input.options.tree_shake {
-            shake::analyze_unused_exports(
-                &chunk.modules,
-                &input.modules,
-                &chunk.entry,
-                &prefix_refs,
-                None,
-            )?
-        } else {
-            HashMap::new()
-        };
-
-        let lazy_module_set: HashSet<PathBuf> = chunk.modules.iter().cloned().collect();
-        let result = bundle_chunk(&ChunkBundleParams {
-            module_paths: &chunk.modules,
-            all_modules: &input.modules,
-            root_dir: &input.root_dir,
-            prefix_refs: &prefix_refs,
-            specifier_rewrites: &specifier_rewrites,
-            per_module_maps: &input.per_module_maps,
-            generate_source_maps: input.options.source_maps,
-            unused_exports: &unused_exports,
-            bundled_specifiers: &input.bundled_specifiers,
-            chunk_entry: &chunk.entry,
-            chunk_kind: &chunk.kind,
-            chunk_module_set: &lazy_module_set,
-            main_file_to_ns: &main_file_to_ns,
-            main_chunk_module_set: &main_module_set,
-        })?;
-
+    for (filename, result) in lazy_outputs {
         // Collect npm symbols this chunk needs.
         // Namespace imports ("* as X") are stored with the local name only.
         for ext in &result.npm_externals {
@@ -197,9 +207,9 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
         // Collect project symbols this chunk needs from main
         all_needed_project.extend(result.project_cross_chunk_symbols);
 
-        output_chunks.insert(chunk.filename.clone(), result.code);
+        output_chunks.insert(filename.clone(), result.code);
         if let Some(map) = result.source_map {
-            chunk_source_maps.insert(chunk.filename.clone(), map);
+            chunk_source_maps.insert(filename, map);
         }
     }
 
@@ -215,22 +225,26 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
         None
     };
 
-    // Minification pass
+    // Minification pass — each chunk's parse + codegen is independent of
+    // every other chunk, so fan out across rayon workers.
     if input.options.minify {
-        let mut minified_chunks: HashMap<String, String> = HashMap::new();
-        let mut minified_maps: HashMap<String, SourceMap> = HashMap::new();
+        let minified: Vec<(String, String, Option<SourceMap>)> = output_chunks
+            .par_iter()
+            .map(|(filename, code)| -> NgcResult<_> {
+                let bundle_map = chunk_source_maps.get(filename);
+                let result = minify::minify_chunk(code, filename, bundle_map)?;
+                Ok((filename.clone(), result.code, result.source_map))
+            })
+            .collect::<NgcResult<Vec<_>>>()?;
 
-        for (filename, code) in &output_chunks {
-            let bundle_map = chunk_source_maps.get(filename);
-            let minified = minify::minify_chunk(code, filename, bundle_map)?;
-            minified_chunks.insert(filename.clone(), minified.code);
-            if let Some(map) = minified.source_map {
-                minified_maps.insert(filename.clone(), map);
+        output_chunks = HashMap::with_capacity(minified.len());
+        chunk_source_maps = HashMap::with_capacity(minified.len());
+        for (filename, code, map) in minified {
+            output_chunks.insert(filename.clone(), code);
+            if let Some(map) = map {
+                chunk_source_maps.insert(filename, map);
             }
         }
-
-        output_chunks = minified_chunks;
-        chunk_source_maps = minified_maps;
     }
 
     // Append cross-chunk exports after minification

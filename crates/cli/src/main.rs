@@ -54,7 +54,7 @@ enum Commands {
 }
 
 fn main() {
-    tracing_subscriber::fmt::init();
+    init_tracing();
     let cli = Cli::parse();
 
     match cli.command {
@@ -117,6 +117,22 @@ fn main() {
     }
 }
 
+/// Configure the global tracing subscriber.
+///
+/// Honours `RUST_LOG` (e.g. `RUST_LOG=info`) and emits span-close events so
+/// `info_span!("stage")` sections report their elapsed time. With no env var
+/// set the output is silent, matching the prior behaviour.
+fn init_tracing() {
+    use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_span_events(FmtSpan::CLOSE)
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .init();
+}
+
 /// Orchestrate the full build pipeline: resolve → transform → bundle → output.
 fn run_build(
     project: &Path,
@@ -132,8 +148,10 @@ fn run_build(
         .map(|ap| ap.ts_config.clone())
         .unwrap_or_else(|| project.to_path_buf());
 
+    let resolve_span = tracing::info_span!("resolve").entered();
     let config = ngc_project_resolver::tsconfig::resolve_tsconfig(&tsconfig_path)?;
     let file_graph = ngc_project_resolver::resolve_project(&tsconfig_path)?;
+    drop(resolve_span);
 
     let config_dir = config
         .config_path
@@ -165,9 +183,20 @@ fn run_build(
         })
         .unwrap_or_else(|| config_dir.join("dist"));
 
+    // Step 3.5: Start CSS/PostCSS work concurrently with the rest of the
+    // pipeline. The PostCSS subprocess (Node + Tailwind) takes ~200 ms of
+    // wall time but shares no state with the bundler, so spawning it here
+    // and awaiting it during io_outputs overlaps the cost.
+    let css_job = {
+        let _span = tracing::info_span!("css_spawn").entered();
+        start_css_job(angular_project.as_ref(), &out_dir, &config_dir)?
+    };
+
     // Step 4: Compile Angular decorators (@Component, @Injectable, @Directive, @Pipe, @NgModule)
+    let templates_span = tracing::info_span!("template_compile").entered();
     let files: Vec<PathBuf> = file_graph.graph.node_weights().cloned().collect();
     let compiled = ngc_template_compiler::compile_all_decorators(&files)?;
+    drop(templates_span);
 
     // Report any JIT fallbacks
     for cf in &compiled {
@@ -193,6 +222,7 @@ fn run_build(
 
     // Step 6: Transform TS → JS
     let bundle_options = build_options(configuration);
+    let transform_span = tracing::info_span!("ts_transform").entered();
     let transformed = transform_with_fallback(&sources, bundle_options.source_maps)?;
 
     // Build modules map (canonical source path → JS code) and collect source maps
@@ -204,6 +234,7 @@ fn run_build(
         }
         modules.insert(m.source_path, m.code);
     }
+    drop(transform_span);
 
     // Find the entry point (look for main.ts among graph entry points)
     let entry = find_entry_point(&file_graph.entry_points)?;
@@ -221,6 +252,7 @@ fn run_build(
     // Step 6.5: Resolve npm dependencies
     // Collect bare specifiers from project scanning AND from transformed output
     // (oxc may inject new imports like @oxc-project/runtime/helpers/decorate)
+    let npm_span = tracing::info_span!("npm_resolve").entered();
     let mut bare_specifiers: Vec<String> = file_graph.npm_import_sites.keys().cloned().collect();
     let post_transform_specifiers = scan_transformed_bare_specifiers(&modules, &local_prefixes);
     for spec in post_transform_specifiers {
@@ -235,9 +267,11 @@ fn run_build(
     for (path, source) in &npm_resolution.modules {
         modules.insert(path.clone(), source.clone());
     }
+    drop(npm_span);
 
     // Step 6.6: Link partially compiled Angular npm packages and flatten
     // NgModule references in component dependencies arrays.
+    let link_span = tracing::info_span!("link").entered();
     let linker_stats = ngc_linker::link_modules(&mut modules, &config_dir)?;
     if linker_stats.files_linked > 0 {
         tracing::info!(
@@ -308,8 +342,10 @@ fn run_build(
         // ɵɵngDeclare calls are transformed too.
         let _ = ngc_linker::link_modules(&mut modules, &config_dir)?;
     }
+    drop(link_span);
 
     // Inject vendored helpers for oxc runtime (not an npm dependency of the project)
+    let graph_span = tracing::info_span!("graph_assembly").entered();
     let injected_helpers = inject_oxc_runtime_helpers(&mut modules, &bare_specifiers, &config_dir);
 
     // Add npm file nodes and injected helper nodes to the graph
@@ -387,15 +423,19 @@ fn run_build(
         per_module_maps,
         bundled_specifiers,
     };
+    drop(graph_span);
 
+    let bundle_span = tracing::info_span!("bundle").entered();
     let bundle_output = ngc_bundler::bundle(&bundle_input)?;
     let modules_bundled: usize = bundle_output
         .chunks
         .values()
         .map(|code| code.matches("\n// ").count() + 1)
         .sum();
+    drop(bundle_span);
 
     // Step 7: Write outputs
+    let io_span = tracing::info_span!("io_outputs").entered();
     std::fs::create_dir_all(&out_dir).map_err(|e| NgcError::Io {
         path: out_dir.clone(),
         source: e,
@@ -448,14 +488,14 @@ fn run_build(
         }
     }
 
-    // Step 9: Extract global styles
-    if let Some(ref ap) = angular_project {
-        if !ap.styles.is_empty() {
-            let path = extract_global_styles(&ap.styles, &out_dir, &config_dir)?;
-            // Step 9b: Compile CSS with PostCSS + Tailwind (if available)
-            compile_css_with_postcss(&path, &config_dir);
-            output_files.push(path);
+    // Step 9: Finalise the CSS job started back in step 3.5. The styles.css
+    // file was already written before bundling; here we just wait for any
+    // in-flight PostCSS subprocess to finish overwriting it.
+    if let Some(job) = css_job {
+        if let Some(child) = job.postcss_child {
+            await_postcss(child);
         }
+        output_files.push(job.styles_path);
     }
 
     // Step 10: Copy assets
@@ -498,6 +538,7 @@ fn run_build(
         .filter_map(|p| std::fs::metadata(p).ok())
         .map(|m| m.len())
         .sum();
+    drop(io_span);
 
     Ok(BuildResult {
         modules_bundled,
@@ -1053,16 +1094,54 @@ fn find_css_in_exports(
     None
 }
 
-/// Compile CSS with PostCSS + Tailwind CSS if `@tailwindcss/postcss` is installed.
+/// A CSS job that has been started early in the pipeline so its Node/PostCSS
+/// subprocess can run concurrently with the bundler.
+struct CssJob {
+    /// Path of the concatenated (pre-PostCSS) styles.css on disk.
+    styles_path: PathBuf,
+    /// Handle to the PostCSS Node subprocess, if `@tailwindcss/postcss` is
+    /// installed. `None` means the styles.css file is already final.
+    postcss_child: Option<std::process::Child>,
+}
+
+/// Extract global styles to `out_dir/styles.css` and, if Tailwind's PostCSS
+/// plugin is installed, spawn the Node subprocess to process it.
 ///
-/// Runs a small Node.js script that loads the PostCSS plugin and processes
-/// the concatenated CSS file in-place. This handles `@import "tailwindcss"`,
-/// `@layer`, `@theme` directives from Tailwind v4.
-fn compile_css_with_postcss(css_path: &Path, project_dir: &Path) {
-    // Check if @tailwindcss/postcss is available
+/// Called early in the build so the subprocess overlaps with the bundler
+/// (Node startup + Tailwind compile is ~200 ms on treasr-frontend). The
+/// returned [`CssJob`] is awaited later during the output phase.
+fn start_css_job(
+    angular_project: Option<&ResolvedAngularProject>,
+    out_dir: &Path,
+    config_dir: &Path,
+) -> NgcResult<Option<CssJob>> {
+    let Some(ap) = angular_project else {
+        return Ok(None);
+    };
+    if ap.styles.is_empty() {
+        return Ok(None);
+    }
+
+    std::fs::create_dir_all(out_dir).map_err(|e| NgcError::Io {
+        path: out_dir.to_path_buf(),
+        source: e,
+    })?;
+
+    let styles_path = extract_global_styles(&ap.styles, out_dir, config_dir)?;
+    let postcss_child = spawn_postcss(&styles_path, config_dir);
+    Ok(Some(CssJob {
+        styles_path,
+        postcss_child,
+    }))
+}
+
+/// Spawn the Tailwind-via-PostCSS Node subprocess, returning a handle.
+///
+/// Returns `None` when `@tailwindcss/postcss` is not installed in the project.
+fn spawn_postcss(css_path: &Path, project_dir: &Path) -> Option<std::process::Child> {
     let postcss_pkg = project_dir.join("node_modules/@tailwindcss/postcss");
     if !postcss_pkg.is_dir() {
-        return;
+        return None;
     }
 
     let script = format!(
@@ -1082,13 +1161,26 @@ postcss([tailwindcss]).process(css, {{ from: 'src/styles.css' }}).then(result =>
         css_path.display()
     );
 
-    let result = std::process::Command::new("node")
+    std::process::Command::new("node")
         .arg("-e")
         .arg(&script)
         .current_dir(project_dir)
-        .output();
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            eprintln!(
+                "{} could not run node for PostCSS: {}",
+                "Warning:".yellow().bold(),
+                e
+            );
+        })
+        .ok()
+}
 
-    match result {
+/// Block until the PostCSS Node subprocess exits and log its outcome.
+fn await_postcss(child: std::process::Child) {
+    match child.wait_with_output() {
         Ok(output) => {
             if output.status.success() {
                 tracing::info!("compiled CSS with PostCSS + Tailwind");
@@ -1103,7 +1195,7 @@ postcss([tailwindcss]).process(css, {{ from: 'src/styles.css' }}).then(result =>
         }
         Err(e) => {
             eprintln!(
-                "{} could not run node for PostCSS: {}",
+                "{} PostCSS subprocess failed: {}",
                 "Warning:".yellow().bold(),
                 e
             );
