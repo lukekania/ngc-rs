@@ -705,6 +705,7 @@ dependencies = [
  "oxc_sourcemap",
  "oxc_span",
  "petgraph",
+ "rayon",
  "regex",
  "sha2",
  "tempfile",
