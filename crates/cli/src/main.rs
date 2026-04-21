@@ -183,6 +183,15 @@ fn run_build(
         })
         .unwrap_or_else(|| config_dir.join("dist"));
 
+    // Step 3.5: Start CSS/PostCSS work concurrently with the rest of the
+    // pipeline. The PostCSS subprocess (Node + Tailwind) takes ~200 ms of
+    // wall time but shares no state with the bundler, so spawning it here
+    // and awaiting it during io_outputs overlaps the cost.
+    let css_job = {
+        let _span = tracing::info_span!("css_spawn").entered();
+        start_css_job(angular_project.as_ref(), &out_dir, &config_dir)?
+    };
+
     // Step 4: Compile Angular decorators (@Component, @Injectable, @Directive, @Pipe, @NgModule)
     let templates_span = tracing::info_span!("template_compile").entered();
     let files: Vec<PathBuf> = file_graph.graph.node_weights().cloned().collect();
@@ -479,14 +488,14 @@ fn run_build(
         }
     }
 
-    // Step 9: Extract global styles
-    if let Some(ref ap) = angular_project {
-        if !ap.styles.is_empty() {
-            let path = extract_global_styles(&ap.styles, &out_dir, &config_dir)?;
-            // Step 9b: Compile CSS with PostCSS + Tailwind (if available)
-            compile_css_with_postcss(&path, &config_dir);
-            output_files.push(path);
+    // Step 9: Finalise the CSS job started back in step 3.5. The styles.css
+    // file was already written before bundling; here we just wait for any
+    // in-flight PostCSS subprocess to finish overwriting it.
+    if let Some(job) = css_job {
+        if let Some(child) = job.postcss_child {
+            await_postcss(child);
         }
+        output_files.push(job.styles_path);
     }
 
     // Step 10: Copy assets
@@ -1085,16 +1094,54 @@ fn find_css_in_exports(
     None
 }
 
-/// Compile CSS with PostCSS + Tailwind CSS if `@tailwindcss/postcss` is installed.
+/// A CSS job that has been started early in the pipeline so its Node/PostCSS
+/// subprocess can run concurrently with the bundler.
+struct CssJob {
+    /// Path of the concatenated (pre-PostCSS) styles.css on disk.
+    styles_path: PathBuf,
+    /// Handle to the PostCSS Node subprocess, if `@tailwindcss/postcss` is
+    /// installed. `None` means the styles.css file is already final.
+    postcss_child: Option<std::process::Child>,
+}
+
+/// Extract global styles to `out_dir/styles.css` and, if Tailwind's PostCSS
+/// plugin is installed, spawn the Node subprocess to process it.
 ///
-/// Runs a small Node.js script that loads the PostCSS plugin and processes
-/// the concatenated CSS file in-place. This handles `@import "tailwindcss"`,
-/// `@layer`, `@theme` directives from Tailwind v4.
-fn compile_css_with_postcss(css_path: &Path, project_dir: &Path) {
-    // Check if @tailwindcss/postcss is available
+/// Called early in the build so the subprocess overlaps with the bundler
+/// (Node startup + Tailwind compile is ~200 ms on treasr-frontend). The
+/// returned [`CssJob`] is awaited later during the output phase.
+fn start_css_job(
+    angular_project: Option<&ResolvedAngularProject>,
+    out_dir: &Path,
+    config_dir: &Path,
+) -> NgcResult<Option<CssJob>> {
+    let Some(ap) = angular_project else {
+        return Ok(None);
+    };
+    if ap.styles.is_empty() {
+        return Ok(None);
+    }
+
+    std::fs::create_dir_all(out_dir).map_err(|e| NgcError::Io {
+        path: out_dir.to_path_buf(),
+        source: e,
+    })?;
+
+    let styles_path = extract_global_styles(&ap.styles, out_dir, config_dir)?;
+    let postcss_child = spawn_postcss(&styles_path, config_dir);
+    Ok(Some(CssJob {
+        styles_path,
+        postcss_child,
+    }))
+}
+
+/// Spawn the Tailwind-via-PostCSS Node subprocess, returning a handle.
+///
+/// Returns `None` when `@tailwindcss/postcss` is not installed in the project.
+fn spawn_postcss(css_path: &Path, project_dir: &Path) -> Option<std::process::Child> {
     let postcss_pkg = project_dir.join("node_modules/@tailwindcss/postcss");
     if !postcss_pkg.is_dir() {
-        return;
+        return None;
     }
 
     let script = format!(
@@ -1114,13 +1161,26 @@ postcss([tailwindcss]).process(css, {{ from: 'src/styles.css' }}).then(result =>
         css_path.display()
     );
 
-    let result = std::process::Command::new("node")
+    std::process::Command::new("node")
         .arg("-e")
         .arg(&script)
         .current_dir(project_dir)
-        .output();
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            eprintln!(
+                "{} could not run node for PostCSS: {}",
+                "Warning:".yellow().bold(),
+                e
+            );
+        })
+        .ok()
+}
 
-    match result {
+/// Block until the PostCSS Node subprocess exits and log its outcome.
+fn await_postcss(child: std::process::Child) {
+    match child.wait_with_output() {
         Ok(output) => {
             if output.status.success() {
                 tracing::info!("compiled CSS with PostCSS + Tailwind");
@@ -1135,7 +1195,7 @@ postcss([tailwindcss]).process(css, {{ from: 'src/styles.css' }}).then(result =>
         }
         Err(e) => {
             eprintln!(
-                "{} could not run node for PostCSS: {}",
+                "{} PostCSS subprocess failed: {}",
                 "Warning:".yellow().bold(),
                 e
             );
