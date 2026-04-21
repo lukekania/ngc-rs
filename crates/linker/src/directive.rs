@@ -72,8 +72,17 @@ pub fn build_define_call(
         }
     }
 
-    // Export as
-    if let Some(export_as) = metadata::get_string_prop(obj, "exportAs") {
+    // Export as — ɵɵngDeclareDirective emits `exportAs` as a string array
+    // (e.g. `exportAs: ["ngForm"]`) but legacy input may also be a single
+    // comma-separated string.  Accept both forms.
+    if let Some(export_as_names) = metadata::get_string_array_prop(obj, "exportAs") {
+        let arr = export_as_names
+            .iter()
+            .map(|s| format!("\"{s}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        props.push(format!("exportAs: [{arr}]"));
+    } else if let Some(export_as) = metadata::get_string_prop(obj, "exportAs") {
         let parts: Vec<&str> = export_as.split(',').map(|s| s.trim()).collect();
         let arr = parts
             .iter()
@@ -862,6 +871,43 @@ mod tests {
         assert!(result.contains("type: MyDir"));
         assert!(result.contains("selectors: [['', 'myDir', '']]"));
         assert!(result.contains("standalone: true"));
+    }
+
+    #[test]
+    fn test_directive_export_as_string_array() {
+        // `ɵɵngDeclareDirective` emits `exportAs` as a string array
+        // (e.g. @angular/forms' NgForm).  The linker must transfer it into
+        // the emitted `ɵɵdefineDirective` call, otherwise runtime
+        // ref lookups with `#ref="exportAsName"` fail with NG0301.
+        let result = parse_and_transform(
+            "{ type: NgForm, selector: 'form', exportAs: ['ngForm'] }",
+        );
+        assert!(
+            result.contains("exportAs: [\"ngForm\"]"),
+            "expected exportAs emitted from array form: {result}"
+        );
+    }
+
+    #[test]
+    fn test_directive_export_as_string_array_multiple() {
+        let result = parse_and_transform(
+            "{ type: MyDir, selector: '[myDir]', exportAs: ['a', 'b'] }",
+        );
+        assert!(
+            result.contains("exportAs: [\"a\", \"b\"]"),
+            "expected multi-name exportAs array: {result}"
+        );
+    }
+
+    #[test]
+    fn test_directive_export_as_string_legacy() {
+        // Legacy comma-separated string form must still work.
+        let result =
+            parse_and_transform("{ type: MyDir, selector: '[myDir]', exportAs: 'foo,bar' }");
+        assert!(
+            result.contains("exportAs: [\"foo\", \"bar\"]"),
+            "expected comma-split string exportAs: {result}"
+        );
     }
 
     #[test]
