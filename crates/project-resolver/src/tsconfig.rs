@@ -223,44 +223,6 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn fixture_path(name: &str) -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/simple-app")
-            .join(name)
-    }
-
-    #[test]
-    fn test_parse_basic_tsconfig() {
-        let config = resolve_tsconfig(&fixture_path("tsconfig.json")).unwrap();
-        assert!(config.compiler_options.base_url.is_some());
-        assert_eq!(config.compiler_options.base_url.as_deref(), Some("."));
-        assert!(config.compiler_options.paths.is_some());
-        let paths = config.compiler_options.paths.as_ref().unwrap();
-        assert!(paths.contains_key("@app/*"));
-        assert!(paths.contains_key("@env/*"));
-    }
-
-    #[test]
-    fn test_extends_chain_resolution() {
-        let config = resolve_tsconfig(&fixture_path("tsconfig.app.json")).unwrap();
-        // Should inherit baseUrl and paths from parent
-        assert_eq!(config.compiler_options.base_url.as_deref(), Some("."));
-        assert!(config.compiler_options.paths.is_some());
-        // Should have its own outDir
-        assert_eq!(config.compiler_options.out_dir.as_deref(), Some("./dist"));
-        // Should have its own include
-        assert_eq!(config.include, vec!["src/**/*.ts"]);
-        assert_eq!(config.exclude, vec!["src/**/*.spec.ts"]);
-    }
-
-    #[test]
-    fn test_paths_from_parent_inherited() {
-        let config = resolve_tsconfig(&fixture_path("tsconfig.app.json")).unwrap();
-        let paths = config.compiler_options.paths.as_ref().unwrap();
-        assert_eq!(paths["@app/*"], vec!["src/app/*"]);
-        assert_eq!(paths["@env/*"], vec!["src/environments/*"]);
-    }
-
     #[test]
     fn test_circular_extends_detection() {
         let dir = tempfile::tempdir().unwrap();

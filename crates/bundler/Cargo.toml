@@ -26,7 +26,4 @@ sha2 = "0.10"
 tracing = "0.1"
 
 [dev-dependencies]
-ngc-ts-transform = { path = "../ts-transform" }
-ngc-template-compiler = { path = "../template-compiler" }
-insta = { version = "1.46", features = ["glob"] }
 tempfile = "3"

@@ -7,9 +7,8 @@ A native Rust replacement for `ng build` in Angular projects. Drop-in swap, **~1
 | Project | `ngc-rs` | `ng build` | Speedup |
 |---------|----------|------------|---------|
 | Production Angular v21 app (~1,200 modules, 14 lazy chunks) | **~380 ms** | ~3,800 ms | **~10×** |
-| Minimal test fixture (77 modules) | ~52 ms | ~3,810 ms | ~72× |
 
-Measured with [hyperfine](https://github.com/sharkdp/hyperfine) on Apple Silicon. Both rows use `-c production` (source maps, minification, tree shaking, content-hashed filenames). The micro-benchmark ratio is high because `ng build`'s fixed ~1.5 s of Node.js startup dominates tiny builds; on realistic projects the 10× figure is more representative.
+Measured with [hyperfine](https://github.com/sharkdp/hyperfine) on Apple Silicon, `-c production` (source maps, minification, tree shaking, content-hashed filenames).
 
 > **Status: v0.7.18 — parallel build pipeline**
 > ngc-rs reads `angular.json`, compiles templates to Ivy, bundles with code splitting, and emits production-ready output with source maps, minified code, tree-shaken exports, and content-hashed filenames. Every hot stage — project resolution, template compilation, TS transform, npm dependency crawl, Angular linker, tree-shaking, bundling, and minification — runs across rayon worker threads.
