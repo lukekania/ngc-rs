@@ -8,3 +8,11 @@ edition = "2021"
 license = "MIT"
 authors = ["lukekania"]
 repository = "https://github.com/lukekania/ngc-rs"
+
+# Release with DWARF debug info and no symbol stripping — used by samply to
+# map samples back to Rust source. Kept separate from `release` so benchmarks
+# continue measuring the stripped/optimised binary.
+[profile.profiling]
+inherits = "release"
+debug = "full"
+strip = "none"

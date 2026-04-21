@@ -54,7 +54,7 @@ enum Commands {
 }
 
 fn main() {
-    tracing_subscriber::fmt::init();
+    init_tracing();
     let cli = Cli::parse();
 
     match cli.command {
@@ -117,6 +117,22 @@ fn main() {
     }
 }
 
+/// Configure the global tracing subscriber.
+///
+/// Honours `RUST_LOG` (e.g. `RUST_LOG=info`) and emits span-close events so
+/// `info_span!("stage")` sections report their elapsed time. With no env var
+/// set the output is silent, matching the prior behaviour.
+fn init_tracing() {
+    use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_span_events(FmtSpan::CLOSE)
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .init();
+}
+
 /// Orchestrate the full build pipeline: resolve → transform → bundle → output.
 fn run_build(
     project: &Path,
@@ -132,8 +148,10 @@ fn run_build(
         .map(|ap| ap.ts_config.clone())
         .unwrap_or_else(|| project.to_path_buf());
 
+    let resolve_span = tracing::info_span!("resolve").entered();
     let config = ngc_project_resolver::tsconfig::resolve_tsconfig(&tsconfig_path)?;
     let file_graph = ngc_project_resolver::resolve_project(&tsconfig_path)?;
+    drop(resolve_span);
 
     let config_dir = config
         .config_path
@@ -166,8 +184,10 @@ fn run_build(
         .unwrap_or_else(|| config_dir.join("dist"));
 
     // Step 4: Compile Angular decorators (@Component, @Injectable, @Directive, @Pipe, @NgModule)
+    let templates_span = tracing::info_span!("template_compile").entered();
     let files: Vec<PathBuf> = file_graph.graph.node_weights().cloned().collect();
     let compiled = ngc_template_compiler::compile_all_decorators(&files)?;
+    drop(templates_span);
 
     // Report any JIT fallbacks
     for cf in &compiled {
@@ -193,6 +213,7 @@ fn run_build(
 
     // Step 6: Transform TS → JS
     let bundle_options = build_options(configuration);
+    let transform_span = tracing::info_span!("ts_transform").entered();
     let transformed = transform_with_fallback(&sources, bundle_options.source_maps)?;
 
     // Build modules map (canonical source path → JS code) and collect source maps
@@ -204,6 +225,7 @@ fn run_build(
         }
         modules.insert(m.source_path, m.code);
     }
+    drop(transform_span);
 
     // Find the entry point (look for main.ts among graph entry points)
     let entry = find_entry_point(&file_graph.entry_points)?;
@@ -221,6 +243,7 @@ fn run_build(
     // Step 6.5: Resolve npm dependencies
     // Collect bare specifiers from project scanning AND from transformed output
     // (oxc may inject new imports like @oxc-project/runtime/helpers/decorate)
+    let npm_span = tracing::info_span!("npm_resolve").entered();
     let mut bare_specifiers: Vec<String> = file_graph.npm_import_sites.keys().cloned().collect();
     let post_transform_specifiers = scan_transformed_bare_specifiers(&modules, &local_prefixes);
     for spec in post_transform_specifiers {
@@ -235,9 +258,11 @@ fn run_build(
     for (path, source) in &npm_resolution.modules {
         modules.insert(path.clone(), source.clone());
     }
+    drop(npm_span);
 
     // Step 6.6: Link partially compiled Angular npm packages and flatten
     // NgModule references in component dependencies arrays.
+    let link_span = tracing::info_span!("link").entered();
     let linker_stats = ngc_linker::link_modules(&mut modules, &config_dir)?;
     if linker_stats.files_linked > 0 {
         tracing::info!(
@@ -308,8 +333,10 @@ fn run_build(
         // ɵɵngDeclare calls are transformed too.
         let _ = ngc_linker::link_modules(&mut modules, &config_dir)?;
     }
+    drop(link_span);
 
     // Inject vendored helpers for oxc runtime (not an npm dependency of the project)
+    let graph_span = tracing::info_span!("graph_assembly").entered();
     let injected_helpers = inject_oxc_runtime_helpers(&mut modules, &bare_specifiers, &config_dir);
 
     // Add npm file nodes and injected helper nodes to the graph
@@ -387,15 +414,19 @@ fn run_build(
         per_module_maps,
         bundled_specifiers,
     };
+    drop(graph_span);
 
+    let bundle_span = tracing::info_span!("bundle").entered();
     let bundle_output = ngc_bundler::bundle(&bundle_input)?;
     let modules_bundled: usize = bundle_output
         .chunks
         .values()
         .map(|code| code.matches("\n// ").count() + 1)
         .sum();
+    drop(bundle_span);
 
     // Step 7: Write outputs
+    let io_span = tracing::info_span!("io_outputs").entered();
     std::fs::create_dir_all(&out_dir).map_err(|e| NgcError::Io {
         path: out_dir.clone(),
         source: e,
@@ -498,6 +529,7 @@ fn run_build(
         .filter_map(|p| std::fs::metadata(p).ok())
         .map(|m| m.len())
         .sum();
+    drop(io_span);
 
     Ok(BuildResult {
         modules_bundled,
