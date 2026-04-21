@@ -50,6 +50,34 @@ pub fn get_string_prop(obj: &ObjectExpression<'_>, key: &str) -> Option<String> 
     None
 }
 
+/// Extract a string-array value for a named property.
+///
+/// Returns the string contents of each element if the property exists and
+/// its value is an array of string literals
+/// (e.g. `exportAs: ['ngForm', 'abc']`).  Returns `None` for non-array
+/// forms — callers that need to fall back to a string literal should
+/// check `get_string_prop` separately.
+pub fn get_string_array_prop(obj: &ObjectExpression<'_>, key: &str) -> Option<Vec<String>> {
+    for prop in &obj.properties {
+        if let ObjectPropertyKind::ObjectProperty(p) = prop {
+            if property_key_matches(&p.key, key) {
+                if let Expression::ArrayExpression(arr) = &p.value {
+                    let mut out = Vec::with_capacity(arr.elements.len());
+                    for elem in &arr.elements {
+                        if let oxc_ast::ast::ArrayExpressionElement::StringLiteral(s) = elem {
+                            out.push(s.value.to_string());
+                        } else {
+                            return None;
+                        }
+                    }
+                    return Some(out);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Extract a boolean literal value for a named property.
 pub fn get_bool_prop(obj: &ObjectExpression<'_>, key: &str) -> Option<bool> {
     for prop in &obj.properties {

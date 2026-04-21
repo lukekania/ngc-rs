@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ngc_diagnostics::NgcResult;
 
@@ -57,6 +57,10 @@ struct IvyCodegen {
     /// This counter tracks the pipe-relative offset (0, 2, 5, …) which
     /// `rewrite_pipe_offsets` later shifts by the sequential binding count.
     pipe_var_offset: u32,
+    /// Template reference variables declared in the current template scope.
+    /// Maps `#refName` → LView slot that stores the resolved ref value.
+    /// Binding expressions reading these names are rewritten to `ɵɵreference(slot)`.
+    template_refs: BTreeMap<String, u32>,
 }
 
 struct ChildTemplate {
@@ -87,6 +91,7 @@ pub fn generate_ivy(
         scope_stack: Vec::new(),
         last_update_slot: None,
         pipe_var_offset: 0,
+        template_refs: BTreeMap::new(),
     };
 
     gen.ivy_imports
@@ -113,6 +118,11 @@ pub fn generate_ivy(
     }
     if !gen.update.is_empty() {
         template_body.push_str("    if (rf & 2) {\n");
+        // Root template: `ctx` is the function parameter, so refs can be
+        // read anywhere — but emit them at the top so bindings below can
+        // use the bare identifier names and not refer to ɵɵreference().
+        let ref_prelude = gen.build_ref_reads_prelude("      ");
+        template_body.push_str(&ref_prelude);
         for instr in &gen.update {
             template_body.push_str("      ");
             let rewritten = rewrite_pipe_offsets(instr, seq_bindings);
@@ -387,19 +397,53 @@ impl IvyCodegen {
             None
         };
 
+        // Collect template reference variables on this element (e.g.
+        // `#profileForm="ngForm"`, `#fileInput`).  Register a consts entry
+        // `[name, exportAs]` per ref — Angular's runtime populates the ref
+        // value into the LView slot immediately following the element.
+        let refs: Vec<(String, String)> = el
+            .attributes
+            .iter()
+            .filter_map(|a| match a {
+                TemplateAttribute::Reference { name, export_as } => {
+                    Some((name.clone(), export_as.clone().unwrap_or_default()))
+                }
+                _ => None,
+            })
+            .collect();
+        let refs_const_idx = if refs.is_empty() {
+            None
+        } else {
+            Some(self.register_refs_const(&refs))
+        };
+
         if el.is_void && !is_ng_container && !has_events {
             let instr = "\u{0275}\u{0275}element";
             self.ivy_imports.insert(instr.to_string());
-            if let Some(ci) = const_idx {
-                self.creation
-                    .push(format!("{instr}({slot}, '{}', {ci});", el.tag));
-            } else {
-                self.creation
-                    .push(format!("{instr}({slot}, '{}');", el.tag));
+            match (const_idx, refs_const_idx) {
+                (Some(ci), Some(ri)) => self
+                    .creation
+                    .push(format!("{instr}({slot}, '{}', {ci}, {ri});", el.tag)),
+                (Some(ci), None) => self
+                    .creation
+                    .push(format!("{instr}({slot}, '{}', {ci});", el.tag)),
+                (None, Some(ri)) => self
+                    .creation
+                    .push(format!("{instr}({slot}, '{}', null, {ri});", el.tag)),
+                (None, None) => self
+                    .creation
+                    .push(format!("{instr}({slot}, '{}');", el.tag)),
             }
+
+            // Allocate ref slots BEFORE emitting bindings so that expressions
+            // using the ref name can resolve to the correct ɵɵreference(slot).
+            self.reserve_template_refs(&refs);
 
             // Bindings for void elements
             self.emit_element_bindings(el, slot);
+
+            // Emit ɵɵreference(slot) calls to register the refs at their slots.
+            self.emit_reference_calls(&refs);
         } else {
             let (start_instr, end_instr) = if is_ng_container {
                 (
@@ -412,18 +456,36 @@ impl IvyCodegen {
             self.ivy_imports.insert(start_instr.to_string());
             self.ivy_imports.insert(end_instr.to_string());
             if is_ng_container {
-                if let Some(ci) = const_idx {
-                    self.creation.push(format!("{start_instr}({slot}, {ci});"));
-                } else {
-                    self.creation.push(format!("{start_instr}({slot});"));
+                match (const_idx, refs_const_idx) {
+                    (Some(ci), Some(ri)) => self
+                        .creation
+                        .push(format!("{start_instr}({slot}, {ci}, {ri});")),
+                    (Some(ci), None) => self.creation.push(format!("{start_instr}({slot}, {ci});")),
+                    (None, Some(ri)) => self
+                        .creation
+                        .push(format!("{start_instr}({slot}, null, {ri});")),
+                    (None, None) => self.creation.push(format!("{start_instr}({slot});")),
                 }
-            } else if let Some(ci) = const_idx {
-                self.creation
-                    .push(format!("{start_instr}({slot}, '{}', {ci});", el.tag));
             } else {
-                self.creation
-                    .push(format!("{start_instr}({slot}, '{}');", el.tag));
+                match (const_idx, refs_const_idx) {
+                    (Some(ci), Some(ri)) => self
+                        .creation
+                        .push(format!("{start_instr}({slot}, '{}', {ci}, {ri});", el.tag)),
+                    (Some(ci), None) => self
+                        .creation
+                        .push(format!("{start_instr}({slot}, '{}', {ci});", el.tag)),
+                    (None, Some(ri)) => self
+                        .creation
+                        .push(format!("{start_instr}({slot}, '{}', null, {ri});", el.tag)),
+                    (None, None) => self
+                        .creation
+                        .push(format!("{start_instr}({slot}, '{}');", el.tag)),
+                }
             }
+
+            // Allocate ref slots BEFORE listeners, bindings, or children.
+            // Listener bodies and descendant bindings may reference these names.
+            self.reserve_template_refs(&refs);
 
             // Event listeners and two-way binding listeners in creation block
             for attr in &el.attributes {
@@ -431,7 +493,7 @@ impl IvyCodegen {
                     TemplateAttribute::Event { name, handler } => {
                         self.ivy_imports
                             .insert("\u{0275}\u{0275}listener".to_string());
-                        let compiled_handler = compile_event_handler(handler, &self.local_vars);
+                        let compiled_handler = self.compile_listener_handler(handler);
                         let depth = self.scope_depth();
                         if depth > 0 {
                             self.ivy_imports
@@ -454,6 +516,10 @@ impl IvyCodegen {
                         self.ivy_imports
                             .insert("\u{0275}\u{0275}listener".to_string());
                         let depth = self.scope_depth();
+                        // Template refs stay as bare identifiers; they resolve
+                        // via the `const <name> = ɵɵreference(<slot>);` prelude
+                        // at the top of the update block / listener body.
+                        let compiled_target = ctx_expr_with_locals(expression, &self.local_vars);
                         if depth > 0 {
                             self.ivy_imports
                                 .insert("\u{0275}\u{0275}restoreView".to_string());
@@ -461,13 +527,13 @@ impl IvyCodegen {
                                 .insert("\u{0275}\u{0275}nextContext".to_string());
                             let listener_preamble = self.generate_listener_preamble();
                             self.creation.push(format!(
-                                "\u{0275}\u{0275}listener('{}Change', function($event) {{ {listener_preamble}return {} = $event; }});",
-                                name, ctx_expr(expression)
+                                "\u{0275}\u{0275}listener('{}Change', function($event) {{ {listener_preamble}return {compiled_target} = $event; }});",
+                                name,
                             ));
                         } else {
                             self.creation.push(format!(
-                                "\u{0275}\u{0275}listener('{}Change', function($event) {{ return {} = $event; }});",
-                                name, ctx_expr(expression)
+                                "\u{0275}\u{0275}listener('{}Change', function($event) {{ return {compiled_target} = $event; }});",
+                                name,
                             ));
                         }
                     }
@@ -484,18 +550,62 @@ impl IvyCodegen {
 
             self.creation.push(format!("{end_instr}();"));
 
-            // Template reference variables
-            for attr in &el.attributes {
-                if let TemplateAttribute::Reference { .. } = attr {
-                    self.ivy_imports
-                        .insert("\u{0275}\u{0275}reference".to_string());
-                    let ref_slot = self.slot_index;
-                    self.slot_index += 1;
-                    self.creation
-                        .push(format!("\u{0275}\u{0275}reference({ref_slot});"));
-                }
-            }
+            // Emit ɵɵreference(slot) calls after elementEnd to register the
+            // refs at their pre-reserved slots (matches Angular's output).
+            self.emit_reference_calls(&refs);
         }
+    }
+
+    /// Reserve a slot for each template reference on the current element and
+    /// register the ref in `template_refs` + `local_vars` so binding
+    /// expressions can resolve it.
+    fn reserve_template_refs(&mut self, refs: &[(String, String)]) {
+        if refs.is_empty() {
+            return;
+        }
+        self.ivy_imports
+            .insert("\u{0275}\u{0275}reference".to_string());
+        for (name, _) in refs {
+            let ref_slot = self.slot_index;
+            self.slot_index += 1;
+            self.template_refs.insert(name.clone(), ref_slot);
+            self.local_vars.insert(name.clone());
+        }
+    }
+
+    /// No-op: ref slots are auto-allocated by Angular's runtime based on the
+    /// `localRefsIndex` arg passed to `ɵɵelementStart`.  Emitting an explicit
+    /// creation-mode `ɵɵreference(slot);` call causes double-registration and
+    /// trips the Angular `assertIndexInRange` check at runtime.
+    fn emit_reference_calls(&mut self, _refs: &[(String, String)]) {}
+
+    /// Compile an event-handler expression with current locals.
+    /// Template references inside the handler stay as bare identifiers;
+    /// they resolve through the `const <name> = ɵɵreference(<slot>);`
+    /// declarations injected at the top of the listener body by
+    /// `build_ref_reads_prelude()`.
+    fn compile_listener_handler(&mut self, handler: &str) -> String {
+        compile_event_handler(handler, &self.local_vars)
+    }
+
+    /// Build the `const <name> = ɵɵreference(<slot>);` prelude that must be
+    /// emitted BEFORE any `ɵɵnextContext()` call (the latter changes the
+    /// context LView, so a subsequent `ɵɵreference()` would read from the
+    /// wrong LView).  Returns an empty string when there are no refs in
+    /// the current scope.
+    fn build_ref_reads_prelude(&mut self, indent: &str) -> String {
+        if self.template_refs.is_empty() {
+            return String::new();
+        }
+        self.ivy_imports
+            .insert("\u{0275}\u{0275}reference".to_string());
+        let mut code = String::new();
+        for (name, slot) in &self.template_refs {
+            code.push_str(&format!(
+                "{indent}const {name} = \u{0275}\u{0275}reference({slot});\n"
+            ));
+        }
+        code
     }
 
     /// Desugar a structural directive (*ngIf, *ngFor) to an ng-template wrapper.
@@ -582,6 +692,7 @@ impl IvyCodegen {
         let parent_update = std::mem::take(&mut self.update);
         let parent_consts = std::mem::take(&mut self.consts);
         let parent_lets = self.let_declarations.clone();
+        let parent_refs = std::mem::take(&mut self.template_refs);
 
         self.slot_index = 0;
         self.var_count = 0;
@@ -635,6 +746,7 @@ impl IvyCodegen {
         self.update = parent_update;
         self.consts = parent_consts;
         self.let_declarations = parent_lets;
+        self.template_refs = parent_refs;
 
         ChildTemplate {
             function_name: fn_name.to_string(),
@@ -1012,6 +1124,7 @@ impl IvyCodegen {
         let parent_creation = std::mem::take(&mut self.creation);
         let parent_update = std::mem::take(&mut self.update);
         let parent_lets = self.let_declarations.clone();
+        let parent_refs = std::mem::take(&mut self.template_refs);
         self.scope_stack.push(ScopeEntry::Conditional);
 
         self.slot_index = 0;
@@ -1020,6 +1133,8 @@ impl IvyCodegen {
         self.last_update_slot = None;
         // Don't clear let_declarations, local_vars, or consts — children
         // inherit parent scope and share the component-level consts array.
+        // template_refs, however, is scoped per-template: refs live in a
+        // specific LView's slot space and can't cross TView boundaries.
 
         self.generate_nodes(children);
 
@@ -1051,6 +1166,10 @@ impl IvyCodegen {
             code.push_str("  if (rf & 2) {\n");
             self.ivy_imports
                 .insert("\u{0275}\u{0275}nextContext".to_string());
+            // Template-reference reads MUST come before ɵɵnextContext —
+            // ɵɵreference(slot) reads the current context LView, and
+            // nextContext switches that context to the parent.
+            code.push_str(&self.build_ref_reads_prelude("    "));
             // Use the scope stack to generate context navigation
             code.push_str(&self.generate_context_navigation());
             // Inject @let variable reads from parent context
@@ -1086,6 +1205,7 @@ impl IvyCodegen {
         self.creation = parent_creation;
         self.update = parent_update;
         self.let_declarations = parent_lets;
+        self.template_refs = parent_refs;
 
         ChildTemplate {
             function_name: fn_name.to_string(),
@@ -1109,6 +1229,7 @@ impl IvyCodegen {
         let parent_creation = std::mem::take(&mut self.creation);
         let parent_update = std::mem::take(&mut self.update);
         let parent_lets = self.let_declarations.clone();
+        let parent_refs = std::mem::take(&mut self.template_refs);
 
         self.slot_index = 0;
         self.var_count = 0;
@@ -1150,6 +1271,9 @@ impl IvyCodegen {
             // Extract item from _ctx and component context.
             // Order matches ng build: item first, then nextContext.
             code.push_str(&format!("    const {item_name} = _ctx.$implicit;\n"));
+            // Template-reference reads must run BEFORE ɵɵnextContext —
+            // ɵɵreference reads the current context LView.
+            code.push_str(&self.build_ref_reads_prelude("    "));
             let comp_depth = self.scope_stack.len() as u32;
             self.ivy_imports
                 .insert("\u{0275}\u{0275}nextContext".to_string());
@@ -1193,6 +1317,7 @@ impl IvyCodegen {
         self.update = parent_update;
         self.let_declarations = parent_lets;
         self.local_vars = parent_locals;
+        self.template_refs = parent_refs;
 
         ChildTemplate {
             function_name: fn_name.to_string(),
@@ -1281,14 +1406,12 @@ impl IvyCodegen {
     fn compile_binding_expr(&mut self, expression: &str) -> String {
         let segments = extract_all_pipe_segments(expression);
         if segments.is_empty() {
-            // No pipes found — just compile with ctx. prefix
+            // No pipes found — just compile with ctx. prefix.
+            // Template-reference names are in `local_vars` so they're left
+            // unprefixed; the `const <name> = ɵɵreference(<slot>);` prelude
+            // at the top of the update block resolves them at runtime.
             return ctx_expr_with_locals(expression, &self.local_vars);
         }
-
-        // First segment is the base expression, rest are pipe names
-        // But pipes can be nested in sub-expressions. We need to replace
-        // pipe segments bottom-up. For simplicity, handle the common pattern:
-        // the entire expression or sub-expressions of form `(expr | pipe)`.
         self.replace_pipes_in_expr(expression)
     }
 
@@ -1355,6 +1478,22 @@ impl IvyCodegen {
         binding_names: &[&str],
     ) -> usize {
         let formatted = format_attrs_with_bindings(attrs, binding_names);
+        let idx = self.consts.len();
+        self.consts.push(formatted);
+        idx
+    }
+
+    /// Register a consts entry describing the template-reference variables
+    /// on an element, e.g. `['profileForm', 'ngForm']` or `['fileInput', '']`.
+    /// Multiple refs on the same element flatten into a single entry:
+    /// `['a', '', 'b', 'bDirective']`.
+    fn register_refs_const(&mut self, refs: &[(String, String)]) -> usize {
+        let mut parts = Vec::with_capacity(refs.len() * 2);
+        for (name, export_as) in refs {
+            parts.push(format!("'{}'", escape_js_string(name)));
+            parts.push(format!("'{}'", escape_js_string(export_as)));
+        }
+        let formatted = format!("[{}]", parts.join(", "));
         let idx = self.consts.len();
         self.consts.push(formatted);
         idx
@@ -1442,6 +1581,14 @@ impl IvyCodegen {
     /// with listener-appropriate single-line formatting.
     fn generate_listener_preamble(&self) -> String {
         let mut code = String::from("\u{0275}\u{0275}restoreView(_r); ");
+        // Template-reference reads must come BEFORE ɵɵnextContext —
+        // `ɵɵreference(slot)` uses the current context LView, and
+        // nextContext switches that context to the parent.
+        for (name, slot) in &self.template_refs {
+            code.push_str(&format!(
+                "const {name} = \u{0275}\u{0275}reference({slot}); "
+            ));
+        }
         if self.scope_stack.is_empty() {
             return code;
         }
@@ -2991,6 +3138,59 @@ mod tests {
         assert!(
             !body.contains("ctx.item.format"),
             "must not emit ctx.item.format: {body}"
+        );
+    }
+
+    #[test]
+    fn test_template_reference_var_resolves_via_ivy_reference() {
+        // `<form #profileForm="ngForm"><button [disabled]="!profileForm.form.valid"></button></form>`
+        // The ref must:
+        //   - appear in consts as ['profileForm','ngForm']
+        //   - be passed as the 4th arg to elementStart on the form
+        //   - resolve in the update block via ɵɵreference(slot) — NOT ctx.profileForm
+        let comp = test_component();
+        let nodes = vec![TemplateNode::Element(ElementNode {
+            tag: "form".to_string(),
+            attributes: vec![TemplateAttribute::Reference {
+                name: "profileForm".to_string(),
+                export_as: Some("ngForm".to_string()),
+            }],
+            children: vec![TemplateNode::Element(ElementNode {
+                tag: "button".to_string(),
+                attributes: vec![TemplateAttribute::Property {
+                    name: "disabled".to_string(),
+                    expression: "!profileForm.form.valid".to_string(),
+                }],
+                children: vec![],
+                is_void: false,
+            })],
+            is_void: false,
+        })];
+        let output = generate_ivy(&comp, &nodes).expect("should generate");
+        let dc = &output.static_fields[0];
+        assert!(
+            output
+                .consts
+                .iter()
+                .any(|c| c.contains("'profileForm'") && c.contains("'ngForm'")),
+            "consts should include ref entry ['profileForm','ngForm']: {:?}",
+            output.consts
+        );
+        let form_start = dc
+            .lines()
+            .find(|l| l.contains("elementStart") && l.contains("'form'"))
+            .unwrap_or("");
+        assert!(
+            form_start.matches(',').count() >= 3,
+            "form elementStart must pass refsIdx as 4th arg: {form_start}"
+        );
+        assert!(
+            dc.contains("\u{0275}\u{0275}reference("),
+            "update block should emit ɵɵreference(slot) for ref use: {dc}"
+        );
+        assert!(
+            !dc.contains("ctx.profileForm"),
+            "ref name must not be prefixed with ctx.: {dc}"
         );
     }
 
