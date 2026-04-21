@@ -1,27 +1,34 @@
 # ngc-rs
 
-A native Rust replacement for `ng build` in Angular projects. Drop-in swap, **~72x faster**.
+A native Rust replacement for `ng build` in Angular projects. Drop-in swap, **~10× faster on real-world apps**.
 
 ### Benchmarks
 
-| Command | Time | Ratio |
-|---------|------|-------|
-| `ngc-rs build -c production` | **~52ms** | **~72x faster** |
-| `ng build --configuration production` | ~3,810ms | baseline |
+| Project | `ngc-rs` | `ng build` | Speedup |
+|---------|----------|------------|---------|
+| Production Angular v21 app (~1,200 modules, 14 lazy chunks) | **~380 ms** | ~3,800 ms | **~10×** |
+| Minimal test fixture (77 modules) | ~52 ms | ~3,810 ms | ~72× |
 
-Measured with [hyperfine](https://github.com/sharkdp/hyperfine) on a real-world 77-module Angular v21 project. Production mode includes source maps, minification, tree shaking, and content-hashed filenames.
+Measured with [hyperfine](https://github.com/sharkdp/hyperfine) on Apple Silicon. Both rows use `-c production` (source maps, minification, tree shaking, content-hashed filenames). The micro-benchmark ratio is high because `ng build`'s fixed ~1.5 s of Node.js startup dominates tiny builds; on realistic projects the 10× figure is more representative.
 
-> **Status: v0.7 — Source Maps & Optimization**
-> ngc-rs reads `angular.json`, compiles templates to Ivy, bundles with code splitting, and emits production-ready output with source maps, minified code, tree-shaken exports, and content-hashed filenames.
+> **Status: v0.7.18 — parallel build pipeline**
+> ngc-rs reads `angular.json`, compiles templates to Ivy, bundles with code splitting, and emits production-ready output with source maps, minified code, tree-shaken exports, and content-hashed filenames. Every hot stage — project resolution, template compilation, TS transform, npm dependency crawl, Angular linker, tree-shaking, bundling, and minification — runs across rayon worker threads.
 > See the [milestones](https://github.com/lukekania/ngc-rs/milestones) for the roadmap toward a full `ng build` replacement.
 
 ## Why is it faster?
 
-The Angular CLI build pipeline runs on Node.js and is largely single-threaded. ngc-rs replaces it with a Rust binary that uses:
+The Angular CLI build pipeline runs on Node.js and is largely single-threaded. ngc-rs replaces it with a Rust binary that is multi-threaded end-to-end:
 
-- **[oxc](https://oxc.rs/)** for native JS/TS parsing (v0.2+)
-- **[rayon](https://github.com/rayon-rs/rayon)** for parallel file processing
+- **[oxc](https://oxc.rs/)** for native JS/TS parsing, codegen, and minification
+- **[rayon](https://github.com/rayon-rs/rayon)** for parallel per-file work at every stage
 - **[petgraph](https://github.com/petgraph/petgraph)** for the file dependency graph
+- **[dashmap](https://github.com/xacrimon/dashmap)** for a shared `canonicalize()` cache across worker threads — collapses duplicate filesystem `stat` syscalls
+
+Additional wins on the critical path:
+- **PostCSS/Tailwind subprocess overlaps with bundling** rather than running after it — ~200 ms of wallclock absorbed
+- **Per-chunk bundling, minification, and tree-shake** all fan out to worker threads
+- **npm dependency BFS** resolves each frontier level in parallel
+- **Linker** (`ɵɵngDeclare*` → `ɵɵdefine*` for partially-compiled npm packages) processes all three of its passes in parallel
 
 Type-checking is delegated to `tsc --noEmit` as a subprocess — we don't reimplement the TypeScript type system.
 
@@ -93,19 +100,17 @@ ngc-rs build --project tsconfig.app.json --output-json
 
 ### Benchmark comparison
 
-Compare against `tsc` (requires [hyperfine](https://github.com/sharkdp/hyperfine)):
+Reproduce the headline number against `ng build` with [hyperfine](https://github.com/sharkdp/hyperfine):
 
 ```sh
-# Resolution
-hyperfine --warmup 3 -i -N \
-  './target/release/ngc-rs info --project /path/to/tsconfig.app.json' \
-  'npx tsc --project /path/to/tsconfig.app.json --listFiles --noEmit'
+cargo build --release
 
-# Transform
-hyperfine --warmup 3 -i -N \
-  './target/release/ngc-rs build --project /path/to/tsconfig.app.json --out-dir /tmp/ngc-rs-out' \
-  'npx tsc --project /path/to/tsconfig.app.json --outDir /tmp/tsc-out --noCheck'
+hyperfine --warmup 3 \
+  "./target/release/ngc-rs build --project /path/to/tsconfig.app.json --out-dir /tmp/ngc-rs-out -c production" \
+  "npx ng build --configuration production"
 ```
+
+Run the `ng build` invocation from inside the Angular project directory, or pass a `cwd` flag. Both commands include full production optimizations.
 
 ## Development
 
@@ -134,8 +139,9 @@ See the [GitHub milestones](https://github.com/lukekania/ngc-rs/milestones) for 
 - **v0.5** — Build Output Completeness ✅ (angular.json, index.html, styles, assets, polyfills, fileReplacements)
 - **v0.6** — Code Splitting & Lazy Routes ✅ (dynamic import detection, chunk graph, multi-file output)
 - **v0.7** — Source Maps & Optimization ✅ (source maps, minification, content hashing, npm bundling)
+- **v0.7.x** — Angular 21 & Performance ✅ (full-pipeline rayon parallelism, overlapped PostCSS, canonicalize cache — 4.2× → ~10× vs `ng build`)
 - **v0.8** — Watch Mode & Dev Server
-- **v1.0** — Angular CLI Drop-in (swap one line in `angular.json`)
+- **v1.0** — Angular CLI Drop-in (swap one line in `angular.json`). Angular linker for partially-compiled npm packages already landed.
 
 ## Contributing
 
