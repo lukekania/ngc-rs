@@ -2998,6 +2998,102 @@ mod tests {
         }
     }
 
+    /// Parse a template string and generate Ivy output, returning the
+    /// defineComponent source (static_fields[0]). Panics on parse failure;
+    /// tests should use literals that are known-valid.
+    fn compile_template(src: &str) -> IvyOutput {
+        use crate::parser::parse_template;
+        use std::path::PathBuf;
+        let nodes = parse_template(src, &PathBuf::from("test.html")).expect("parse");
+        generate_ivy(&test_component(), &nodes).expect("generate")
+    }
+
+    #[test]
+    fn test_svg_namespace_emitted_before_svg_element() {
+        let output = compile_template("<svg><g><path d='M0 0'/></g></svg>");
+        assert!(
+            output.ivy_imports.contains("\u{0275}\u{0275}namespaceSVG"),
+            "namespaceSVG should be imported"
+        );
+        let dc = &output.static_fields[0];
+        let ns_idx = dc
+            .find("\u{0275}\u{0275}namespaceSVG()")
+            .expect("namespaceSVG should be emitted");
+        let svg_start = dc
+            .find("\u{0275}\u{0275}elementStart(0, 'svg')")
+            .expect("elementStart for svg should be emitted");
+        assert!(
+            ns_idx < svg_start,
+            "namespaceSVG must come before elementStart('svg'): {dc}"
+        );
+        // Descendants inherit SVG — no redundant transitions inside the subtree.
+        assert_eq!(
+            dc.matches("\u{0275}\u{0275}namespaceSVG()").count(),
+            1,
+            "only one namespaceSVG transition expected: {dc}"
+        );
+    }
+
+    #[test]
+    fn test_namespace_restores_to_html_after_svg_subtree() {
+        let output = compile_template("<svg><path/></svg><div></div>");
+        let dc = &output.static_fields[0];
+        let svg_idx = dc
+            .find("\u{0275}\u{0275}namespaceSVG()")
+            .expect("namespaceSVG should be emitted");
+        let html_idx = dc
+            .find("\u{0275}\u{0275}namespaceHTML()")
+            .expect("namespaceHTML transition should be emitted for trailing HTML");
+        let div_start = dc.find("'div'").expect("div element should be emitted");
+        assert!(
+            svg_idx < html_idx && html_idx < div_start,
+            "namespaceSVG → namespaceHTML → div expected: {dc}"
+        );
+    }
+
+    #[test]
+    fn test_foreign_object_children_return_to_html() {
+        let output = compile_template("<svg><foreignObject><div>x</div></foreignObject></svg>");
+        let dc = &output.static_fields[0];
+        let svg_ns = dc
+            .find("\u{0275}\u{0275}namespaceSVG()")
+            .expect("namespaceSVG should be emitted before svg");
+        let fo_start = dc
+            .find("'foreignObject'")
+            .expect("foreignObject elementStart");
+        let html_ns = dc
+            .find("\u{0275}\u{0275}namespaceHTML()")
+            .expect("namespaceHTML should be emitted for foreignObject's HTML children");
+        let div_start = dc
+            .find("'div'")
+            .expect("div elementStart inside foreignObject");
+        assert!(
+            svg_ns < fo_start,
+            "namespaceSVG must precede foreignObject: {dc}"
+        );
+        assert!(
+            fo_start < html_ns && html_ns < div_start,
+            "namespaceHTML must be emitted between foreignObject and its div child: {dc}"
+        );
+    }
+
+    #[test]
+    fn test_math_ns_emitted_before_math_element() {
+        let output = compile_template("<math><mrow></mrow></math>");
+        assert!(
+            output
+                .ivy_imports
+                .contains("\u{0275}\u{0275}namespaceMathML"),
+            "namespaceMathML should be imported"
+        );
+        let dc = &output.static_fields[0];
+        let ns = dc
+            .find("\u{0275}\u{0275}namespaceMathML()")
+            .expect("namespaceMathML should be emitted");
+        let math = dc.find("'math'").expect("math elementStart");
+        assert!(ns < math, "namespaceMathML must precede math: {dc}");
+    }
+
     #[test]
     fn test_void_element_codegen() {
         let comp = test_component();
