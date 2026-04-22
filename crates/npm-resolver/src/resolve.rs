@@ -13,7 +13,13 @@ use crate::package_json::{parse_specifier, resolve_package_entry};
 ///
 /// Parses the specifier into package name and subpath, locates the package
 /// in `node_modules`, and resolves its entry point via `package.json`.
-pub fn resolve_bare_specifier(specifier: &str, project_root: &Path) -> NgcResult<PathBuf> {
+/// `conditions` is the active condition set used by the exports field
+/// matcher — see [`crate::package_json`] for the built-in sets.
+pub fn resolve_bare_specifier(
+    specifier: &str,
+    project_root: &Path,
+    conditions: &[&str],
+) -> NgcResult<PathBuf> {
     let (pkg_name, subpath) = parse_specifier(specifier);
     let node_modules = project_root.join("node_modules");
     let pkg_dir = node_modules.join(&pkg_name);
@@ -25,7 +31,7 @@ pub fn resolve_bare_specifier(specifier: &str, project_root: &Path) -> NgcResult
         });
     }
 
-    resolve_package_entry(&pkg_dir, &subpath)
+    resolve_package_entry(&pkg_dir, &subpath, conditions)
 }
 
 /// Resolve a relative import specifier from within an npm package file.
@@ -85,7 +91,10 @@ pub fn resolve_relative_import(specifier: &str, from_file: &Path) -> NgcResult<P
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::package_json::DEVELOPMENT_BROWSER_CONDITIONS;
     use std::fs;
+
+    const DEV: &[&str] = DEVELOPMENT_BROWSER_CONDITIONS;
 
     fn setup_mock_packages(dir: &Path) {
         // @angular/core
@@ -127,7 +136,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         setup_mock_packages(dir.path());
 
-        let result = resolve_bare_specifier("@angular/core", dir.path()).unwrap();
+        let result = resolve_bare_specifier("@angular/core", dir.path(), DEV).unwrap();
         assert!(result.ends_with("fesm2022/core.mjs"));
     }
 
@@ -136,7 +145,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         setup_mock_packages(dir.path());
 
-        let result = resolve_bare_specifier("rxjs", dir.path()).unwrap();
+        let result = resolve_bare_specifier("rxjs", dir.path(), DEV).unwrap();
         assert!(result.ends_with("dist/esm5/index.js"));
     }
 
@@ -145,14 +154,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         setup_mock_packages(dir.path());
 
-        let result = resolve_bare_specifier("rxjs/operators", dir.path()).unwrap();
+        let result = resolve_bare_specifier("rxjs/operators", dir.path(), DEV).unwrap();
         assert!(result.ends_with("dist/esm5/operators/index.js"));
     }
 
     #[test]
     fn test_resolve_missing_package() {
         let dir = tempfile::tempdir().unwrap();
-        let result = resolve_bare_specifier("nonexistent-pkg", dir.path());
+        let result = resolve_bare_specifier("nonexistent-pkg", dir.path(), DEV);
         assert!(result.is_err());
     }
 
