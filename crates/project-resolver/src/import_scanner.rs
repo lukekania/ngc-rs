@@ -18,13 +18,28 @@ static DYNAMIC_IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"import\(\s*['"]([^'"]+)['"]\s*\)"#).expect("DYNAMIC_IMPORT_RE is a valid regex")
 });
 
-/// Distinguishes static `import`/`export` declarations from dynamic `import()` expressions.
+/// Matches `new Worker(new URL('./foo.worker', import.meta.url), ...)` and
+/// `new SharedWorker(...)`. The captured group is the specifier that points
+/// to the worker entry file. Matches are treated as a new entrypoint into
+/// the dependency graph, producing a separate chunk.
+static WORKER_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"new\s+(?:Worker|SharedWorker)\s*\(\s*new\s+URL\s*\(\s*['"]([^'"]+)['"]\s*,\s*import\.meta\.url"#,
+    )
+    .expect("WORKER_URL_RE is a valid regex")
+});
+
+/// Distinguishes static `import`/`export` declarations from dynamic `import()`
+/// expressions and web-worker URL constructions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ImportKind {
     /// A static `import ... from '...'`, `export ... from '...'`, or side-effect `import '...'`.
     Static,
     /// A dynamic `import('...')` expression (triggers code splitting).
     Dynamic,
+    /// A `new Worker(new URL('...', import.meta.url), ...)` or `new SharedWorker(...)`
+    /// call — the URL argument is a worker entrypoint that becomes its own chunk.
+    Worker,
 }
 
 /// An import specifier with its kind (static or dynamic).
@@ -50,6 +65,7 @@ pub fn scan_imports_with_kind(source: &str) -> Vec<ScannedImport> {
     let mut imports = Vec::new();
     let mut seen_static = std::collections::HashSet::new();
     let mut seen_dynamic = std::collections::HashSet::new();
+    let mut seen_worker = std::collections::HashSet::new();
 
     for cap in FROM_CLAUSE_RE.captures_iter(source) {
         if let Some(m) = cap.get(1) {
@@ -82,6 +98,18 @@ pub fn scan_imports_with_kind(source: &str) -> Vec<ScannedImport> {
                 imports.push(ScannedImport {
                     specifier: s,
                     kind: ImportKind::Dynamic,
+                });
+            }
+        }
+    }
+
+    for cap in WORKER_URL_RE.captures_iter(source) {
+        if let Some(m) = cap.get(1) {
+            let s = m.as_str().to_string();
+            if seen_worker.insert(s.clone()) {
+                imports.push(ScannedImport {
+                    specifier: s,
+                    kind: ImportKind::Worker,
                 });
             }
         }
@@ -255,6 +283,42 @@ const routes = [
         assert_eq!(imports[0].kind, ImportKind::Static);
         assert_eq!(imports[1].specifier, "./admin/admin.component");
         assert_eq!(imports[1].kind, ImportKind::Dynamic);
+    }
+
+    #[test]
+    fn test_scan_with_kind_worker_module() {
+        let source = r#"const w = new Worker(new URL('./compute.worker', import.meta.url), { type: 'module' });"#;
+        let imports = scan_imports_with_kind(source);
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].specifier, "./compute.worker");
+        assert_eq!(imports[0].kind, ImportKind::Worker);
+    }
+
+    #[test]
+    fn test_scan_with_kind_shared_worker() {
+        let source = r#"const w = new SharedWorker(new URL("./shared.worker", import.meta.url));"#;
+        let imports = scan_imports_with_kind(source);
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].specifier, "./shared.worker");
+        assert_eq!(imports[0].kind, ImportKind::Worker);
+    }
+
+    #[test]
+    fn test_scan_with_kind_worker_whitespace_variants() {
+        let source = r#"new   Worker ( new   URL (   './w',  import.meta.url ), {type:'module'})"#;
+        let imports = scan_imports_with_kind(source);
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].specifier, "./w");
+        assert_eq!(imports[0].kind, ImportKind::Worker);
+    }
+
+    #[test]
+    fn test_scan_with_kind_worker_ignores_non_import_meta() {
+        // A new Worker with a URL that's not rooted on import.meta.url isn't
+        // a bundled worker entry — we leave those alone for the runtime.
+        let source = r#"new Worker(new URL('./compute.worker', location.href));"#;
+        let imports = scan_imports_with_kind(source);
+        assert!(imports.is_empty());
     }
 
     #[test]
