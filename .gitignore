@@ -10,3 +10,4 @@ MILESTONES.md
 .env.*
 /scripts/bench_local.sh
 /scripts/deploy_to_container.sh
+/test/
