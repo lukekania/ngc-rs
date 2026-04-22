@@ -72,6 +72,15 @@ pub struct RawBuildOptions {
     pub styles: Option<Vec<RawStyleEntry>>,
     /// Asset entries.
     pub assets: Option<Vec<RawAssetEntry>>,
+    /// Base URL prefix injected into `<base href>` in `index.html`.
+    pub base_href: Option<String>,
+    /// Absolute URL prefix prepended to emitted script/style URLs.
+    pub deploy_url: Option<String>,
+    /// `crossorigin` attribute value for injected script/link tags
+    /// (`"none"`, `"anonymous"`, or `"use-credentials"`).
+    pub cross_origin: Option<String>,
+    /// Whether to compute and inject SRI `integrity` attributes.
+    pub subresource_integrity: Option<bool>,
 }
 
 /// Output path can be a simple string or an object for SSR setups.
@@ -157,6 +166,14 @@ pub struct FileReplacement {
 pub struct RawBuildConfiguration {
     /// File replacement entries.
     pub file_replacements: Option<Vec<FileReplacement>>,
+    /// Override for `baseHref`.
+    pub base_href: Option<String>,
+    /// Override for `deployUrl`.
+    pub deploy_url: Option<String>,
+    /// Override for `crossOrigin`.
+    pub cross_origin: Option<String>,
+    /// Override for `subresourceIntegrity`.
+    pub subresource_integrity: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +209,30 @@ pub enum ResolvedAsset {
     },
 }
 
+/// Value of the `crossOrigin` attribute applied to injected tags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CrossOrigin {
+    /// No `crossorigin` attribute emitted (Angular default).
+    #[default]
+    None,
+    /// `crossorigin="anonymous"`.
+    Anonymous,
+    /// `crossorigin="use-credentials"`.
+    UseCredentials,
+}
+
+impl CrossOrigin {
+    /// The attribute value as it appears in the rendered HTML, or `None`
+    /// when no attribute should be emitted.
+    pub fn attribute_value(self) -> Option<&'static str> {
+        match self {
+            CrossOrigin::None => None,
+            CrossOrigin::Anonymous => Some("anonymous"),
+            CrossOrigin::UseCredentials => Some("use-credentials"),
+        }
+    }
+}
+
 /// A fully resolved Angular project build configuration.
 #[derive(Debug, Clone)]
 pub struct ResolvedAngularProject {
@@ -219,6 +260,14 @@ pub struct ResolvedAngularProject {
     pub polyfills: Vec<String>,
     /// File replacements for the active configuration.
     pub file_replacements: Vec<FileReplacement>,
+    /// `baseHref` value to inject into `<base href>`, if any.
+    pub base_href: Option<String>,
+    /// `deployUrl` prefix for injected asset URLs, if any.
+    pub deploy_url: Option<String>,
+    /// `crossOrigin` attribute for injected script/link tags.
+    pub cross_origin: CrossOrigin,
+    /// Whether SRI `integrity` attributes should be injected.
+    pub subresource_integrity: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -343,6 +392,27 @@ pub fn resolve_angular_project(
         .and_then(|bc| bc.file_replacements.clone())
         .unwrap_or_default();
 
+    // Merge baseHref / deployUrl / crossOrigin / subresourceIntegrity with
+    // configuration values taking precedence over base options.
+    let base_href = build_config
+        .and_then(|bc| bc.base_href.clone())
+        .or_else(|| options.and_then(|o| o.base_href.clone()));
+    let deploy_url = build_config
+        .and_then(|bc| bc.deploy_url.clone())
+        .or_else(|| options.and_then(|o| o.deploy_url.clone()));
+    let cross_origin_raw = build_config
+        .and_then(|bc| bc.cross_origin.clone())
+        .or_else(|| options.and_then(|o| o.cross_origin.clone()));
+    let cross_origin = match cross_origin_raw.as_deref() {
+        Some("anonymous") => CrossOrigin::Anonymous,
+        Some("use-credentials") => CrossOrigin::UseCredentials,
+        _ => CrossOrigin::None,
+    };
+    let subresource_integrity = build_config
+        .and_then(|bc| bc.subresource_integrity)
+        .or_else(|| options.and_then(|o| o.subresource_integrity))
+        .unwrap_or(false);
+
     debug!(
         project = %name,
         output_path = %output_path.display(),
@@ -363,6 +433,10 @@ pub fn resolve_angular_project(
         assets,
         polyfills,
         file_replacements,
+        base_href,
+        deploy_url,
+        cross_origin,
+        subresource_integrity,
     })
 }
 
@@ -649,6 +723,113 @@ mod tests {
         // No explicit configuration — should use defaultConfiguration
         let result = resolve_angular_project(f.path(), None, None).unwrap();
         assert_eq!(result.file_replacements.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_deploy_options() {
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "architect": {
+                        "build": {
+                            "options": {
+                                "outputPath": "dist",
+                                "tsConfig": "tsconfig.json",
+                                "baseHref": "/app/",
+                                "deployUrl": "https://cdn.example.com/",
+                                "crossOrigin": "anonymous",
+                                "subresourceIntegrity": true
+                            }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let result = resolve_angular_project(f.path(), None, None).unwrap();
+        assert_eq!(result.base_href.as_deref(), Some("/app/"));
+        assert_eq!(
+            result.deploy_url.as_deref(),
+            Some("https://cdn.example.com/")
+        );
+        assert_eq!(result.cross_origin, CrossOrigin::Anonymous);
+        assert!(result.subresource_integrity);
+    }
+
+    #[test]
+    fn test_cross_origin_use_credentials() {
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "architect": {
+                        "build": {
+                            "options": {
+                                "outputPath": "dist",
+                                "tsConfig": "tsconfig.json",
+                                "crossOrigin": "use-credentials"
+                            }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let result = resolve_angular_project(f.path(), None, None).unwrap();
+        assert_eq!(result.cross_origin, CrossOrigin::UseCredentials);
+    }
+
+    #[test]
+    fn test_deploy_options_default_to_none() {
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "architect": {
+                        "build": {
+                            "options": {
+                                "outputPath": "dist",
+                                "tsConfig": "tsconfig.json"
+                            }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let result = resolve_angular_project(f.path(), None, None).unwrap();
+        assert!(result.base_href.is_none());
+        assert!(result.deploy_url.is_none());
+        assert_eq!(result.cross_origin, CrossOrigin::None);
+        assert!(!result.subresource_integrity);
+    }
+
+    #[test]
+    fn test_configuration_overrides_deploy_options() {
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "architect": {
+                        "build": {
+                            "options": {
+                                "outputPath": "dist",
+                                "tsConfig": "tsconfig.json",
+                                "baseHref": "/default/",
+                                "subresourceIntegrity": false
+                            },
+                            "configurations": {
+                                "production": {
+                                    "baseHref": "/prod/",
+                                    "subresourceIntegrity": true
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let result = resolve_angular_project(f.path(), None, Some("production")).unwrap();
+        assert_eq!(result.base_href.as_deref(), Some("/prod/"));
+        assert!(result.subresource_integrity);
     }
 
     #[test]
