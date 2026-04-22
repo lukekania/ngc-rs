@@ -1279,6 +1279,84 @@ mod tests {
     }
 
     #[test]
+    fn test_worker_bundling_emits_separate_chunk_and_rewrites_url() {
+        // main --worker--> compute.worker
+        // compute.worker --static--> worker-dep
+        let mut graph = DiGraph::new();
+        let worker_dep = graph.add_node(make_path("/root/worker-dep.ts"));
+        let worker = graph.add_node(make_path("/root/compute.worker.ts"));
+        let entry = graph.add_node(make_path("/root/main.ts"));
+        graph.add_edge(entry, worker, ImportKind::Worker);
+        graph.add_edge(worker, worker_dep, ImportKind::Static);
+
+        let mut modules = HashMap::new();
+        modules.insert(
+            make_path("/root/worker-dep.ts"),
+            "export function heavy(x) { return x * 2; }\n".to_string(),
+        );
+        modules.insert(
+            make_path("/root/compute.worker.ts"),
+            "import { heavy } from './worker-dep';\nself.onmessage = (e) => self.postMessage(heavy(e.data));\n"
+                .to_string(),
+        );
+        modules.insert(
+            make_path("/root/main.ts"),
+            "const w = new Worker(new URL('./compute.worker', import.meta.url), { type: 'module' });\nconsole.log(w);\n".to_string(),
+        );
+
+        let input = BundleInput {
+            modules,
+            graph,
+            entry: make_path("/root/main.ts"),
+            local_prefixes: vec![".".to_string()],
+            root_dir: make_path("/root"),
+            options: BundleOptions::default(),
+            per_module_maps: HashMap::new(),
+            bundled_specifiers: HashSet::new(),
+            export_conditions: Vec::new(),
+        };
+
+        let output = bundle(&input).expect("should bundle");
+
+        // Exactly one main + one worker chunk.
+        assert_eq!(output.chunks.len(), 2, "should produce 2 chunks");
+        let worker_entry = output
+            .chunks
+            .iter()
+            .find(|(k, _)| k.starts_with("worker-"))
+            .expect("should have a worker chunk");
+        assert_eq!(worker_entry.0, "worker-compute.js");
+
+        // The worker chunk must contain both the worker module and its nested
+        // static dependency — the worker has its own dependency graph.
+        assert!(worker_entry.1.contains("onmessage"));
+        assert!(
+            worker_entry.1.contains("function heavy"),
+            "worker chunk should inline its nested static dependency"
+        );
+
+        let main_code = main_chunk(&output);
+        // Main should NOT contain the worker body.
+        assert!(
+            !main_code.contains("onmessage"),
+            "main chunk should not contain worker module's body"
+        );
+        // Main should have rewritten the URL specifier to the emitted filename.
+        assert!(
+            main_code.contains("'./worker-compute.js'"),
+            "main chunk should reference the worker chunk filename. Got:\n{main_code}"
+        );
+        assert!(
+            !main_code.contains("./compute.worker"),
+            "main chunk should no longer reference the raw worker source path"
+        );
+        // The `new Worker(new URL(...))` shell must remain intact — only the
+        // inner specifier was rewritten.
+        assert!(main_code.contains("new Worker(new URL("));
+        assert!(main_code.contains("import.meta.url"));
+    }
+
+    #[test]
     fn test_format_import_named() {
         let imp = MergedImport {
             source: "@angular/core".to_string(),
