@@ -66,6 +66,11 @@ pub struct BundleInput {
     /// Bare specifiers that have been resolved and included in the graph.
     /// The rewriter treats imports of these specifiers as local (strips them).
     pub bundled_specifiers: HashSet<String>,
+    /// Active `exports` conditions (e.g. `browser`, `import`, `production`).
+    /// Forwarded to the npm resolver when re-resolving specifiers during
+    /// bundling so the same branch of conditional exports selected during
+    /// dependency collection is selected again here.
+    pub export_conditions: Vec<String>,
 }
 
 /// Merge result for a single source: all imports grouped.
@@ -107,6 +112,7 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
     let specifier_rewrites = build_specifier_rewrite_map(input, &chunk_graph.dynamic_import_map)?;
 
     let prefix_refs: Vec<&str> = input.local_prefixes.iter().map(|s| s.as_str()).collect();
+    let condition_refs: Vec<&str> = input.export_conditions.iter().map(|s| s.as_str()).collect();
     let mut output_chunks: HashMap<String, String> = HashMap::new();
     let mut chunk_source_maps: HashMap<String, SourceMap> = HashMap::new();
     let canon_cache: CanonCache = DashMap::new();
@@ -156,6 +162,7 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
         main_file_to_ns: &HashMap::new(),
         main_chunk_module_set: &main_module_set,
         canon_cache: &canon_cache,
+        export_conditions: &condition_refs,
     })?;
     let main_spec_to_ns = main_result.specifier_to_namespace;
     let main_file_to_ns = main_result.file_to_namespace;
@@ -200,6 +207,7 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
                 main_file_to_ns: &main_file_to_ns,
                 main_chunk_module_set: &main_module_set,
                 canon_cache: &canon_cache,
+                export_conditions: &condition_refs,
             })?;
             Ok((chunk.filename.clone(), result))
         })
@@ -398,6 +406,8 @@ struct ChunkBundleParams<'a> {
     main_chunk_module_set: &'a HashSet<PathBuf>,
     /// Shared cache of `canonicalize()` results across all per-chunk work.
     canon_cache: &'a CanonCache,
+    /// Active `exports` conditions, forwarded to the npm resolver.
+    export_conditions: &'a [&'a str],
 }
 
 /// Result of bundling a single chunk, including cross-chunk dependency info.
@@ -455,6 +465,7 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<ChunkBundleResult> {
             if let Ok(entry_path) = ngc_npm_resolver::resolve::resolve_bare_specifier(
                 spec,
                 node_modules_dir.parent().unwrap_or(&node_modules_dir),
+                p.export_conditions,
             ) {
                 let canonical =
                     cached_canonicalize(p.canon_cache, &entry_path).unwrap_or(entry_path);
@@ -1096,6 +1107,7 @@ mod tests {
             options: BundleOptions::default(),
             per_module_maps: HashMap::new(),
             bundled_specifiers: HashSet::new(),
+            export_conditions: Vec::new(),
         };
 
         let output = bundle(&input).expect("should bundle");
@@ -1142,6 +1154,7 @@ mod tests {
             options: BundleOptions::default(),
             per_module_maps: HashMap::new(),
             bundled_specifiers: HashSet::new(),
+            export_conditions: Vec::new(),
         };
 
         let output = bundle(&input).expect("should bundle");
@@ -1184,6 +1197,7 @@ mod tests {
             options: BundleOptions::default(),
             per_module_maps: HashMap::new(),
             bundled_specifiers: HashSet::new(),
+            export_conditions: Vec::new(),
         };
 
         let output = bundle(&input).expect("should bundle");
@@ -1227,6 +1241,7 @@ mod tests {
             options: BundleOptions::default(),
             per_module_maps: HashMap::new(),
             bundled_specifiers: HashSet::new(),
+            export_conditions: Vec::new(),
         };
 
         let output = bundle(&input).expect("should bundle");
@@ -1354,6 +1369,7 @@ mod tests {
             },
             per_module_maps,
             bundled_specifiers: HashSet::new(),
+            export_conditions: Vec::new(),
         };
 
         let output = bundle(&input).expect("should bundle");
@@ -1403,6 +1419,7 @@ mod tests {
             options: BundleOptions::default(),
             per_module_maps: HashMap::new(),
             bundled_specifiers: HashSet::new(),
+            export_conditions: Vec::new(),
         };
 
         let output = bundle(&input).expect("should bundle");
@@ -1460,6 +1477,7 @@ mod tests {
             },
             per_module_maps: HashMap::new(),
             bundled_specifiers: HashSet::new(),
+            export_conditions: Vec::new(),
         };
 
         let output = bundle(&input).expect("should bundle");

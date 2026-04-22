@@ -260,8 +260,13 @@ fn run_build(
             bare_specifiers.push(spec);
         }
     }
-    let mut npm_resolution =
-        ngc_npm_resolver::resolve_npm_dependencies(&bare_specifiers, &config_dir)?;
+    let export_conditions =
+        ngc_npm_resolver::package_json::conditions_for_configuration(configuration);
+    let mut npm_resolution = ngc_npm_resolver::resolve_npm_dependencies(
+        &bare_specifiers,
+        &config_dir,
+        export_conditions,
+    )?;
 
     // Merge npm modules into the modules map (they're already JS — no transform needed)
     for (path, source) in &npm_resolution.modules {
@@ -318,7 +323,11 @@ fn run_build(
             new_specifiers
         );
         bare_specifiers.extend(new_specifiers.iter().cloned());
-        let extra = ngc_npm_resolver::resolve_npm_dependencies(&new_specifiers, &config_dir)?;
+        let extra = ngc_npm_resolver::resolve_npm_dependencies(
+            &new_specifiers,
+            &config_dir,
+            export_conditions,
+        )?;
         tracing::info!(
             "post-flatten npm resolution pulled in {} file(s)",
             extra.modules.len()
@@ -369,7 +378,14 @@ fn run_build(
         if let Some(entry_path) = npm_resolution
             .resolved_specifiers
             .contains(specifier)
-            .then(|| ngc_npm_resolver::resolve::resolve_bare_specifier(specifier, &config_dir).ok())
+            .then(|| {
+                ngc_npm_resolver::resolve::resolve_bare_specifier(
+                    specifier,
+                    &config_dir,
+                    export_conditions,
+                )
+                .ok()
+            })
             .flatten()
         {
             if let Some(&to_idx) = path_index.get(&entry_path) {
@@ -422,6 +438,7 @@ fn run_build(
         options: bundle_options,
         per_module_maps,
         bundled_specifiers,
+        export_conditions: export_conditions.iter().map(|s| (*s).to_string()).collect(),
     };
     drop(graph_span);
 

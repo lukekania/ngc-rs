@@ -35,9 +35,14 @@ pub struct NpmResolution {
 /// its entry file via `package.json`, reads the source, scans for further
 /// imports, and recursively resolves those too. Returns all discovered files,
 /// edges, and the set of resolved specifiers.
+///
+/// `conditions` is forwarded to the `package.json` exports matcher: it
+/// determines which branch of a conditional exports object is selected
+/// (e.g. `browser` vs `node`, `production` vs `development`).
 pub fn resolve_npm_dependencies(
     specifiers: &[String],
     project_root: &Path,
+    conditions: &[&str],
 ) -> NgcResult<NpmResolution> {
     let node_modules = project_root.join("node_modules");
     if !node_modules.is_dir() {
@@ -76,7 +81,7 @@ pub fn resolve_npm_dependencies(
     let initial_entries: Vec<(String, PathBuf)> = specifiers
         .par_iter()
         .filter_map(
-            |spec| match resolve::resolve_bare_specifier(spec, project_root) {
+            |spec| match resolve::resolve_bare_specifier(spec, project_root, conditions) {
                 Ok(entry_path) => {
                     let canonical = canonicalize_cached(entry_path);
                     Some((spec.clone(), canonical))
@@ -136,7 +141,11 @@ pub fn resolve_npm_dependencies(
                             None,
                         )
                     } else {
-                        match resolve::resolve_bare_specifier(&import.specifier, project_root) {
+                        match resolve::resolve_bare_specifier(
+                            &import.specifier,
+                            project_root,
+                            conditions,
+                        ) {
                             Ok(p) => (Some(p), Some(import.specifier.clone())),
                             Err(_) => {
                                 debug!(
@@ -197,7 +206,10 @@ pub fn resolve_npm_dependencies(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::package_json::{DEVELOPMENT_BROWSER_CONDITIONS, PRODUCTION_BROWSER_CONDITIONS};
     use std::fs;
+
+    const DEV: &[&str] = DEVELOPMENT_BROWSER_CONDITIONS;
 
     fn setup_crawl_fixture(dir: &Path) {
         // Package "alpha" that imports from "beta" and has internal relative imports
@@ -235,8 +247,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         setup_crawl_fixture(dir.path());
 
-        let result =
-            resolve_npm_dependencies(&["alpha".to_string()], dir.path()).expect("should resolve");
+        let result = resolve_npm_dependencies(&["alpha".to_string()], dir.path(), DEV)
+            .expect("should resolve");
 
         // Should have 3 files: alpha/dist/index.mjs, alpha/dist/utils.mjs, beta/index.mjs
         assert_eq!(result.modules.len(), 3, "should discover 3 npm files");
@@ -247,8 +259,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         setup_crawl_fixture(dir.path());
 
-        let result =
-            resolve_npm_dependencies(&["alpha".to_string()], dir.path()).expect("should resolve");
+        let result = resolve_npm_dependencies(&["alpha".to_string()], dir.path(), DEV)
+            .expect("should resolve");
 
         // "beta" should be in resolved_specifiers even though only "alpha" was requested
         assert!(
@@ -266,8 +278,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         setup_crawl_fixture(dir.path());
 
-        let result =
-            resolve_npm_dependencies(&["alpha".to_string()], dir.path()).expect("should resolve");
+        let result = resolve_npm_dependencies(&["alpha".to_string()], dir.path(), DEV)
+            .expect("should resolve");
 
         // Should have edges: index->utils (relative), index->beta (bare)
         assert_eq!(result.edges.len(), 2, "should have 2 dependency edges");
@@ -280,7 +292,7 @@ mod tests {
 
         // Request both alpha and beta — beta should not be crawled twice
         let result =
-            resolve_npm_dependencies(&["alpha".to_string(), "beta".to_string()], dir.path())
+            resolve_npm_dependencies(&["alpha".to_string(), "beta".to_string()], dir.path(), DEV)
                 .expect("should resolve");
 
         assert_eq!(result.modules.len(), 3, "should still have only 3 files");
@@ -290,7 +302,7 @@ mod tests {
     fn test_crawl_no_node_modules() {
         let dir = tempfile::tempdir().unwrap();
         // No node_modules directory
-        let result = resolve_npm_dependencies(&["anything".to_string()], dir.path())
+        let result = resolve_npm_dependencies(&["anything".to_string()], dir.path(), DEV)
             .expect("should succeed");
 
         assert!(result.modules.is_empty());
@@ -302,9 +314,86 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("node_modules")).unwrap();
 
-        let result = resolve_npm_dependencies(&["nonexistent".to_string()], dir.path())
+        let result = resolve_npm_dependencies(&["nonexistent".to_string()], dir.path(), DEV)
             .expect("should succeed with warning");
 
         assert!(result.modules.is_empty());
+    }
+
+    /// Integration test covering the end-to-end dev vs prod split: a package
+    /// exposes different entry files for the `development` and `production`
+    /// conditions, and each build mode pulls in its own transitive graph.
+    #[test]
+    fn test_crawl_dev_vs_prod_entry_split() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_dir = dir.path().join("node_modules/envsplit");
+        fs::create_dir_all(pkg_dir.join("dev")).unwrap();
+        fs::create_dir_all(pkg_dir.join("prod")).unwrap();
+        fs::write(
+            pkg_dir.join("package.json"),
+            r#"{
+              "exports": {
+                ".": {
+                  "browser": {
+                    "development": "./dev/entry.mjs",
+                    "production": "./prod/entry.mjs"
+                  },
+                  "default": "./dev/entry.mjs"
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            pkg_dir.join("dev/entry.mjs"),
+            "export const mode = 'dev';\nexport const verbose = true;\n",
+        )
+        .unwrap();
+        fs::write(
+            pkg_dir.join("prod/entry.mjs"),
+            "export const mode = 'prod';\n",
+        )
+        .unwrap();
+
+        let prod = resolve_npm_dependencies(
+            &["envsplit".to_string()],
+            dir.path(),
+            PRODUCTION_BROWSER_CONDITIONS,
+        )
+        .expect("prod resolution");
+        let dev = resolve_npm_dependencies(
+            &["envsplit".to_string()],
+            dir.path(),
+            DEVELOPMENT_BROWSER_CONDITIONS,
+        )
+        .expect("dev resolution");
+
+        let prod_keys: Vec<String> = prod
+            .modules
+            .keys()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let dev_keys: Vec<String> = dev
+            .modules
+            .keys()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(
+            prod_keys.iter().any(|k| k.ends_with("prod/entry.mjs")),
+            "production build should include prod/entry.mjs, got {prod_keys:?}"
+        );
+        assert!(
+            !prod_keys.iter().any(|k| k.ends_with("dev/entry.mjs")),
+            "production build should NOT include dev/entry.mjs, got {prod_keys:?}"
+        );
+        assert!(
+            dev_keys.iter().any(|k| k.ends_with("dev/entry.mjs")),
+            "development build should include dev/entry.mjs, got {dev_keys:?}"
+        );
+        assert!(
+            !dev_keys.iter().any(|k| k.ends_with("prod/entry.mjs")),
+            "development build should NOT include prod/entry.mjs, got {dev_keys:?}"
+        );
     }
 }
