@@ -62,14 +62,26 @@ pub fn build_chunk_graph(
         ),
     })?;
 
-    // Step 1: Identify split points (targets of dynamic import edges)
+    // Step 1: Identify split points (targets of dynamic import or worker edges)
+    // and remember which ones came from worker URLs so we can give them a
+    // `worker-` filename prefix instead of the generic `chunk-` prefix.
     let mut split_points: BTreeSet<NodeIndex> = BTreeSet::new();
+    let mut worker_split_points: HashSet<NodeIndex> = HashSet::new();
     for edge in graph.edge_indices() {
         if let Some(weight) = graph.edge_weight(edge) {
-            if *weight == ImportKind::Dynamic {
-                if let Some((_source, target)) = graph.edge_endpoints(edge) {
-                    split_points.insert(target);
+            match *weight {
+                ImportKind::Dynamic => {
+                    if let Some((_source, target)) = graph.edge_endpoints(edge) {
+                        split_points.insert(target);
+                    }
                 }
+                ImportKind::Worker => {
+                    if let Some((_source, target)) = graph.edge_endpoints(edge) {
+                        split_points.insert(target);
+                        worker_split_points.insert(target);
+                    }
+                }
+                ImportKind::Static => {}
             }
         }
     }
@@ -175,7 +187,11 @@ pub fn build_chunk_graph(
             continue;
         }
 
-        let filename = chunk_filename_from_path(&sp_path, root_dir);
+        let filename = if worker_split_points.contains(&sp) {
+            worker_chunk_filename_from_path(&sp_path, root_dir)
+        } else {
+            chunk_filename_from_path(&sp_path, root_dir)
+        };
 
         // Modules exclusive to this lazy chunk + the split point itself
         let mut chunk_nodes: HashSet<NodeIndex> = HashSet::new();
@@ -516,6 +532,38 @@ fn scc_emit_deps_first(
     }
 }
 
+/// Derive a worker chunk filename from a worker entry's file path.
+///
+/// Strips a trailing `.worker` segment so `foo.worker.ts` produces
+/// `worker-foo.js` rather than the redundant `worker-foo-worker.js`.
+/// Example: `/root/src/app/compute.worker.ts` → `"worker-compute.js"`
+fn worker_chunk_filename_from_path(path: &Path, root_dir: &Path) -> String {
+    let relative = path.strip_prefix(root_dir).unwrap_or(path);
+    let stem = relative.with_extension("");
+    let stem_str = stem.to_string_lossy();
+
+    let name = stem_str
+        .replace(['/', '\\'], "-")
+        .replace('.', "-")
+        .to_lowercase();
+
+    let mut parts: Vec<&str> = name.split('-').filter(|s| !s.is_empty()).collect();
+    if parts.last().is_some_and(|s| *s == "worker") {
+        parts.pop();
+    }
+    let short_name = if parts.len() > 2 {
+        parts[parts.len() - 2..].join("-")
+    } else {
+        parts.join("-")
+    };
+
+    if short_name.is_empty() {
+        "worker.js".to_string()
+    } else {
+        format!("worker-{short_name}.js")
+    }
+}
+
 /// Derive a chunk filename from a split point's file path.
 ///
 /// Example: `/root/src/app/admin/admin.component.ts` → `"chunk-admin-component.js"`
@@ -732,6 +780,53 @@ mod tests {
             .modules
             .iter()
             .any(|m| m.to_str().unwrap_or("").contains("admin")));
+    }
+
+    #[test]
+    fn test_worker_chunk_filename_from_path() {
+        let root = Path::new("/root/src");
+        assert_eq!(
+            worker_chunk_filename_from_path(Path::new("/root/src/compute.worker.ts"), root),
+            "worker-compute.js"
+        );
+        assert_eq!(
+            worker_chunk_filename_from_path(Path::new("/root/src/workers/compute.worker.ts"), root),
+            "worker-workers-compute.js"
+        );
+        // No trailing .worker segment — no strip.
+        assert_eq!(
+            worker_chunk_filename_from_path(Path::new("/root/src/foo.ts"), root),
+            "worker-foo.js"
+        );
+    }
+
+    #[test]
+    fn test_worker_edge_creates_worker_chunk() {
+        let mut graph = DiGraph::new();
+        let worker = graph.add_node(make_path("/root/src/compute.worker.ts"));
+        let entry = graph.add_node(make_path("/root/src/main.ts"));
+        graph.add_edge(entry, worker, ImportKind::Worker);
+
+        let result = build_chunk_graph(
+            &graph,
+            &make_path("/root/src/main.ts"),
+            Path::new("/root/src"),
+        )
+        .expect("should build chunk graph");
+
+        assert_eq!(result.chunks.len(), 2);
+        let worker_chunk = result
+            .chunks
+            .iter()
+            .find(|c| c.kind == ChunkKind::Lazy)
+            .expect("should have a lazy chunk for the worker");
+        assert_eq!(worker_chunk.filename, "worker-compute.js");
+        assert_eq!(
+            result
+                .dynamic_import_map
+                .get(&make_path("/root/src/compute.worker.ts")),
+            Some(&"worker-compute.js".to_string())
+        );
     }
 
     #[test]

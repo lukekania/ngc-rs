@@ -407,7 +407,8 @@ fn collect_dynamic_import_edits_from_decl(
     }
 }
 
-/// Recursively walk an expression tree to find `import()` calls.
+/// Recursively walk an expression tree to find `import()` calls and worker
+/// URL constructions (`new Worker(new URL(...))` / `new SharedWorker(...)`).
 fn walk_expr_for_dynamic_imports(
     expr: &Expression,
     rewrites: &HashMap<String, String>,
@@ -431,6 +432,45 @@ fn walk_expr_for_dynamic_imports(
                         end: lit.span.end,
                         replacement: Some(format!("'./{chunk_filename}'")),
                     });
+                }
+            }
+        }
+        Expression::NewExpression(new_expr) => {
+            // Detect `new Worker(new URL('<spec>', import.meta.url), ...)`
+            // and `new SharedWorker(...)`. Rewrite the inner URL string
+            // literal to point to the emitted worker chunk filename.
+            if is_worker_callee(&new_expr.callee) {
+                if let Some(Expression::NewExpression(url_expr)) =
+                    new_expr.arguments.first().and_then(|a| a.as_expression())
+                {
+                    if is_url_callee(&url_expr.callee)
+                        && url_expr
+                            .arguments
+                            .get(1)
+                            .and_then(|a| a.as_expression())
+                            .is_some_and(is_import_meta_url)
+                    {
+                        if let Some(Expression::StringLiteral(lit)) =
+                            url_expr.arguments.first().and_then(|a| a.as_expression())
+                        {
+                            let specifier = lit.value.as_str();
+                            if let Some(chunk_filename) = rewrites.get(specifier) {
+                                edits.push(TextEdit {
+                                    start: lit.span.start,
+                                    end: lit.span.end,
+                                    replacement: Some(format!("'./{chunk_filename}'")),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            // Still recurse into the callee + arguments so nested dynamic
+            // imports or worker URLs inside the arguments also get visited.
+            walk_expr_for_dynamic_imports(&new_expr.callee, rewrites, edits, dynamic_imports);
+            for arg in &new_expr.arguments {
+                if let Some(expr) = arg.as_expression() {
+                    walk_expr_for_dynamic_imports(expr, rewrites, edits, dynamic_imports);
                 }
             }
         }
@@ -529,6 +569,41 @@ fn walk_expr_for_dynamic_imports(
         // For other expression types, we don't recurse (no nested import() possible)
         _ => {}
     }
+}
+
+/// True when `expr` is a plain identifier reference to `Worker` or `SharedWorker`.
+fn is_worker_callee(expr: &Expression) -> bool {
+    if let Expression::Identifier(id) = expr {
+        matches!(id.name.as_str(), "Worker" | "SharedWorker")
+    } else {
+        false
+    }
+}
+
+/// True when `expr` is a plain identifier reference to `URL`.
+fn is_url_callee(expr: &Expression) -> bool {
+    matches!(expr, Expression::Identifier(id) if id.name.as_str() == "URL")
+}
+
+/// True when `expr` is the `import.meta.url` member expression.
+fn is_import_meta_url(expr: &Expression) -> bool {
+    let member = match expr.as_member_expression() {
+        Some(m) => m,
+        None => return false,
+    };
+    // Property must be `url`
+    let Some(prop_name) = member.static_property_name() else {
+        return false;
+    };
+    if prop_name != "url" {
+        return false;
+    }
+    // Object must be a MetaProperty whose meta is `import` and property is `meta`
+    matches!(
+        member.object(),
+        Expression::MetaProperty(mp)
+            if mp.meta.name.as_str() == "import" && mp.property.name.as_str() == "meta"
+    )
 }
 
 /// Extract the declared name from a declaration, if it has a single clear name.
@@ -747,6 +822,51 @@ mod tests {
         let result = rewrite_module(code, "test.js", &["."], &rewrites).expect("should rewrite");
         assert!(result.code.contains("'./chunk-lazy.js'"));
         assert_eq!(result.dynamic_imports.len(), 1);
+    }
+
+    #[test]
+    fn test_worker_url_specifier_rewritten() {
+        let code =
+            "const w = new Worker(new URL('./compute.worker', import.meta.url), { type: 'module' });\n";
+        let mut rewrites = HashMap::new();
+        rewrites.insert(
+            "./compute.worker".to_string(),
+            "worker-compute.js".to_string(),
+        );
+        let result = rewrite_module(code, "test.js", &["."], &rewrites).expect("should rewrite");
+        assert!(result.code.contains("'./worker-compute.js'"));
+        assert!(!result.code.contains("./compute.worker"));
+        assert!(result.code.contains("new Worker(new URL("));
+        assert!(result.code.contains("import.meta.url"));
+    }
+
+    #[test]
+    fn test_shared_worker_url_specifier_rewritten() {
+        let code = r#"const w = new SharedWorker(new URL("./shared.worker", import.meta.url));"#;
+        let mut rewrites = HashMap::new();
+        rewrites.insert(
+            "./shared.worker".to_string(),
+            "worker-shared.js".to_string(),
+        );
+        let result = rewrite_module(code, "test.js", &["."], &rewrites).expect("should rewrite");
+        assert!(result.code.contains("'./worker-shared.js'"));
+        assert!(!result.code.contains("./shared.worker"));
+    }
+
+    #[test]
+    fn test_worker_without_import_meta_url_not_rewritten() {
+        // A `new Worker(new URL(...))` that uses something other than
+        // `import.meta.url` as the base isn't a bundled worker entrypoint;
+        // leave the specifier alone.
+        let code = "const w = new Worker(new URL('./compute.worker', location.href));\n";
+        let mut rewrites = HashMap::new();
+        rewrites.insert(
+            "./compute.worker".to_string(),
+            "worker-compute.js".to_string(),
+        );
+        let result = rewrite_module(code, "test.js", &["."], &rewrites).expect("should rewrite");
+        assert!(!result.code.contains("worker-compute.js"));
+        assert!(result.code.contains("./compute.worker"));
     }
 
     #[test]
