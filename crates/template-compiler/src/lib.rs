@@ -887,4 +887,59 @@ export class TestComponent {
             js.err()
         );
     }
+
+    #[test]
+    fn inline_svg_component_emits_namespace_transitions() {
+        // End-to-end fixture covering issue #60: a realistic inline-SVG icon
+        // with a foreignObject subtree must compile and emit ɵɵnamespaceSVG /
+        // ɵɵnamespaceHTML transitions at the right positions so the browser
+        // attaches the elements under the SVG namespace.
+        let source = r#"import { Component } from '@angular/core';
+
+@Component({
+  selector: 'app-icon',
+  standalone: true,
+  template: `
+    <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+      <g fill="currentColor">
+        <path d="M12 2 L2 22 L22 22 Z"></path>
+      </g>
+      <foreignObject x="0" y="0" width="24" height="24">
+        <div class="label">icon</div>
+      </foreignObject>
+    </svg>
+    <span class="caption">Logo</span>
+  `,
+})
+export class IconComponent {}
+"#;
+        let path = PathBuf::from("icon.component.ts");
+        let result = compile_file(source, &path).expect("should compile");
+        assert!(result.compiled, "should be compiled");
+
+        let out = &result.source;
+        assert!(
+            out.contains("\u{0275}\u{0275}namespaceSVG"),
+            "ɵɵnamespaceSVG must be emitted for inline SVG: {out}"
+        );
+        assert!(
+            out.contains("\u{0275}\u{0275}namespaceHTML"),
+            "ɵɵnamespaceHTML must be emitted (foreignObject descendants + trailing span): {out}"
+        );
+
+        let svg_ns = out.find("\u{0275}\u{0275}namespaceSVG()").unwrap();
+        let svg_start = out
+            .find("\u{0275}\u{0275}elementStart(0, 'svg'")
+            .expect("svg elementStart with slot 0");
+        assert!(
+            svg_ns < svg_start,
+            "ɵɵnamespaceSVG must precede elementStart('svg'): {out}"
+        );
+
+        // Rewritten component source must still parse through ts-transform
+        // — the pipeline ngc-rs build runs before emitting JS.
+        let js = ngc_ts_transform::transform_source(&result.source, "icon.component.ts")
+            .expect("oxc should parse compiled source");
+        assert!(js.contains("\u{0275}\u{0275}namespaceSVG"));
+    }
 }

@@ -29,6 +29,17 @@ enum ScopeEntry {
     Repeater { item_name: String },
 }
 
+/// The DOM namespace under which an element (and its descendants) is created.
+/// Ivy's runtime tracks a single global namespace flag that each
+/// ɵɵnamespaceHTML/SVG/MathML call flips — once set, every subsequent
+/// elementStart/element in the same template function inherits it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Namespace {
+    Html,
+    Svg,
+    MathMl,
+}
+
 /// Internal codegen state.
 struct IvyCodegen {
     component_name: String,
@@ -61,6 +72,15 @@ struct IvyCodegen {
     /// Maps `#refName` → LView slot that stores the resolved ref value.
     /// Binding expressions reading these names are rewritten to `ɵɵreference(slot)`.
     template_refs: BTreeMap<String, u32>,
+    /// Namespace most recently emitted in the current template function's
+    /// creation block. Compared against each element's target namespace to
+    /// decide whether a ɵɵnamespaceHTML/SVG/MathML transition is needed.
+    namespace_state: Namespace,
+    /// Stack of "child namespace" for each element currently being walked.
+    /// Top of stack = namespace that direct children should render in.
+    /// Entering `<svg>` pushes Svg; `<math>` pushes MathMl; `<foreignObject>`
+    /// (which is itself SVG) pushes Html so its HTML descendants render correctly.
+    namespace_stack: Vec<Namespace>,
 }
 
 struct ChildTemplate {
@@ -92,6 +112,8 @@ pub fn generate_ivy(
         last_update_slot: None,
         pipe_var_offset: 0,
         template_refs: BTreeMap::new(),
+        namespace_state: Namespace::Html,
+        namespace_stack: vec![Namespace::Html],
     };
 
     gen.ivy_imports
@@ -245,6 +267,57 @@ impl IvyCodegen {
             TemplateNode::SwitchBlock(block) => self.generate_switch_block(block),
             TemplateNode::LetDeclaration(decl) => self.generate_let_declaration(decl),
         }
+    }
+
+    /// Namespace the current position's elements inherit — top of the stack,
+    /// or Html if the stack is empty (should not happen in practice).
+    fn current_namespace(&self) -> Namespace {
+        self.namespace_stack
+            .last()
+            .copied()
+            .unwrap_or(Namespace::Html)
+    }
+
+    /// Namespace an element with the given tag should render in, given the
+    /// inherited namespace. `svg` and `math` force their own namespaces
+    /// regardless of parent; every other tag inherits.
+    fn element_namespace(tag: &str, inherited: Namespace) -> Namespace {
+        match tag {
+            "svg" => Namespace::Svg,
+            "math" => Namespace::MathMl,
+            _ => inherited,
+        }
+    }
+
+    /// Namespace the children of an element with the given tag should render
+    /// in. `<foreignObject>` is itself an SVG element but its descendants
+    /// return to HTML until the subtree ends.
+    fn child_namespace(tag: &str, element_ns: Namespace) -> Namespace {
+        match (tag, element_ns) {
+            ("svg", _) => Namespace::Svg,
+            ("math", _) => Namespace::MathMl,
+            // foreignObject inside SVG hands control back to HTML for its
+            // descendants. Case-sensitive match mirrors Angular / the HTML5
+            // parser behavior.
+            ("foreignObject", Namespace::Svg) => Namespace::Html,
+            (_, ns) => ns,
+        }
+    }
+
+    /// Emit a `ɵɵnamespaceHTML/SVG/MathML()` transition to the creation block
+    /// if the given target differs from `namespace_state`; update the state.
+    fn emit_namespace_transition(&mut self, target: Namespace) {
+        if self.namespace_state == target {
+            return;
+        }
+        let instr = match target {
+            Namespace::Html => "\u{0275}\u{0275}namespaceHTML",
+            Namespace::Svg => "\u{0275}\u{0275}namespaceSVG",
+            Namespace::MathMl => "\u{0275}\u{0275}namespaceMathML",
+        };
+        self.ivy_imports.insert(instr.to_string());
+        self.creation.push(format!("{instr}();"));
+        self.namespace_state = target;
     }
 
     fn generate_element(&mut self, el: &ElementNode) {
@@ -417,6 +490,17 @@ impl IvyCodegen {
             Some(self.register_refs_const(&refs))
         };
 
+        // Resolve this element's DOM namespace (svg/math force their own;
+        // others inherit from the enclosing subtree) and emit a runtime
+        // ɵɵnamespace* transition if it differs from the current state.
+        // ng-container is a virtual wrapper and doesn't itself take a
+        // namespace, but its children still inherit the outer context.
+        let inherited_ns = self.current_namespace();
+        let element_ns = Self::element_namespace(&el.tag, inherited_ns);
+        if !is_ng_container {
+            self.emit_namespace_transition(element_ns);
+        }
+
         if el.is_void && !is_ng_container && !has_events {
             let instr = "\u{0275}\u{0275}element";
             self.ivy_imports.insert(instr.to_string());
@@ -545,8 +629,13 @@ impl IvyCodegen {
             // so ɵɵadvance() targets the correct element slot.
             self.emit_element_bindings(el, slot);
 
-            // Generate children
+            // Push the namespace that direct children render in.
+            // `<foreignObject>` inside SVG resets to HTML for the subtree,
+            // restored automatically when we pop after children.
+            let child_ns = Self::child_namespace(&el.tag, element_ns);
+            self.namespace_stack.push(child_ns);
             self.generate_nodes(&el.children);
+            self.namespace_stack.pop();
 
             self.creation.push(format!("{end_instr}();"));
 
@@ -693,6 +782,12 @@ impl IvyCodegen {
         let parent_consts = std::mem::take(&mut self.consts);
         let parent_lets = self.let_declarations.clone();
         let parent_refs = std::mem::take(&mut self.template_refs);
+        // Each child template function runs with its own namespace flag that
+        // starts as HTML, so reset the tracked state. The stack is left
+        // intact — its top is the outer child_ns and remains the correct
+        // inherited namespace for elements generated inside the child.
+        let parent_ns_state = self.namespace_state;
+        self.namespace_state = Namespace::Html;
 
         self.slot_index = 0;
         self.var_count = 0;
@@ -747,6 +842,7 @@ impl IvyCodegen {
         self.consts = parent_consts;
         self.let_declarations = parent_lets;
         self.template_refs = parent_refs;
+        self.namespace_state = parent_ns_state;
 
         ChildTemplate {
             function_name: fn_name.to_string(),
@@ -1126,6 +1222,11 @@ impl IvyCodegen {
         let parent_lets = self.let_declarations.clone();
         let parent_refs = std::mem::take(&mut self.template_refs);
         self.scope_stack.push(ScopeEntry::Conditional);
+        // Reset namespace_state for this child template function (its runtime
+        // namespace flag starts as HTML). The stack is left intact so nested
+        // elements inherit the outer context's namespace.
+        let parent_ns_state = self.namespace_state;
+        self.namespace_state = Namespace::Html;
 
         self.slot_index = 0;
         self.var_count = 0;
@@ -1206,6 +1307,7 @@ impl IvyCodegen {
         self.update = parent_update;
         self.let_declarations = parent_lets;
         self.template_refs = parent_refs;
+        self.namespace_state = parent_ns_state;
 
         ChildTemplate {
             function_name: fn_name.to_string(),
@@ -1235,6 +1337,10 @@ impl IvyCodegen {
         self.var_count = 0;
         self.pipe_var_offset = 0;
         self.last_update_slot = None;
+        // Reset namespace_state for this child template function; stack is
+        // left intact so @for row elements inherit the outer namespace.
+        let parent_ns_state = self.namespace_state;
+        self.namespace_state = Namespace::Html;
 
         // Register the @for item variable as a local so ctx_expr_with_locals()
         // does NOT prefix it with `ctx.`.  e.g. `p.id` stays `p.id`, not `ctx.p.id`.
@@ -1318,6 +1424,7 @@ impl IvyCodegen {
         self.let_declarations = parent_lets;
         self.local_vars = parent_locals;
         self.template_refs = parent_refs;
+        self.namespace_state = parent_ns_state;
 
         ChildTemplate {
             function_name: fn_name.to_string(),
@@ -2889,6 +2996,102 @@ mod tests {
             styles_source: None,
             input_properties: Vec::new(),
         }
+    }
+
+    /// Parse a template string and generate Ivy output, returning the
+    /// defineComponent source (static_fields[0]). Panics on parse failure;
+    /// tests should use literals that are known-valid.
+    fn compile_template(src: &str) -> IvyOutput {
+        use crate::parser::parse_template;
+        use std::path::PathBuf;
+        let nodes = parse_template(src, &PathBuf::from("test.html")).expect("parse");
+        generate_ivy(&test_component(), &nodes).expect("generate")
+    }
+
+    #[test]
+    fn test_svg_namespace_emitted_before_svg_element() {
+        let output = compile_template("<svg><g><path d='M0 0'/></g></svg>");
+        assert!(
+            output.ivy_imports.contains("\u{0275}\u{0275}namespaceSVG"),
+            "namespaceSVG should be imported"
+        );
+        let dc = &output.static_fields[0];
+        let ns_idx = dc
+            .find("\u{0275}\u{0275}namespaceSVG()")
+            .expect("namespaceSVG should be emitted");
+        let svg_start = dc
+            .find("\u{0275}\u{0275}elementStart(0, 'svg')")
+            .expect("elementStart for svg should be emitted");
+        assert!(
+            ns_idx < svg_start,
+            "namespaceSVG must come before elementStart('svg'): {dc}"
+        );
+        // Descendants inherit SVG — no redundant transitions inside the subtree.
+        assert_eq!(
+            dc.matches("\u{0275}\u{0275}namespaceSVG()").count(),
+            1,
+            "only one namespaceSVG transition expected: {dc}"
+        );
+    }
+
+    #[test]
+    fn test_namespace_restores_to_html_after_svg_subtree() {
+        let output = compile_template("<svg><path/></svg><div></div>");
+        let dc = &output.static_fields[0];
+        let svg_idx = dc
+            .find("\u{0275}\u{0275}namespaceSVG()")
+            .expect("namespaceSVG should be emitted");
+        let html_idx = dc
+            .find("\u{0275}\u{0275}namespaceHTML()")
+            .expect("namespaceHTML transition should be emitted for trailing HTML");
+        let div_start = dc.find("'div'").expect("div element should be emitted");
+        assert!(
+            svg_idx < html_idx && html_idx < div_start,
+            "namespaceSVG → namespaceHTML → div expected: {dc}"
+        );
+    }
+
+    #[test]
+    fn test_foreign_object_children_return_to_html() {
+        let output = compile_template("<svg><foreignObject><div>x</div></foreignObject></svg>");
+        let dc = &output.static_fields[0];
+        let svg_ns = dc
+            .find("\u{0275}\u{0275}namespaceSVG()")
+            .expect("namespaceSVG should be emitted before svg");
+        let fo_start = dc
+            .find("'foreignObject'")
+            .expect("foreignObject elementStart");
+        let html_ns = dc
+            .find("\u{0275}\u{0275}namespaceHTML()")
+            .expect("namespaceHTML should be emitted for foreignObject's HTML children");
+        let div_start = dc
+            .find("'div'")
+            .expect("div elementStart inside foreignObject");
+        assert!(
+            svg_ns < fo_start,
+            "namespaceSVG must precede foreignObject: {dc}"
+        );
+        assert!(
+            fo_start < html_ns && html_ns < div_start,
+            "namespaceHTML must be emitted between foreignObject and its div child: {dc}"
+        );
+    }
+
+    #[test]
+    fn test_math_ns_emitted_before_math_element() {
+        let output = compile_template("<math><mrow></mrow></math>");
+        assert!(
+            output
+                .ivy_imports
+                .contains("\u{0275}\u{0275}namespaceMathML"),
+            "namespaceMathML should be imported"
+        );
+        let dc = &output.static_fields[0];
+        let ns = dc
+            .find("\u{0275}\u{0275}namespaceMathML()")
+            .expect("namespaceMathML should be emitted");
+        let math = dc.find("'math'").expect("math elementStart");
+        assert!(ns < math, "namespaceMathML must precede math: {dc}");
     }
 
     #[test]
