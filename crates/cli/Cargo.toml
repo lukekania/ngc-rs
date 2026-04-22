@@ -28,6 +28,8 @@ serde_json = "1.0"
 glob = "0.3"
 regex = "1.12"
 oxc_sourcemap = "6.1"
+sha2 = "0.10"
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3"

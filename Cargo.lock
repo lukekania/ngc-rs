@@ -662,6 +662,7 @@ dependencies = [
 name = "ngc-rs"
 version = "0.7.21"
 dependencies = [
+ "base64",
  "clap",
  "colored",
  "glob",
@@ -677,6 +678,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tracing",
  "tracing-subscriber",

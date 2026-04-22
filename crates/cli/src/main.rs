@@ -7,7 +7,7 @@ use colored::Colorize;
 use ngc_bundler::{BundleInput, BundleOptions};
 use ngc_diagnostics::{NgcError, NgcResult};
 use ngc_project_resolver::angular_json::{
-    FileReplacement, ResolvedAngularProject, ResolvedAsset, ResolvedStyle,
+    CrossOrigin, FileReplacement, ResolvedAngularProject, ResolvedAsset, ResolvedStyle,
 };
 
 /// Result of the bundled build pipeline.
@@ -509,6 +509,12 @@ fn run_build(
     // Step 11: Generate index.html
     if let Some(ref ap) = angular_project {
         if let Some(ref index_path) = ap.index_html {
+            let index_opts = IndexHtmlOptions {
+                base_href: ap.base_href.as_deref(),
+                deploy_url: ap.deploy_url.as_deref(),
+                cross_origin: ap.cross_origin,
+                subresource_integrity: ap.subresource_integrity,
+            };
             let path = generate_index_html(
                 index_path,
                 &ap.index_output,
@@ -516,6 +522,7 @@ fn run_build(
                 !ap.polyfills.is_empty(),
                 &out_dir,
                 &bundle_output.main_filename,
+                &index_opts,
             )?;
             output_files.push(path);
         }
@@ -951,7 +958,29 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> NgcResult<Vec<PathBuf>> {
     Ok(output_paths)
 }
 
+/// Options controlling how `index.html` is rewritten during injection.
+///
+/// Each field mirrors the corresponding `angular.json` build option. See
+/// [`generate_index_html`] for how they're applied to the emitted HTML.
+#[derive(Debug, Default, Clone, Copy)]
+struct IndexHtmlOptions<'a> {
+    /// `baseHref` — value written into `<base href="...">`.
+    base_href: Option<&'a str>,
+    /// `deployUrl` — absolute URL prefix prepended to injected `src`/`href`.
+    deploy_url: Option<&'a str>,
+    /// `crossOrigin` attribute for injected `<script>` / `<link>` tags.
+    cross_origin: CrossOrigin,
+    /// When true, compute SHA-384 integrity hashes of emitted artifacts and
+    /// inject `integrity="sha384-..."` attributes on the tags that load them.
+    subresource_integrity: bool,
+}
+
 /// Read source index.html, inject stylesheet and script tags, write to out_dir.
+///
+/// Applies the `baseHref`, `deployUrl`, `crossOrigin`, and
+/// `subresourceIntegrity` options during injection. SRI hashes are computed
+/// over the files on disk in `out_dir`, so this must run after the bundler,
+/// polyfills, and CSS pipeline have emitted their artifacts.
 fn generate_index_html(
     index_source: &Path,
     output_filename: &str,
@@ -959,28 +988,75 @@ fn generate_index_html(
     has_polyfills: bool,
     out_dir: &Path,
     main_filename: &str,
+    options: &IndexHtmlOptions,
 ) -> NgcResult<PathBuf> {
     let mut html = std::fs::read_to_string(index_source).map_err(|e| NgcError::Io {
         path: index_source.to_path_buf(),
         source: e,
     })?;
 
+    // Rewrite or inject <base href="..."> per baseHref option.
+    if let Some(base_href) = options.base_href {
+        html = apply_base_href(&html, base_href);
+    }
+
+    let deploy_url = options.deploy_url.unwrap_or("");
+    let crossorigin_attr = options
+        .cross_origin
+        .attribute_value()
+        .map(|v| format!(" crossorigin=\"{v}\""))
+        .unwrap_or_default();
+
     // Inject stylesheet link before </head>
     if has_styles {
-        html = html.replace(
-            "</head>",
-            "  <link rel=\"stylesheet\" href=\"styles.css\">\n</head>",
+        let href = format!("{deploy_url}styles.css");
+        let integrity = if options.subresource_integrity {
+            Some(compute_sri_hash(&out_dir.join("styles.css"))?)
+        } else {
+            None
+        };
+        let integrity_attr = integrity
+            .as_deref()
+            .map(|i| format!(" integrity=\"{i}\""))
+            .unwrap_or_default();
+        let tag = format!(
+            "  <link rel=\"stylesheet\" href=\"{href}\"{crossorigin_attr}{integrity_attr}>\n"
         );
+        html = html.replace("</head>", &format!("{tag}</head>"));
     }
 
     // Inject script tags before </body>
     let mut scripts = String::new();
     if has_polyfills {
-        scripts.push_str("  <script src=\"polyfills.js\" type=\"module\"></script>\n");
+        let src = format!("{deploy_url}polyfills.js");
+        let integrity = if options.subresource_integrity {
+            Some(compute_sri_hash(&out_dir.join("polyfills.js"))?)
+        } else {
+            None
+        };
+        let integrity_attr = integrity
+            .as_deref()
+            .map(|i| format!(" integrity=\"{i}\""))
+            .unwrap_or_default();
+        scripts.push_str(&format!(
+            "  <script src=\"{src}\" type=\"module\"{crossorigin_attr}{integrity_attr}></script>\n"
+        ));
     }
-    scripts.push_str(&format!(
-        "  <script src=\"{main_filename}\" type=\"module\"></script>\n"
-    ));
+    {
+        let src = format!("{deploy_url}{main_filename}");
+        let integrity = if options.subresource_integrity {
+            Some(compute_sri_hash(&out_dir.join(main_filename))?)
+        } else {
+            None
+        };
+        let integrity_attr = integrity
+            .as_deref()
+            .map(|i| format!(" integrity=\"{i}\""))
+            .unwrap_or_default();
+        scripts.push_str(&format!(
+            "  <script src=\"{src}\" type=\"module\"{crossorigin_attr}{integrity_attr}></script>\n"
+        ));
+    }
     html = html.replace("</body>", &format!("{scripts}</body>"));
 
     let path = out_dir.join(output_filename);
@@ -989,6 +1065,47 @@ fn generate_index_html(
         source: e,
     })?;
     Ok(path)
+}
+
+/// Rewrite an existing `<base href="...">` tag, or inject one after `<head>`.
+///
+/// Matches any existing tag with flexible whitespace and quote styles so we
+/// don't create a duplicate when the source index already declares one.
+fn apply_base_href(html: &str, base_href: &str) -> String {
+    let base_re = regex::Regex::new(r#"<base\s+[^>]*href\s*=\s*["'][^"']*["'][^>]*>"#)
+        .expect("valid base-href regex");
+    let replacement = format!("<base href=\"{base_href}\">");
+    if base_re.is_match(html) {
+        return base_re.replace(html, replacement.as_str()).into_owned();
+    }
+
+    // No existing <base> tag — inject after the opening <head>.
+    let head_re = regex::Regex::new(r"(?i)<head(\s[^>]*)?>").expect("valid head regex");
+    if let Some(m) = head_re.find(html) {
+        let end = m.end();
+        let mut out = String::with_capacity(html.len() + replacement.len() + 4);
+        out.push_str(&html[..end]);
+        out.push_str("\n  ");
+        out.push_str(&replacement);
+        out.push_str(&html[end..]);
+        return out;
+    }
+    // No <head> at all — fall back to prepending so the tag still lands.
+    format!("{replacement}\n{html}")
+}
+
+/// Compute a `sha384-<base64>` SRI digest for a file on disk.
+fn compute_sri_hash(path: &Path) -> NgcResult<String> {
+    use base64::Engine;
+    use sha2::{Digest, Sha384};
+
+    let bytes = std::fs::read(path).map_err(|e| NgcError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    let digest = Sha384::digest(&bytes);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(digest);
+    Ok(format!("sha384-{b64}"))
 }
 
 /// Scan the bundle's external imports, find LICENSE files in node_modules,
@@ -1411,8 +1528,19 @@ mod tests {
             "<!doctype html>\n<html>\n<head>\n</head>\n<body>\n  <app-root></app-root>\n</body>\n</html>\n",
         )
         .unwrap();
-        let out = generate_index_html(&index_src, "index.html", true, true, dir.path(), "main.js")
-            .unwrap();
+        std::fs::write(dir.path().join("styles.css"), "").unwrap();
+        std::fs::write(dir.path().join("polyfills.js"), "").unwrap();
+        std::fs::write(dir.path().join("main.js"), "").unwrap();
+        let out = generate_index_html(
+            &index_src,
+            "index.html",
+            true,
+            true,
+            dir.path(),
+            "main.js",
+            &IndexHtmlOptions::default(),
+        )
+        .unwrap();
         let content = std::fs::read_to_string(out).unwrap();
         assert!(content.contains(r#"<link rel="stylesheet" href="styles.css">"#));
         assert!(content.contains(r#"<script src="polyfills.js" type="module"></script>"#));
@@ -1424,6 +1552,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         let index_src = dir.path().join("index.html");
         std::fs::write(&index_src, "<html><head></head><body></body></html>").unwrap();
+        std::fs::write(dir.path().join("main.js"), "").unwrap();
         let out = generate_index_html(
             &index_src,
             "index.html",
@@ -1431,12 +1560,211 @@ mod tests {
             false,
             dir.path(),
             "main.js",
+            &IndexHtmlOptions::default(),
         )
         .unwrap();
         let content = std::fs::read_to_string(out).unwrap();
         assert!(!content.contains("styles.css"));
         assert!(!content.contains("polyfills.js"));
         assert!(content.contains(r#"<script src="main.js" type="module"></script>"#));
+    }
+
+    /// Fixture helper: writes a minimal index + artifact files and returns
+    /// `(dir, index_src)` for reuse across option-specific tests.
+    fn setup_index_fixture(artifact_bytes: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let index_src = dir.path().join("index.html");
+        std::fs::write(
+            &index_src,
+            "<!doctype html>\n<html>\n<head>\n</head>\n<body>\n  <app-root></app-root>\n</body>\n</html>\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("styles.css"), artifact_bytes).unwrap();
+        std::fs::write(dir.path().join("polyfills.js"), artifact_bytes).unwrap();
+        std::fs::write(dir.path().join("main.js"), artifact_bytes).unwrap();
+        (dir, index_src)
+    }
+
+    #[test]
+    fn test_index_html_base_href_injection() {
+        let (dir, index_src) = setup_index_fixture(b"");
+        let opts = IndexHtmlOptions {
+            base_href: Some("/app/"),
+            ..IndexHtmlOptions::default()
+        };
+        let out = generate_index_html(
+            &index_src,
+            "index.html",
+            true,
+            true,
+            dir.path(),
+            "main.js",
+            &opts,
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(out).unwrap();
+        assert!(content.contains(r#"<base href="/app/">"#));
+    }
+
+    #[test]
+    fn test_index_html_base_href_rewrites_existing() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let index_src = dir.path().join("index.html");
+        std::fs::write(
+            &index_src,
+            "<!doctype html>\n<html>\n<head><base href=\"/\"></head>\n<body></body>\n</html>\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("main.js"), b"").unwrap();
+        let opts = IndexHtmlOptions {
+            base_href: Some("/app/"),
+            ..IndexHtmlOptions::default()
+        };
+        let out = generate_index_html(
+            &index_src,
+            "index.html",
+            false,
+            false,
+            dir.path(),
+            "main.js",
+            &opts,
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(out).unwrap();
+        assert!(content.contains(r#"<base href="/app/">"#));
+        // Original href=/ should be gone — only one <base> tag remains.
+        assert_eq!(content.matches("<base ").count(), 1);
+    }
+
+    #[test]
+    fn test_index_html_deploy_url_prefixing() {
+        let (dir, index_src) = setup_index_fixture(b"");
+        let opts = IndexHtmlOptions {
+            deploy_url: Some("https://cdn.example.com/"),
+            ..IndexHtmlOptions::default()
+        };
+        let out = generate_index_html(
+            &index_src,
+            "index.html",
+            true,
+            true,
+            dir.path(),
+            "main.js",
+            &opts,
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(out).unwrap();
+        assert!(content.contains(r#"href="https://cdn.example.com/styles.css""#));
+        assert!(content.contains(r#"src="https://cdn.example.com/polyfills.js""#));
+        assert!(content.contains(r#"src="https://cdn.example.com/main.js""#));
+    }
+
+    #[test]
+    fn test_index_html_cross_origin_anonymous() {
+        let (dir, index_src) = setup_index_fixture(b"");
+        let opts = IndexHtmlOptions {
+            cross_origin: CrossOrigin::Anonymous,
+            ..IndexHtmlOptions::default()
+        };
+        let out = generate_index_html(
+            &index_src,
+            "index.html",
+            true,
+            true,
+            dir.path(),
+            "main.js",
+            &opts,
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(out).unwrap();
+        assert_eq!(content.matches(r#"crossorigin="anonymous""#).count(), 3);
+    }
+
+    #[test]
+    fn test_index_html_cross_origin_use_credentials() {
+        let (dir, index_src) = setup_index_fixture(b"");
+        let opts = IndexHtmlOptions {
+            cross_origin: CrossOrigin::UseCredentials,
+            ..IndexHtmlOptions::default()
+        };
+        let out = generate_index_html(
+            &index_src,
+            "index.html",
+            true,
+            true,
+            dir.path(),
+            "main.js",
+            &opts,
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(out).unwrap();
+        assert!(content.contains(r#"crossorigin="use-credentials""#));
+    }
+
+    #[test]
+    fn test_index_html_subresource_integrity() {
+        use base64::Engine;
+        use sha2::{Digest, Sha384};
+        let payload = b"hello";
+        let (dir, index_src) = setup_index_fixture(payload);
+        let digest = Sha384::digest(payload);
+        let expected = format!(
+            "sha384-{}",
+            base64::engine::general_purpose::STANDARD.encode(digest)
+        );
+        let opts = IndexHtmlOptions {
+            subresource_integrity: true,
+            ..IndexHtmlOptions::default()
+        };
+        let out = generate_index_html(
+            &index_src,
+            "index.html",
+            true,
+            true,
+            dir.path(),
+            "main.js",
+            &opts,
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(out).unwrap();
+        assert_eq!(content.matches(expected.as_str()).count(), 3);
+    }
+
+    #[test]
+    fn test_index_html_all_deploy_options_together() {
+        let (dir, index_src) = setup_index_fixture(b"payload");
+        let opts = IndexHtmlOptions {
+            base_href: Some("/app/"),
+            deploy_url: Some("https://cdn.example.com/"),
+            cross_origin: CrossOrigin::Anonymous,
+            subresource_integrity: true,
+        };
+        let out = generate_index_html(
+            &index_src,
+            "index.html",
+            true,
+            true,
+            dir.path(),
+            "main.js",
+            &opts,
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(out).unwrap();
+        assert!(content.contains(r#"<base href="/app/">"#));
+        assert!(content.contains(r#"href="https://cdn.example.com/styles.css""#));
+        assert!(content.contains(r#"src="https://cdn.example.com/polyfills.js""#));
+        assert!(content.contains(r#"src="https://cdn.example.com/main.js""#));
+        assert_eq!(content.matches(r#"crossorigin="anonymous""#).count(), 3);
+
+        // Verify SRI hashes match what openssl would emit for the payload.
+        use base64::Engine;
+        use sha2::{Digest, Sha384};
+        let digest = Sha384::digest(b"payload");
+        let expected = format!(
+            "sha384-{}",
+            base64::engine::general_purpose::STANDARD.encode(digest)
+        );
+        assert_eq!(content.matches(expected.as_str()).count(), 3);
     }
 
     #[test]
