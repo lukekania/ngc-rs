@@ -968,15 +968,15 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
                         Expression::ArrayExpression(arr) => {
                             for elem in &arr.elements {
                                 match elem {
-                                    oxc_ast::ast::ArrayExpressionElement::TemplateLiteral(tpl) => {
-                                        if tpl.expressions.is_empty() {
-                                            let text: String = tpl
-                                                .quasis
-                                                .iter()
-                                                .map(|q| q.value.raw.as_str())
-                                                .collect();
-                                            inline_styles.push(text);
-                                        }
+                                    oxc_ast::ast::ArrayExpressionElement::TemplateLiteral(tpl)
+                                        if tpl.expressions.is_empty() =>
+                                    {
+                                        let text: String = tpl
+                                            .quasis
+                                            .iter()
+                                            .map(|q| q.value.raw.as_str())
+                                            .collect();
+                                        inline_styles.push(text);
                                     }
                                     oxc_ast::ast::ArrayExpressionElement::StringLiteral(s) => {
                                         inline_styles.push(s.value.to_string());
@@ -988,12 +988,10 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
                         Expression::StringLiteral(s) => {
                             inline_styles.push(s.value.to_string());
                         }
-                        Expression::TemplateLiteral(tpl) => {
-                            if tpl.expressions.is_empty() {
-                                let text: String =
-                                    tpl.quasis.iter().map(|q| q.value.raw.as_str()).collect();
-                                inline_styles.push(text);
-                            }
+                        Expression::TemplateLiteral(tpl) if tpl.expressions.is_empty() => {
+                            let text: String =
+                                tpl.quasis.iter().map(|q| q.value.raw.as_str()).collect();
+                            inline_styles.push(text);
                         }
                         _ => {}
                     }
