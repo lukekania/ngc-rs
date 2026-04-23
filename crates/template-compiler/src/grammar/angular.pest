@@ -33,13 +33,16 @@ close_tag = { "</" ~ tag_name ~ ">" }
 tag_name = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "-")* }
 
 // Attributes (ordered by specificity to avoid ambiguity)
-attribute = _{ class_binding | style_binding | attr_binding | two_way_binding | event_binding | property_binding | structural_directive | ref_variable | static_attribute }
+attribute = _{ class_binding | style_binding | attr_binding | two_way_binding | event_binding | animation_property_binding | property_binding | structural_directive | ref_variable | static_attribute }
 
 two_way_binding = { "[(" ~ prop_name ~ ")]" ~ "=" ~ quoted_value }
 structural_directive = { "*" ~ attr_name ~ "=" ~ quoted_value }
 ref_variable = { "#" ~ identifier ~ ("=" ~ quoted_value)? }
 
 event_binding = { "(" ~ event_name ~ ")" ~ "=" ~ quoted_value }
+// `[@trigger]` with no value is valid Angular shorthand for `[@trigger]="undefined"`.
+animation_property_binding = { "[" ~ animation_prop_name ~ "]" ~ ("=" ~ quoted_value)? }
+animation_prop_name = @{ "@" ~ (ASCII_ALPHANUMERIC | "-" | "_")+ }
 property_binding = { "[" ~ prop_name ~ "]" ~ "=" ~ quoted_value }
 class_binding = { "[class." ~ class_name ~ "]" ~ "=" ~ quoted_value }
 style_binding = { "[style." ~ style_prop ~ "]" ~ "=" ~ quoted_value }
@@ -47,7 +50,7 @@ attr_binding = { "[attr." ~ attr_name ~ "]" ~ "=" ~ quoted_value }
 static_attribute = { attr_name ~ ("=" ~ quoted_value)? }
 
 event_name = @{ (ASCII_ALPHANUMERIC | "." | "-" | "@")+ }
-prop_name = @{ (ASCII_ALPHANUMERIC | "-" | "@")+ }
+prop_name = @{ (ASCII_ALPHANUMERIC | "-")+ }
 class_name = @{ (ASCII_ALPHANUMERIC | "-" | ":" | "_" | "." | "/")+ }
 style_prop = @{ (ASCII_ALPHANUMERIC | "-" | "." | "%")+ }
 attr_name = @{ (ASCII_ALPHANUMERIC | "-" | "_")+ }

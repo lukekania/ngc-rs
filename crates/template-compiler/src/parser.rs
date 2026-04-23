@@ -165,6 +165,20 @@ fn parse_attributes(
                     .unwrap_or_default();
                 attrs.push(crate::ast::TemplateAttribute::Property { name, expression });
             }
+            Rule::animation_property_binding => {
+                let mut inner = pair.into_inner();
+                let name = inner
+                    .next()
+                    .map(|p| p.as_str().to_string())
+                    .unwrap_or_default();
+                // `[@trigger]` without `="..."` is shorthand for `[@trigger]="undefined"`.
+                let expression = inner
+                    .next()
+                    .and_then(|p| p.into_inner().next())
+                    .map(|p| p.as_str().to_string())
+                    .unwrap_or_else(|| "undefined".to_string());
+                attrs.push(crate::ast::TemplateAttribute::Property { name, expression });
+            }
             Rule::class_binding => {
                 let mut inner = pair.into_inner();
                 let class_name = inner
@@ -697,6 +711,21 @@ mod tests {
                     assert_eq!(expression, "state");
                 }
                 _ => panic!("expected property binding for [@fade]"),
+            },
+            _ => panic!("expected element"),
+        }
+    }
+
+    #[test]
+    fn test_animation_property_binding_no_value() {
+        let nodes = parse("<div [@slide]></div>");
+        match &nodes[0] {
+            TemplateNode::Element(e) => match &e.attributes[0] {
+                TemplateAttribute::Property { name, expression } => {
+                    assert_eq!(name, "@slide");
+                    assert_eq!(expression, "undefined");
+                }
+                _ => panic!("expected property binding for [@slide]"),
             },
             _ => panic!("expected element"),
         }
