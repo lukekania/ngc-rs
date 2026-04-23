@@ -272,7 +272,30 @@ impl IvyCodegen {
             TemplateNode::SwitchBlock(block) => self.generate_switch_block(block),
             TemplateNode::LetDeclaration(decl) => self.generate_let_declaration(decl),
             TemplateNode::DeferBlock(block) => self.generate_defer_block(block),
+            TemplateNode::IcuExpression(icu) => self.generate_icu_expression(icu),
         }
+    }
+
+    /// Emit an ICU message as a `$localize`-tagged placeholder text node.
+    ///
+    /// Full ICU codegen (`ɵɵi18n` + runtime selector arms) is substantial;
+    /// this first pass renders the `other` branch (or the first case when
+    /// `other` is missing) so templates parse and render, while the
+    /// extractor still sees the complete message for translation.
+    fn generate_icu_expression(&mut self, icu: &crate::ast::IcuExpressionNode) {
+        let fallback = icu
+            .cases
+            .iter()
+            .find(|c| c.key == "other")
+            .or_else(|| icu.cases.first())
+            .map(|c| c.body.clone())
+            .unwrap_or_default();
+        let slot = self.slot_index;
+        self.slot_index += 1;
+        let escaped = escape_js_string(&fallback);
+        self.creation.push(format!(
+            "        \u{0275}\u{0275}text({slot}, '{escaped}');"
+        ));
     }
 
     /// Namespace the current position's elements inherit — top of the stack,

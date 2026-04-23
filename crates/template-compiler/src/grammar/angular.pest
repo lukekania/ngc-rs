@@ -2,13 +2,25 @@
 
 template = { SOI ~ node* ~ EOI }
 
-node = _{ control_flow | let_block | html_comment | element | interpolation | text }
+node = _{ control_flow | let_block | html_comment | element | interpolation | icu_expression | text }
 
 // HTML comments: <!-- ... -->
 html_comment = { "<!--" ~ (!"-->" ~ ANY)* ~ "-->" }
 
-// Text: anything not starting a tag, interpolation, or control flow keyword
+// Text: anything not starting a tag, interpolation, or control flow keyword.
+// ICU messages start with `{`; they are disambiguated from stray `{` chars in
+// text by being listed before `text` in `node` — the parser tries ICU first.
 text = @{ (!("<" | "{{" | "}" | "@if" | "@for" | "@switch" | "@else" | "@case" | "@default" | "@empty" | "@let" | "@defer" | "@placeholder" | "@loading" | "@error") ~ ANY)+ }
+
+// ICU expressions: { <switchExpr>, <plural|select|selectordinal>, <case>{ ... } ... }
+// Example: { count, plural, =0 {no items} =1 {one item} other {# items} }
+// Case body content is atomic so whitespace inside is preserved.
+icu_expression = { "{" ~ icu_switch_expr ~ "," ~ icu_category ~ "," ~ icu_case+ ~ "}" }
+icu_switch_expr = @{ (!("," | "}") ~ ANY)+ }
+icu_category = @{ ("plural" | "selectordinal" | "select") ~ !(ASCII_ALPHANUMERIC | "_") }
+icu_case = { icu_case_key ~ "{" ~ icu_case_body ~ "}" }
+icu_case_key = @{ ("=" ~ ASCII_DIGIT+) | (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_" | "-")* }
+icu_case_body = @{ (!"}" ~ ANY)* }
 
 // Text interpolation: {{ expression | pipe }}
 // Handles || (logical OR), balanced parens, and | only as top-level pipe separator
