@@ -42,7 +42,20 @@ pub struct ExtractedComponent {
     /// Named imports from `@angular/core` other than `Component`.
     pub other_angular_core_imports: Vec<String>,
     /// Raw source text of the `styles` array (e.g. `['\`.sidebar { ... }\`']`).
+    ///
+    /// Retained for codegen fast-path when no preprocessing is needed. When
+    /// `style_urls` is non-empty or `inlineStyleLanguage` is non-CSS, the
+    /// post-extraction step in `compile_component` rewrites this field to a
+    /// synthesized `[`compiled-css`]` array of preprocessed CSS.
     pub styles_source: Option<String>,
+    /// Inline CSS contents from `styles: [...]` — one entry per element
+    /// (template-literal body or string literal value, with no surrounding
+    /// backticks/quotes).
+    pub inline_styles: Vec<String>,
+    /// Relative paths from `styleUrl: '...'` or `styleUrls: [...]`. These
+    /// are resolved against the component's file directory and read during
+    /// `compile_component` so preprocessors can run on their contents.
+    pub style_urls: Vec<String>,
     /// Property names decorated with `@Input()`.
     pub input_properties: Vec<String>,
 }
@@ -180,6 +193,8 @@ pub fn extract_component(source: &str, file_path: &Path) -> NgcResult<Option<Ext
             angular_core_import_span,
             other_angular_core_imports,
             styles_source: metadata.styles_source,
+            inline_styles: metadata.inline_styles,
+            style_urls: metadata.style_urls,
             input_properties,
         }));
     }
@@ -855,6 +870,8 @@ struct DecoratorMetadata {
     imports_source: Option<String>,
     imports_identifiers: Vec<String>,
     styles_source: Option<String>,
+    inline_styles: Vec<String>,
+    style_urls: Vec<String>,
 }
 
 /// Extract metadata from the `@Component({...})` decorator argument.
@@ -870,6 +887,8 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
                 imports_source: None,
                 imports_identifiers: Vec::new(),
                 styles_source: None,
+                inline_styles: Vec::new(),
+                style_urls: Vec::new(),
             });
         }
     };
@@ -885,6 +904,8 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
                 imports_source: None,
                 imports_identifiers: Vec::new(),
                 styles_source: None,
+                inline_styles: Vec::new(),
+                style_urls: Vec::new(),
             });
         }
     };
@@ -896,6 +917,8 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
     let mut imports_source = None;
     let mut imports_identifiers = Vec::new();
     let mut styles_source = None;
+    let mut inline_styles: Vec<String> = Vec::new();
+    let mut style_urls: Vec<String> = Vec::new();
 
     for prop in &arg.properties {
         if let ObjectPropertyKind::ObjectProperty(prop) = prop {
@@ -932,11 +955,64 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
                         standalone = b.value;
                     }
                 }
-                "styles" | "styleUrl" | "styleUrls" => {
+                "styles" => {
                     let start = prop.value.span().start as usize;
                     let end = prop.value.span().end as usize;
                     if start < source.len() && end <= source.len() {
                         styles_source = Some(source[start..end].to_string());
+                    }
+                    // Also parse each element into a structured list so the
+                    // preprocessor step can operate on raw content rather than
+                    // the JS source text.
+                    match &prop.value {
+                        Expression::ArrayExpression(arr) => {
+                            for elem in &arr.elements {
+                                match elem {
+                                    oxc_ast::ast::ArrayExpressionElement::TemplateLiteral(tpl) => {
+                                        if tpl.expressions.is_empty() {
+                                            let text: String = tpl
+                                                .quasis
+                                                .iter()
+                                                .map(|q| q.value.raw.as_str())
+                                                .collect();
+                                            inline_styles.push(text);
+                                        }
+                                    }
+                                    oxc_ast::ast::ArrayExpressionElement::StringLiteral(s) => {
+                                        inline_styles.push(s.value.to_string());
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Expression::StringLiteral(s) => {
+                            inline_styles.push(s.value.to_string());
+                        }
+                        Expression::TemplateLiteral(tpl) => {
+                            if tpl.expressions.is_empty() {
+                                let text: String =
+                                    tpl.quasis.iter().map(|q| q.value.raw.as_str()).collect();
+                                inline_styles.push(text);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                "styleUrl" => {
+                    if let Expression::StringLiteral(s) = &prop.value {
+                        style_urls.push(s.value.to_string());
+                    }
+                }
+                "styleUrls" => {
+                    if let Expression::ArrayExpression(arr) = &prop.value {
+                        for elem in &arr.elements {
+                            if let oxc_ast::ast::ArrayExpressionElement::StringLiteral(s) = elem {
+                                style_urls.push(s.value.to_string());
+                            }
+                        }
+                    } else if let Expression::StringLiteral(s) = &prop.value {
+                        // Defensive: single string passed to styleUrls.
+                        style_urls.push(s.value.to_string());
                     }
                 }
                 "imports" => {
@@ -968,6 +1044,8 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
         imports_source,
         imports_identifiers,
         styles_source,
+        inline_styles,
+        style_urls,
     })
 }
 
