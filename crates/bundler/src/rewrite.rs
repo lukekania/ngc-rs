@@ -377,6 +377,18 @@ fn collect_dynamic_import_edits(
                 }
             }
         }
+        // Top-level `function foo() { ... return import('./x'); }` — e.g. the
+        // dependency-resolver helpers emitted by the template-compiler for
+        // `@defer` blocks. Without this arm, `import()` calls inside the body
+        // are never walked and their specifiers never rewritten to chunk
+        // filenames.
+        Statement::FunctionDeclaration(f) => {
+            if let Some(body) = &f.body {
+                for s in &body.statements {
+                    collect_dynamic_import_edits(s, rewrites, edits, dynamic_imports);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -821,6 +833,26 @@ mod tests {
         rewrites.insert("./lazy".to_string(), "chunk-lazy.js".to_string());
         let result = rewrite_module(code, "test.js", &["."], &rewrites).expect("should rewrite");
         assert!(result.code.contains("'./chunk-lazy.js'"));
+        assert_eq!(result.dynamic_imports.len(), 1);
+    }
+
+    #[test]
+    fn test_dynamic_import_in_top_level_function_declaration_is_rewritten() {
+        // The template-compiler emits `@defer` dep resolvers as top-level
+        // function declarations: `function X_DepsFn() { return [import('./y')...]; }`.
+        // The walker must recurse into the body for the `import()` specifier
+        // to be rewritten to the chunk filename.
+        let code =
+            "function App_Defer_0_DepsFn() { return [import('./deferred').then(m => m.D)]; }\n";
+        let mut rewrites = HashMap::new();
+        rewrites.insert("./deferred".to_string(), "chunk-deferred.js".to_string());
+        let result = rewrite_module(code, "test.js", &["."], &rewrites).expect("should rewrite");
+        assert!(
+            result.code.contains("'./chunk-deferred.js'"),
+            "chunk filename should replace the import() specifier: {}",
+            result.code
+        );
+        assert!(!result.code.contains("import('./deferred')"));
         assert_eq!(result.dynamic_imports.len(), 1);
     }
 
