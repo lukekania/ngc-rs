@@ -46,8 +46,8 @@ style_binding = { "[style." ~ style_prop ~ "]" ~ "=" ~ quoted_value }
 attr_binding = { "[attr." ~ attr_name ~ "]" ~ "=" ~ quoted_value }
 static_attribute = { attr_name ~ ("=" ~ quoted_value)? }
 
-event_name = @{ (ASCII_ALPHANUMERIC | "." | "-")+ }
-prop_name = @{ (ASCII_ALPHANUMERIC | "-")+ }
+event_name = @{ (ASCII_ALPHANUMERIC | "." | "-" | "@")+ }
+prop_name = @{ (ASCII_ALPHANUMERIC | "-" | "@")+ }
 class_name = @{ (ASCII_ALPHANUMERIC | "-" | ":" | "_" | "." | "/")+ }
 style_prop = @{ (ASCII_ALPHANUMERIC | "-" | "." | "%")+ }
 attr_name = @{ (ASCII_ALPHANUMERIC | "-" | "_")+ }

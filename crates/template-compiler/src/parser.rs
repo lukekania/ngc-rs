@@ -688,6 +688,51 @@ mod tests {
     }
 
     #[test]
+    fn test_animation_property_binding() {
+        let nodes = parse("<div [@fade]=\"state\"></div>");
+        match &nodes[0] {
+            TemplateNode::Element(e) => match &e.attributes[0] {
+                TemplateAttribute::Property { name, expression } => {
+                    assert_eq!(name, "@fade");
+                    assert_eq!(expression, "state");
+                }
+                _ => panic!("expected property binding for [@fade]"),
+            },
+            _ => panic!("expected element"),
+        }
+    }
+
+    #[test]
+    fn test_animation_listener_done() {
+        let nodes = parse("<div (@fade.done)=\"onDone($event)\"></div>");
+        match &nodes[0] {
+            TemplateNode::Element(e) => match &e.attributes[0] {
+                TemplateAttribute::Event { name, handler } => {
+                    assert_eq!(name, "@fade.done");
+                    assert_eq!(handler, "onDone($event)");
+                }
+                _ => panic!("expected event binding for (@fade.done)"),
+            },
+            _ => panic!("expected element"),
+        }
+    }
+
+    #[test]
+    fn test_animation_listener_start() {
+        let nodes = parse("<div (@fade.start)=\"onStart()\"></div>");
+        match &nodes[0] {
+            TemplateNode::Element(e) => match &e.attributes[0] {
+                TemplateAttribute::Event { name, handler } => {
+                    assert_eq!(name, "@fade.start");
+                    assert_eq!(handler, "onStart()");
+                }
+                _ => panic!("expected event binding for (@fade.start)"),
+            },
+            _ => panic!("expected element"),
+        }
+    }
+
+    #[test]
     fn test_let_with_if() {
         let nodes = parse("@let x = value(); @if (x) { <p>yes</p> }");
         assert_eq!(nodes.len(), 2);
