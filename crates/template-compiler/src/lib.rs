@@ -118,6 +118,7 @@ pub fn generate_template_fn(
         inline_styles: Vec::new(),
         style_urls: Vec::new(),
         input_properties: Vec::new(),
+        animations_source: None,
     };
 
     let ivy_output = codegen::generate_ivy(&extracted, &template_ast)?;

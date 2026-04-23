@@ -202,6 +202,11 @@ pub fn generate_ivy(
         let scoped = scope_component_styles(styles_src);
         dc.push_str(&format!(",\n    styles: {scoped}"));
     }
+    if let Some(ref animations_src) = component.animations_source {
+        // Angular's runtime reads `data.animation` when resolving `@`-prefixed
+        // property/listener bindings through the animation renderer.
+        dc.push_str(&format!(",\n    data: {{ animation: {animations_src} }}"));
+    }
     dc.push_str("\n  })");
 
     // Collect child template functions
@@ -2997,6 +3002,7 @@ mod tests {
             inline_styles: Vec::new(),
             style_urls: Vec::new(),
             input_properties: Vec::new(),
+            animations_source: None,
         }
     }
 
