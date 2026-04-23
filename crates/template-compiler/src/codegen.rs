@@ -2994,6 +2994,8 @@ mod tests {
             angular_core_import_span: None,
             other_angular_core_imports: Vec::new(),
             styles_source: None,
+            inline_styles: Vec::new(),
+            style_urls: Vec::new(),
             input_properties: Vec::new(),
         }
     }

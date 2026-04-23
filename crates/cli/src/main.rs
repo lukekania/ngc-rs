@@ -7,8 +7,10 @@ use colored::Colorize;
 use ngc_bundler::{BundleInput, BundleOptions};
 use ngc_diagnostics::{NgcError, NgcResult};
 use ngc_project_resolver::angular_json::{
-    CrossOrigin, FileReplacement, ResolvedAngularProject, ResolvedAsset, ResolvedStyle,
+    CrossOrigin, FileReplacement, InlineStyleLanguage, ResolvedAngularProject, ResolvedAsset,
+    ResolvedStyle,
 };
+use ngc_template_compiler::{StyleContext, StyleLanguage};
 
 /// Result of the bundled build pipeline.
 #[derive(serde::Serialize)]
@@ -195,7 +197,8 @@ fn run_build(
     // Step 4: Compile Angular decorators (@Component, @Injectable, @Directive, @Pipe, @NgModule)
     let templates_span = tracing::info_span!("template_compile").entered();
     let files: Vec<PathBuf> = file_graph.graph.node_weights().cloned().collect();
-    let compiled = ngc_template_compiler::compile_all_decorators(&files)?;
+    let style_ctx = build_style_context(angular_project.as_ref(), &config_dir);
+    let compiled = ngc_template_compiler::compile_all_decorators_with_styles(&files, &style_ctx)?;
     drop(templates_span);
 
     // Report any JIT fallbacks
@@ -679,10 +682,14 @@ fn generate_polyfills(polyfills: &[String], out_dir: &Path) -> NgcResult<PathBuf
     Ok(path)
 }
 
-/// Read and concatenate global CSS style files, writing dist/styles.css.
+/// Read and concatenate global style files, writing dist/styles.css.
 ///
-/// Resolves CSS `@import` directives that reference npm packages (e.g.
-/// `@import "tailwindcss"`) by looking up the package in `node_modules`.
+/// Accepts `.css`, `.scss`, `.sass`, `.less`, and `.styl`/`.stylus` files.
+/// Non-CSS entries are preprocessed through the appropriate Node subprocess
+/// (`sass` / `less` / `stylus`) before concatenation. After concatenation,
+/// CSS `@import` directives that reference npm packages (e.g.
+/// `@import "tailwindcss"`) are resolved by looking up the package in
+/// `node_modules`.
 fn extract_global_styles(
     styles: &[ResolvedStyle],
     out_dir: &Path,
@@ -698,16 +705,15 @@ fn extract_global_styles(
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("");
-        if ext != "css" {
-            return Err(NgcError::StyleError {
+        let language = StyleLanguage::from_extension(ext);
+        let content = if language == StyleLanguage::Css {
+            std::fs::read_to_string(&style.path).map_err(|e| NgcError::Io {
                 path: style.path.clone(),
-                message: format!(".{ext} files are not supported — only plain .css in v0.5"),
-            });
-        }
-        let content = std::fs::read_to_string(&style.path).map_err(|e| NgcError::Io {
-            path: style.path.clone(),
-            source: e,
-        })?;
+                source: e,
+            })?
+        } else {
+            ngc_template_compiler::preprocessor::preprocess_file(&style.path, project_root)?
+        };
         if !css.is_empty() {
             css.push('\n');
         }
@@ -1334,6 +1340,42 @@ fn await_postcss(child: std::process::Child) {
                 e
             );
         }
+    }
+}
+
+/// Build the [`StyleContext`] used by the template compiler for component
+/// style preprocessing.
+///
+/// `project_root` points at the directory containing `node_modules`, which
+/// defaults to the tsconfig's directory (`config_dir`) but is overridden by
+/// the `angular.json` project root when present — that is where
+/// `@angular/build:application` looks for style preprocessor packages.
+fn build_style_context(
+    angular_project: Option<&ResolvedAngularProject>,
+    config_dir: &Path,
+) -> StyleContext {
+    let project_root = angular_project
+        .map(|ap| ap.root.clone())
+        .unwrap_or_else(|| config_dir.to_path_buf());
+    let inline_style_language = angular_project
+        .map(|ap| inline_language_to_style_language(ap.inline_style_language))
+        .unwrap_or(StyleLanguage::Css);
+    StyleContext {
+        project_root,
+        inline_style_language,
+    }
+}
+
+/// Bridge `ngc_project_resolver`'s `InlineStyleLanguage` to the
+/// `ngc_template_compiler`'s `StyleLanguage`. The two enums are intentionally
+/// separate so template-compiler doesn't depend on project-resolver.
+fn inline_language_to_style_language(lang: InlineStyleLanguage) -> StyleLanguage {
+    match lang {
+        InlineStyleLanguage::Css => StyleLanguage::Css,
+        InlineStyleLanguage::Scss => StyleLanguage::Scss,
+        InlineStyleLanguage::Sass => StyleLanguage::Sass,
+        InlineStyleLanguage::Less => StyleLanguage::Less,
+        InlineStyleLanguage::Stylus => StyleLanguage::Stylus,
     }
 }
 

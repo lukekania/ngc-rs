@@ -81,6 +81,10 @@ pub struct RawBuildOptions {
     pub cross_origin: Option<String>,
     /// Whether to compute and inject SRI `integrity` attributes.
     pub subresource_integrity: Option<bool>,
+    /// Language for inline component styles: `css` (default), `scss`, `sass`,
+    /// `less`, or `stylus`. Used when a component uses a `styles: [...]`
+    /// literal rather than `styleUrl`/`styleUrls`.
+    pub inline_style_language: Option<String>,
 }
 
 /// Output path can be a simple string or an object for SSR setups.
@@ -268,6 +272,40 @@ pub struct ResolvedAngularProject {
     pub cross_origin: CrossOrigin,
     /// Whether SRI `integrity` attributes should be injected.
     pub subresource_integrity: bool,
+    /// Language for inline component `styles: [\`...\`]` literals.
+    pub inline_style_language: InlineStyleLanguage,
+}
+
+/// Language applied to inline component `styles: [\`...\`]` literals when no
+/// `styleUrl`/`styleUrls` are present. Mirrors `@angular/build:application`
+/// `inlineStyleLanguage`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InlineStyleLanguage {
+    /// Plain CSS — no preprocessing.
+    #[default]
+    Css,
+    /// SCSS (indented `scss`) via the `sass` npm package.
+    Scss,
+    /// Sass (original indented syntax) via the `sass` npm package.
+    Sass,
+    /// Less via the `less` npm package.
+    Less,
+    /// Stylus via the `stylus` npm package.
+    Stylus,
+}
+
+impl InlineStyleLanguage {
+    /// Parse from the `angular.json` string value. Unknown or missing values
+    /// default to `Css`.
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.map(|s| s.to_ascii_lowercase()).as_deref() {
+            Some("scss") => InlineStyleLanguage::Scss,
+            Some("sass") => InlineStyleLanguage::Sass,
+            Some("less") => InlineStyleLanguage::Less,
+            Some("stylus") => InlineStyleLanguage::Stylus,
+            _ => InlineStyleLanguage::Css,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -412,6 +450,8 @@ pub fn resolve_angular_project(
         .and_then(|bc| bc.subresource_integrity)
         .or_else(|| options.and_then(|o| o.subresource_integrity))
         .unwrap_or(false);
+    let inline_style_language =
+        InlineStyleLanguage::parse(options.and_then(|o| o.inline_style_language.as_deref()));
 
     debug!(
         project = %name,
@@ -437,6 +477,7 @@ pub fn resolve_angular_project(
         deploy_url,
         cross_origin,
         subresource_integrity,
+        inline_style_language,
     })
 }
 
@@ -830,6 +871,76 @@ mod tests {
         let result = resolve_angular_project(f.path(), None, Some("production")).unwrap();
         assert_eq!(result.base_href.as_deref(), Some("/prod/"));
         assert!(result.subresource_integrity);
+    }
+
+    #[test]
+    fn test_parse_inline_style_language() {
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "architect": {
+                        "build": {
+                            "options": {
+                                "outputPath": "dist",
+                                "tsConfig": "tsconfig.json",
+                                "inlineStyleLanguage": "scss"
+                            }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let result = resolve_angular_project(f.path(), None, None).unwrap();
+        assert_eq!(result.inline_style_language, InlineStyleLanguage::Scss);
+    }
+
+    #[test]
+    fn test_inline_style_language_defaults_to_css() {
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "architect": {
+                        "build": {
+                            "options": { "outputPath": "dist", "tsConfig": "tsconfig.json" }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let result = resolve_angular_project(f.path(), None, None).unwrap();
+        assert_eq!(result.inline_style_language, InlineStyleLanguage::Css);
+    }
+
+    #[test]
+    fn test_inline_style_language_less_and_stylus() {
+        for (raw, expected) in [
+            ("less", InlineStyleLanguage::Less),
+            ("stylus", InlineStyleLanguage::Stylus),
+            ("sass", InlineStyleLanguage::Sass),
+        ] {
+            let json = format!(
+                r#"{{
+                    "projects": {{
+                        "app": {{
+                            "architect": {{
+                                "build": {{
+                                    "options": {{
+                                        "outputPath": "dist",
+                                        "tsConfig": "tsconfig.json",
+                                        "inlineStyleLanguage": "{raw}"
+                                    }}
+                                }}
+                            }}
+                        }}
+                    }}
+                }}"#
+            );
+            let f = write_temp_json(&json);
+            let result = resolve_angular_project(f.path(), None, None).unwrap();
+            assert_eq!(result.inline_style_language, expected);
+        }
     }
 
     #[test]

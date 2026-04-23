@@ -14,6 +14,7 @@ mod injectable_codegen;
 mod ng_module_codegen;
 mod parser;
 mod pipe_codegen;
+pub mod preprocessor;
 mod rewrite;
 mod selector;
 
@@ -22,6 +23,34 @@ use std::path::{Path, PathBuf};
 use ngc_diagnostics::{NgcError, NgcResult};
 use rayon::prelude::*;
 use tracing::debug;
+
+pub use preprocessor::StyleLanguage;
+
+/// Context needed to preprocess component styles.
+///
+/// Threaded through `compile_all_decorators_with_styles` so that SCSS / Less /
+/// Stylus subprocesses can locate `node_modules` (via `project_root`) and so
+/// that inline `styles: [\`...\`]` literals are interpreted against the
+/// configured `inlineStyleLanguage` from `angular.json`.
+#[derive(Debug, Clone)]
+pub struct StyleContext {
+    /// Directory that contains `node_modules` — usually the project root
+    /// (the directory containing `angular.json`).
+    pub project_root: PathBuf,
+    /// `inlineStyleLanguage` from `angular.json`, applied to bodies of
+    /// `styles: [\`...\`]` array entries. File-based `styleUrl`/`styleUrls`
+    /// entries always derive their language from the file extension.
+    pub inline_style_language: StyleLanguage,
+}
+
+impl Default for StyleContext {
+    fn default() -> Self {
+        Self {
+            project_root: PathBuf::from("."),
+            inline_style_language: StyleLanguage::Css,
+        }
+    }
+}
 
 /// Lightweight metadata for template compilation without `ExtractedComponent`.
 ///
@@ -86,6 +115,8 @@ pub fn generate_template_fn(
         angular_core_import_span: None,
         other_angular_core_imports: Vec::new(),
         styles_source: meta.styles_source.clone(),
+        inline_styles: Vec::new(),
+        style_urls: Vec::new(),
         input_properties: Vec::new(),
     };
 
@@ -202,7 +233,18 @@ pub struct CompiledFile {
 /// Files without Angular decorators are returned unchanged.
 ///
 /// Files are processed in parallel using rayon.
+///
+/// Uses a default style context (no preprocessing). Callers that need SCSS /
+/// Less / Stylus support should use [`compile_all_decorators_with_styles`].
 pub fn compile_all_decorators(files: &[PathBuf]) -> NgcResult<Vec<CompiledFile>> {
+    compile_all_decorators_with_styles(files, &StyleContext::default())
+}
+
+/// Variant of [`compile_all_decorators`] that preprocesses component styles.
+pub fn compile_all_decorators_with_styles(
+    files: &[PathBuf],
+    style_ctx: &StyleContext,
+) -> NgcResult<Vec<CompiledFile>> {
     let results: Vec<NgcResult<CompiledFile>> = files
         .par_iter()
         .map(|file_path| {
@@ -211,7 +253,7 @@ pub fn compile_all_decorators(files: &[PathBuf]) -> NgcResult<Vec<CompiledFile>>
                 source: e,
             })?;
 
-            compile_file(&source, file_path)
+            compile_file(&source, file_path, style_ctx)
         })
         .collect();
 
@@ -228,9 +270,13 @@ pub fn compile_templates(files: &[PathBuf]) -> NgcResult<Vec<CompiledFile>> {
 /// Tries `@Component` first, then falls through to `@Injectable`, `@Directive`,
 /// `@Pipe`, and `@NgModule`. Returns the source unchanged if no Angular decorator
 /// is found.
-fn compile_file(source: &str, file_path: &Path) -> NgcResult<CompiledFile> {
+fn compile_file(
+    source: &str,
+    file_path: &Path,
+    style_ctx: &StyleContext,
+) -> NgcResult<CompiledFile> {
     // Try @Component first (most complex, has template compilation)
-    let component_result = compile_component(source, file_path)?;
+    let component_result = compile_component_with_styles(source, file_path, style_ctx)?;
     if component_result.compiled || component_result.jit_fallback {
         return Ok(component_result);
     }
@@ -296,13 +342,99 @@ fn compile_file(source: &str, file_path: &Path) -> NgcResult<CompiledFile> {
     })
 }
 
+/// Resolve `styleUrl`/`styleUrls` from disk, preprocess them plus any inline
+/// `styles: [\`...\`]` entries according to `style_ctx.inline_style_language`,
+/// and rewrite `extracted.styles_source` to a template-literal array of
+/// compiled CSS.
+///
+/// Has no effect for components that only use plain CSS and have no
+/// `styleUrl`/`styleUrls` — the existing raw `styles_source` flows through
+/// unchanged and the PostCSS-style %COMP% scoping works as before.
+fn preprocess_component_styles(
+    extracted: &mut extract::ExtractedComponent,
+    file_path: &Path,
+    style_ctx: &StyleContext,
+) -> NgcResult<()> {
+    let needs_url_resolution = !extracted.style_urls.is_empty();
+    let inline_needs_preproc = style_ctx.inline_style_language != StyleLanguage::Css
+        && !extracted.inline_styles.is_empty();
+
+    if !needs_url_resolution && !inline_needs_preproc {
+        return Ok(());
+    }
+
+    let base_dir = file_path.parent().unwrap_or(Path::new("."));
+    let mut compiled: Vec<String> =
+        Vec::with_capacity(extracted.inline_styles.len() + extracted.style_urls.len());
+
+    // Preprocess inline styles under inlineStyleLanguage.
+    for src in &extracted.inline_styles {
+        let css = preprocessor::preprocess_style(
+            src,
+            style_ctx.inline_style_language,
+            &style_ctx.project_root,
+            file_path,
+        )?;
+        compiled.push(css);
+    }
+
+    // Resolve + preprocess each styleUrl/styleUrls entry.
+    for url in &extracted.style_urls {
+        let path = base_dir.join(url);
+        let content = std::fs::read_to_string(&path).map_err(|e| NgcError::Io {
+            path: path.clone(),
+            source: e,
+        })?;
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        let language = StyleLanguage::from_extension(ext);
+        let css =
+            preprocessor::preprocess_style(&content, language, &style_ctx.project_root, &path)?;
+        compiled.push(css);
+    }
+
+    // Synthesize a JS array literal of backtick-quoted CSS strings. Any
+    // existing backticks in the CSS are escaped so the emitted source parses.
+    let mut arr = String::from("[");
+    for (i, css) in compiled.iter().enumerate() {
+        if i > 0 {
+            arr.push_str(", ");
+        }
+        arr.push('`');
+        for ch in css.chars() {
+            match ch {
+                '`' => arr.push_str("\\`"),
+                '\\' => arr.push_str("\\\\"),
+                '$' => arr.push_str("\\$"),
+                _ => arr.push(ch),
+            }
+        }
+        arr.push('`');
+    }
+    arr.push(']');
+    extracted.styles_source = Some(arr);
+    Ok(())
+}
+
 /// Compile a single TypeScript source string containing an Angular component.
 ///
 /// If the source contains an `@Component` decorator with an inline `template`,
 /// parses the template, generates Ivy instructions, and rewrites the source.
 /// If no `@Component` is found, returns the source unchanged.
+///
+/// Uses a default style context (no preprocessing). For SCSS / Less / Stylus
+/// component styles, use [`compile_component_with_styles`].
 pub fn compile_component(source: &str, file_path: &Path) -> NgcResult<CompiledFile> {
-    let extracted = match extract::extract_component(source, file_path)? {
+    compile_component_with_styles(source, file_path, &StyleContext::default())
+}
+
+/// Variant of [`compile_component`] that preprocesses SCSS / Less / Stylus
+/// component styles into CSS before codegen emits the `styles:` array.
+pub fn compile_component_with_styles(
+    source: &str,
+    file_path: &Path,
+    style_ctx: &StyleContext,
+) -> NgcResult<CompiledFile> {
+    let mut extracted = match extract::extract_component(source, file_path)? {
         Some(ext) => ext,
         None => {
             return Ok(CompiledFile {
@@ -327,6 +459,11 @@ pub fn compile_component(source: &str, file_path: &Path) -> NgcResult<CompiledFi
             jit_fallback: true,
         });
     }
+
+    // Resolve + preprocess any non-CSS component styles. Rewrites
+    // `extracted.styles_source` to a template-literal array of compiled CSS so
+    // that codegen + CSS scoping proceed unchanged.
+    preprocess_component_styles(&mut extracted, file_path, style_ctx)?;
 
     // Resolve template source: inline template or external templateUrl
     let resolved_template;
@@ -564,7 +701,7 @@ export class SidenavComponent implements OnInit {
 }
 "#;
         let path = PathBuf::from("test.component.ts");
-        let result = compile_file(source, &path).expect("should compile");
+        let result = compile_file(source, &path, &StyleContext::default()).expect("should compile");
         assert!(result.compiled, "should be compiled");
         assert!(
             !result.source.contains("@Component"),
@@ -593,7 +730,7 @@ export class AuthService {
 }
 "#;
         let path = PathBuf::from("auth.service.ts");
-        let result = compile_file(source, &path).expect("should compile");
+        let result = compile_file(source, &path, &StyleContext::default()).expect("should compile");
         assert!(result.compiled, "should be compiled");
         assert!(result.source.contains("\u{0275}prov"));
         assert!(result.source.contains("\u{0275}\u{0275}defineInjectable"));
@@ -620,7 +757,7 @@ export class DataService {
 }
 "#;
         let path = PathBuf::from("data.service.ts");
-        let result = compile_file(source, &path).expect("should compile");
+        let result = compile_file(source, &path, &StyleContext::default()).expect("should compile");
         assert!(result.compiled);
         assert!(result.source.contains("\u{0275}\u{0275}inject(HttpClient)"));
         assert!(result.source.contains("\u{0275}\u{0275}inject(Router)"));
@@ -647,7 +784,7 @@ export class HighlightDirective {
 }
 "#;
         let path = PathBuf::from("highlight.directive.ts");
-        let result = compile_file(source, &path).expect("should compile");
+        let result = compile_file(source, &path, &StyleContext::default()).expect("should compile");
         assert!(result.compiled);
         assert!(result.source.contains("\u{0275}dir"));
         assert!(result.source.contains("\u{0275}\u{0275}defineDirective"));
@@ -676,7 +813,7 @@ export class DateFormatPipe implements PipeTransform {
 }
 "#;
         let path = PathBuf::from("date-format.pipe.ts");
-        let result = compile_file(source, &path).expect("should compile");
+        let result = compile_file(source, &path, &StyleContext::default()).expect("should compile");
         assert!(result.compiled);
         assert!(result.source.contains("\u{0275}pipe"));
         assert!(result.source.contains("\u{0275}\u{0275}definePipe"));
@@ -704,7 +841,7 @@ export class DateFormatPipe implements PipeTransform {
 export class AppModule {}
 "#;
         let path = PathBuf::from("app.module.ts");
-        let result = compile_file(source, &path).expect("should compile");
+        let result = compile_file(source, &path, &StyleContext::default()).expect("should compile");
         assert!(result.compiled);
         assert!(result.source.contains("\u{0275}mod"));
         assert!(result.source.contains("\u{0275}inj"));
@@ -725,7 +862,7 @@ export class AppModule {}
     fn test_plain_class_unchanged() {
         let source = "export class PlainClass { x = 1; }\n";
         let path = PathBuf::from("plain.ts");
-        let result = compile_file(source, &path).expect("should compile");
+        let result = compile_file(source, &path, &StyleContext::default()).expect("should compile");
         assert!(!result.compiled);
         assert_eq!(result.source, source);
     }
@@ -914,7 +1051,7 @@ export class TestComponent {
 export class IconComponent {}
 "#;
         let path = PathBuf::from("icon.component.ts");
-        let result = compile_file(source, &path).expect("should compile");
+        let result = compile_file(source, &path, &StyleContext::default()).expect("should compile");
         assert!(result.compiled, "should be compiled");
 
         let out = &result.source;

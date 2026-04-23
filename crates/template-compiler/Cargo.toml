@@ -22,3 +22,5 @@ tracing = "0.1"
 ngc-project-resolver = { path = "../project-resolver" }
 ngc-ts-transform = { path = "../ts-transform" }
 insta = { version = "1.46", features = ["glob"] }
+tempfile = "3"
+which = "8"
