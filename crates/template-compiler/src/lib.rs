@@ -10,6 +10,7 @@ mod codegen;
 mod directive_codegen;
 mod extract;
 mod factory_codegen;
+mod i18n;
 mod injectable_codegen;
 mod ng_module_codegen;
 mod parser;
