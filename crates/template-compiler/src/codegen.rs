@@ -3536,6 +3536,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_animation_property_binding_codegen() {
+        let output = compile_template("<div [@fade]=\"state\"></div>");
+        let dc = &output.static_fields[0];
+        assert!(
+            dc.contains("\u{0275}\u{0275}property('@fade', ctx.state)"),
+            "expected ɵɵproperty('@fade', ctx.state): {dc}"
+        );
+        assert!(output.ivy_imports.contains("\u{0275}\u{0275}property"));
+    }
+
+    #[test]
+    fn test_animation_listener_done_codegen() {
+        let output = compile_template("<div (@fade.done)=\"onDone($event)\"></div>");
+        let dc = &output.static_fields[0];
+        assert!(
+            dc.contains("\u{0275}\u{0275}listener('@fade.done'"),
+            "expected ɵɵlistener('@fade.done', ...): {dc}"
+        );
+        assert!(
+            dc.contains("ctx.onDone($event)"),
+            "listener body should call ctx.onDone($event): {dc}"
+        );
+        assert!(output.ivy_imports.contains("\u{0275}\u{0275}listener"));
+    }
+
+    #[test]
+    fn test_animation_listener_start_codegen() {
+        let output = compile_template("<div (@fade.start)=\"onStart()\"></div>");
+        let dc = &output.static_fields[0];
+        assert!(
+            dc.contains("\u{0275}\u{0275}listener('@fade.start'"),
+            "expected ɵɵlistener('@fade.start', ...): {dc}"
+        );
+    }
+
     fn collect_pipe_slot_offsets(code: &str) -> Vec<u32> {
         let mut out = Vec::new();
         for marker in [
