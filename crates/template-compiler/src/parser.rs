@@ -55,6 +55,7 @@ fn parse_node(pair: pest::iterators::Pair<Rule>) -> NgcResult<Option<TemplateNod
         Rule::for_block => Ok(Some(parse_for_block(pair)?)),
         Rule::switch_block => Ok(Some(parse_switch_block(pair)?)),
         Rule::let_block => Ok(Some(parse_let_block(pair)?)),
+        Rule::defer_block => Ok(Some(parse_defer_block(pair)?)),
         Rule::node => {
             let inner = pair.into_inner().next();
             match inner {
@@ -505,6 +506,136 @@ fn parse_let_block(pair: pest::iterators::Pair<Rule>) -> NgcResult<TemplateNode>
     ))
 }
 
+/// Parse an `@defer { ... } @placeholder { ... } @loading { ... } @error { ... }`.
+fn parse_defer_block(pair: pest::iterators::Pair<Rule>) -> NgcResult<TemplateNode> {
+    let mut triggers: Vec<crate::ast::DeferTrigger> = Vec::new();
+    let mut prefetch_triggers: Vec<crate::ast::DeferTrigger> = Vec::new();
+    let mut children = Vec::new();
+    let mut placeholder = None;
+    let mut loading = None;
+    let mut error = None;
+
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::defer_triggers => {
+                for trig_pair in inner.into_inner() {
+                    if trig_pair.as_rule() != Rule::defer_trigger {
+                        continue;
+                    }
+                    let (is_prefetch, trig) = parse_defer_trigger(trig_pair);
+                    if let Some(t) = trig {
+                        if is_prefetch {
+                            prefetch_triggers.push(t);
+                        } else {
+                            triggers.push(t);
+                        }
+                    }
+                }
+            }
+            Rule::placeholder_block => {
+                placeholder = Some(parse_defer_sub_children(inner)?);
+            }
+            Rule::loading_block => {
+                loading = Some(parse_defer_sub_children(inner)?);
+            }
+            Rule::error_block => {
+                error = Some(parse_defer_sub_children(inner)?);
+            }
+            _ => {
+                if let Some(node) = parse_node(inner)? {
+                    children.push(node);
+                }
+            }
+        }
+    }
+
+    Ok(TemplateNode::DeferBlock(crate::ast::DeferBlockNode {
+        triggers,
+        prefetch_triggers,
+        children,
+        placeholder,
+        loading,
+        error,
+    }))
+}
+
+/// Parse a single `defer_trigger` pair. Returns `(is_prefetch, trigger)`.
+fn parse_defer_trigger(
+    pair: pest::iterators::Pair<Rule>,
+) -> (bool, Option<crate::ast::DeferTrigger>) {
+    let mut is_prefetch = false;
+    let mut trigger: Option<crate::ast::DeferTrigger> = None;
+    for sub in pair.into_inner() {
+        match sub.as_rule() {
+            Rule::defer_prefetch => is_prefetch = true,
+            Rule::defer_on => {
+                for on_child in sub.into_inner() {
+                    trigger = match on_child.as_rule() {
+                        Rule::on_viewport => Some(crate::ast::DeferTrigger::Viewport(
+                            extract_trigger_ref(on_child),
+                        )),
+                        Rule::on_idle => Some(crate::ast::DeferTrigger::Idle),
+                        Rule::on_immediate => Some(crate::ast::DeferTrigger::Immediate),
+                        Rule::on_hover => Some(crate::ast::DeferTrigger::Hover(
+                            extract_trigger_ref(on_child),
+                        )),
+                        Rule::on_interaction => Some(crate::ast::DeferTrigger::Interaction(
+                            extract_trigger_ref(on_child),
+                        )),
+                        Rule::timer_trigger => {
+                            let duration = on_child
+                                .into_inner()
+                                .next()
+                                .map(|p| p.as_str().trim().to_string())
+                                .unwrap_or_default();
+                            Some(crate::ast::DeferTrigger::Timer(duration))
+                        }
+                        _ => trigger,
+                    };
+                    if trigger.is_some() {
+                        break;
+                    }
+                }
+            }
+            Rule::defer_when => {
+                let expr = sub
+                    .into_inner()
+                    .next()
+                    .map(|p| p.as_str().trim().to_string())
+                    .unwrap_or_default();
+                trigger = Some(crate::ast::DeferTrigger::When(expr));
+            }
+            _ => {}
+        }
+    }
+    (is_prefetch, trigger)
+}
+
+/// Extract the optional `(triggerRef)` identifier from a viewport / hover /
+/// interaction on-trigger pair. Returns `None` when the trigger is used in
+/// keyword-only form.
+fn extract_trigger_ref(pair: pest::iterators::Pair<Rule>) -> Option<String> {
+    pair.into_inner()
+        .find(|p| p.as_rule() == Rule::trigger_ref)
+        .and_then(|tr| tr.into_inner().next())
+        .map(|id| id.as_str().to_string())
+}
+
+/// Parse the children of a `@placeholder`/`@loading`/`@error` sub-block,
+/// skipping any `defer_args` option list that precedes the body.
+fn parse_defer_sub_children(pair: pest::iterators::Pair<Rule>) -> NgcResult<Vec<TemplateNode>> {
+    let mut nodes = Vec::new();
+    for inner in pair.into_inner() {
+        if inner.as_rule() == Rule::defer_args {
+            continue;
+        }
+        if let Some(node) = parse_node(inner)? {
+            nodes.push(node);
+        }
+    }
+    Ok(nodes)
+}
+
 /// Extract the text content from an expression pair, handling nested rules.
 fn extract_expression_text(pair: pest::iterators::Pair<Rule>) -> String {
     // For ctrl_expression and track_expression, the text comes from
@@ -767,5 +898,127 @@ mod tests {
         assert_eq!(nodes.len(), 2);
         assert!(matches!(&nodes[0], TemplateNode::LetDeclaration(_)));
         assert!(matches!(&nodes[1], TemplateNode::IfBlock(_)));
+    }
+
+    #[test]
+    fn test_defer_block_without_triggers() {
+        let nodes = parse("@defer { <my-comp /> }");
+        assert_eq!(nodes.len(), 1);
+        match &nodes[0] {
+            TemplateNode::DeferBlock(b) => {
+                assert!(b.triggers.is_empty());
+                assert!(b.prefetch_triggers.is_empty());
+                assert_eq!(b.children.len(), 1);
+                assert!(b.placeholder.is_none());
+            }
+            _ => panic!("expected defer block"),
+        }
+    }
+
+    #[test]
+    fn test_defer_block_all_on_triggers() {
+        let nodes = parse(
+            "@defer (on viewport; on idle; on hover; on interaction; on immediate; on timer(500ms)) { <d-c /> }",
+        );
+        match &nodes[0] {
+            TemplateNode::DeferBlock(b) => {
+                assert_eq!(b.triggers.len(), 6);
+                assert!(matches!(b.triggers[0], DeferTrigger::Viewport(None)));
+                assert!(matches!(b.triggers[1], DeferTrigger::Idle));
+                assert!(matches!(b.triggers[2], DeferTrigger::Hover(None)));
+                assert!(matches!(b.triggers[3], DeferTrigger::Interaction(None)));
+                assert!(matches!(b.triggers[4], DeferTrigger::Immediate));
+                match &b.triggers[5] {
+                    DeferTrigger::Timer(d) => assert_eq!(d, "500ms"),
+                    _ => panic!("expected timer trigger"),
+                }
+            }
+            _ => panic!("expected defer block"),
+        }
+    }
+
+    #[test]
+    fn test_defer_block_when_trigger() {
+        let nodes = parse("@defer (when isVisible()) { <d-c /> }");
+        match &nodes[0] {
+            TemplateNode::DeferBlock(b) => {
+                assert_eq!(b.triggers.len(), 1);
+                match &b.triggers[0] {
+                    DeferTrigger::When(expr) => assert_eq!(expr, "isVisible()"),
+                    _ => panic!("expected when trigger"),
+                }
+            }
+            _ => panic!("expected defer block"),
+        }
+    }
+
+    #[test]
+    fn test_defer_block_prefetch_trigger() {
+        let nodes = parse("@defer (prefetch on idle; on viewport) { <d-c /> }");
+        match &nodes[0] {
+            TemplateNode::DeferBlock(b) => {
+                assert_eq!(b.prefetch_triggers.len(), 1);
+                assert!(matches!(b.prefetch_triggers[0], DeferTrigger::Idle));
+                assert_eq!(b.triggers.len(), 1);
+                assert!(matches!(b.triggers[0], DeferTrigger::Viewport(None)));
+            }
+            _ => panic!("expected defer block"),
+        }
+    }
+
+    #[test]
+    fn test_defer_on_hover_with_trigger_ref() {
+        let nodes = parse("@defer (on hover(triggerEl)) { <d-c /> }");
+        match &nodes[0] {
+            TemplateNode::DeferBlock(b) => {
+                assert_eq!(b.triggers.len(), 1);
+                match &b.triggers[0] {
+                    DeferTrigger::Hover(Some(r)) => assert_eq!(r, "triggerEl"),
+                    other => panic!("expected Hover(Some(...)), got {other:?}"),
+                }
+            }
+            _ => panic!("expected defer block"),
+        }
+    }
+
+    #[test]
+    fn test_defer_on_viewport_with_trigger_ref() {
+        let nodes = parse("@defer (on viewport(el)) { <d-c /> }");
+        match &nodes[0] {
+            TemplateNode::DeferBlock(b) => match &b.triggers[0] {
+                DeferTrigger::Viewport(Some(r)) => assert_eq!(r, "el"),
+                other => panic!("expected Viewport(Some(...)), got {other:?}"),
+            },
+            _ => panic!("expected defer block"),
+        }
+    }
+
+    #[test]
+    fn test_defer_block_all_sub_blocks() {
+        let nodes = parse(
+            "@defer (on idle) { <d-c /> } @placeholder { <p>wait</p> } @loading { <p>loading</p> } @error { <p>err</p> }",
+        );
+        match &nodes[0] {
+            TemplateNode::DeferBlock(b) => {
+                assert_eq!(b.triggers.len(), 1);
+                assert!(b.placeholder.is_some());
+                assert!(b.loading.is_some());
+                assert!(b.error.is_some());
+            }
+            _ => panic!("expected defer block"),
+        }
+    }
+
+    #[test]
+    fn test_defer_placeholder_with_minimum_option() {
+        let nodes =
+            parse("@defer (on idle) { <d-c /> } @placeholder (minimum 500ms) { <p>wait</p> }");
+        match &nodes[0] {
+            TemplateNode::DeferBlock(b) => {
+                let ph = b.placeholder.as_ref().expect("placeholder");
+                assert_eq!(ph.len(), 1);
+            }
+            _ => panic!("expected defer block"),
+        }
     }
 }

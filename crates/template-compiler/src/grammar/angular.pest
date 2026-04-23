@@ -8,7 +8,7 @@ node = _{ control_flow | let_block | html_comment | element | interpolation | te
 html_comment = { "<!--" ~ (!"-->" ~ ANY)* ~ "-->" }
 
 // Text: anything not starting a tag, interpolation, or control flow keyword
-text = @{ (!("<" | "{{" | "}" | "@if" | "@for" | "@switch" | "@else" | "@case" | "@default" | "@empty" | "@let") ~ ANY)+ }
+text = @{ (!("<" | "{{" | "}" | "@if" | "@for" | "@switch" | "@else" | "@case" | "@default" | "@empty" | "@let" | "@defer" | "@placeholder" | "@loading" | "@error") ~ ANY)+ }
 
 // Text interpolation: {{ expression | pipe }}
 // Handles || (logical OR), balanced parens, and | only as top-level pipe separator
@@ -66,7 +66,7 @@ let_block = { "@let" ~ identifier ~ "=" ~ let_expression ~ ";" }
 let_expression = @{ (!";" ~ ANY)+ }
 
 // Control flow blocks
-control_flow = _{ if_block | for_block | switch_block }
+control_flow = _{ if_block | for_block | switch_block | defer_block }
 
 // @if / @else if / @else
 if_block = { "@if" ~ "(" ~ ctrl_expression ~ ")" ~ "{" ~ node* ~ "}" ~ else_if_block* ~ else_block? }
@@ -95,5 +95,34 @@ switch_block = { "@switch" ~ "(" ~ ctrl_expression ~ ")" ~ "{" ~ switch_body* ~ 
 switch_body = _{ case_block | default_block }
 case_block = { "@case" ~ "(" ~ ctrl_expression ~ ")" ~ "{" ~ node* ~ "}" }
 default_block = { "@default" ~ "{" ~ node* ~ "}" }
+
+// @defer with triggers and @placeholder / @loading / @error sub-blocks
+defer_block = { "@defer" ~ defer_triggers? ~ "{" ~ node* ~ "}" ~ defer_sub_block* }
+defer_triggers = { "(" ~ defer_trigger ~ (";" ~ defer_trigger)* ~ ";"? ~ ")" }
+defer_trigger = { defer_prefetch? ~ (defer_on | defer_when) }
+defer_prefetch = { "prefetch" }
+defer_on = { "on" ~ defer_on_kind }
+defer_on_kind = _{ timer_trigger | on_viewport | on_idle | on_immediate | on_hover | on_interaction }
+// `viewport` / `hover` / `interaction` accept an optional template-reference
+// argument, e.g. `on hover(triggerRef)`. `idle` / `immediate` take none.
+on_viewport = { "viewport" ~ trigger_ref? }
+on_idle = { "idle" }
+on_immediate = { "immediate" }
+on_hover = { "hover" ~ trigger_ref? }
+on_interaction = { "interaction" ~ trigger_ref? }
+trigger_ref = { "(" ~ identifier ~ ")" }
+timer_trigger = { "timer" ~ "(" ~ timer_duration ~ ")" }
+timer_duration = @{ (ASCII_ALPHANUMERIC | "." | "_")+ }
+defer_when = { "when" ~ defer_when_expr }
+defer_when_expr = { when_token+ }
+when_token = _{ when_paren_group | when_char }
+when_paren_group = { "(" ~ (when_paren_group | when_char)* ~ ")" }
+when_char = @{ (!("(" | ")" | ";") ~ ANY)+ }
+
+defer_sub_block = _{ placeholder_block | loading_block | error_block }
+placeholder_block = { "@placeholder" ~ defer_args? ~ "{" ~ node* ~ "}" }
+loading_block = { "@loading" ~ defer_args? ~ "{" ~ node* ~ "}" }
+error_block = { "@error" ~ "{" ~ node* ~ "}" }
+defer_args = { "(" ~ (!")" ~ ANY)* ~ ")" }
 
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }

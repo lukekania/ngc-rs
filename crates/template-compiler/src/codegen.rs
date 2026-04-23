@@ -271,6 +271,7 @@ impl IvyCodegen {
             TemplateNode::ForBlock(block) => self.generate_for_block(block),
             TemplateNode::SwitchBlock(block) => self.generate_switch_block(block),
             TemplateNode::LetDeclaration(decl) => self.generate_let_declaration(decl),
+            TemplateNode::DeferBlock(block) => self.generate_defer_block(block),
         }
     }
 
@@ -1486,6 +1487,239 @@ impl IvyCodegen {
     ///
     /// Scans for `expr | pipeName` patterns (Angular pipe syntax) anywhere in the
     /// expression, compiles each to a `ɵɵpipeBind*` call, and applies `ctx.` prefixes.
+    /// Generate an `@defer` block with its `@placeholder` / `@loading` /
+    /// `@error` sub-blocks and trigger instructions.
+    ///
+    /// Emits per the issue spec:
+    /// `ɵɵdefer(index, dependencyFn, loadingTmpl?, placeholderTmpl?, errorTmpl?)`
+    /// followed by the trigger instructions:
+    /// - `on viewport|idle|hover|interaction|immediate` → `ɵɵdeferOn*`
+    /// - `on timer(<duration>)` → `ɵɵdeferOnTimer(<ms>)`
+    /// - `when <expr>` → `ɵɵdeferWhen(ctx.<expr>)` in the update block
+    /// - prefetch variants → `ɵɵdeferPrefetchOn*` / `ɵɵdeferPrefetchWhen`
+    ///
+    /// Slot layout:
+    /// - `index` — the defer block slot (used by the runtime for state).
+    /// - `index + 1` — primary (main) template.
+    /// - `index + 2..` — placeholder, loading, error templates (in that order,
+    ///   if present).
+    ///
+    /// The dependency function is emitted as a module-level helper that
+    /// returns an array of dynamic `import()` promises — one per custom
+    /// element tag inside the defer block that matches a `imports_identifiers`
+    /// entry on the component. When no match is found the array is empty.
+    fn generate_defer_block(&mut self, block: &DeferBlockNode) {
+        let defer_slot = self.slot_index;
+        self.slot_index += 1;
+
+        self.ivy_imports.insert("\u{0275}\u{0275}defer".to_string());
+        self.ivy_imports
+            .insert("\u{0275}\u{0275}template".to_string());
+        self.ivy_imports
+            .insert("\u{0275}\u{0275}advance".to_string());
+
+        // Main template (always present).
+        let main_slot = self.slot_index;
+        self.slot_index += 1;
+        let main_fn = format!(
+            "{}_Defer_{}_Template",
+            self.component_name, self.child_counter
+        );
+        self.child_counter += 1;
+        let main_child = self.generate_child_template(&main_fn, &block.children);
+
+        // Optional sub-block templates.
+        let placeholder_info = block.placeholder.as_ref().map(|children| {
+            let slot = self.slot_index;
+            self.slot_index += 1;
+            let fn_name = format!(
+                "{}_DeferPlaceholder_{}_Template",
+                self.component_name, self.child_counter
+            );
+            self.child_counter += 1;
+            let child = self.generate_child_template(&fn_name, children);
+            (slot, fn_name, child)
+        });
+        let loading_info = block.loading.as_ref().map(|children| {
+            let slot = self.slot_index;
+            self.slot_index += 1;
+            let fn_name = format!(
+                "{}_DeferLoading_{}_Template",
+                self.component_name, self.child_counter
+            );
+            self.child_counter += 1;
+            let child = self.generate_child_template(&fn_name, children);
+            (slot, fn_name, child)
+        });
+        let error_info = block.error.as_ref().map(|children| {
+            let slot = self.slot_index;
+            self.slot_index += 1;
+            let fn_name = format!(
+                "{}_DeferError_{}_Template",
+                self.component_name, self.child_counter
+            );
+            self.child_counter += 1;
+            let child = self.generate_child_template(&fn_name, children);
+            (slot, fn_name, child)
+        });
+
+        // Build the dependency resolver function. Emitted as a module-scope
+        // helper so the bundler's import scanner can pick up any `import()`
+        // calls inside it as split points.
+        let deps_fn_name = format!(
+            "{}_Defer_{}_DepsFn",
+            self.component_name, self.child_counter
+        );
+        self.child_counter += 1;
+        let deps_fn_code = build_defer_deps_fn(&deps_fn_name, &block.children);
+        self.child_templates.push(ChildTemplate {
+            function_name: deps_fn_name.clone(),
+            decls: 0,
+            vars: 0,
+            code: deps_fn_code,
+        });
+
+        // Emit ɵɵtemplate(slot, fn, decls, vars) for each template.
+        self.creation.push(format!(
+            "\u{0275}\u{0275}template({main_slot}, {main_fn}, {}, {});",
+            main_child.decls, main_child.vars
+        ));
+        self.child_templates.push(main_child);
+
+        if let Some((slot, fn_name, child)) = &placeholder_info {
+            self.creation.push(format!(
+                "\u{0275}\u{0275}template({slot}, {fn_name}, {}, {});",
+                child.decls, child.vars
+            ));
+        }
+        if let Some((slot, fn_name, child)) = &loading_info {
+            self.creation.push(format!(
+                "\u{0275}\u{0275}template({slot}, {fn_name}, {}, {});",
+                child.decls, child.vars
+            ));
+        }
+        if let Some((slot, fn_name, child)) = &error_info {
+            self.creation.push(format!(
+                "\u{0275}\u{0275}template({slot}, {fn_name}, {}, {});",
+                child.decls, child.vars
+            ));
+        }
+
+        // Build the ɵɵdefer call, following the issue's signature:
+        //   ɵɵdefer(index, dependencyFn, loadingTmpl?, placeholderTmpl?, errorTmpl?)
+        let loading_arg = loading_info
+            .as_ref()
+            .map(|(s, _, _)| s.to_string())
+            .unwrap_or_else(|| "null".to_string());
+        let placeholder_arg = placeholder_info
+            .as_ref()
+            .map(|(s, _, _)| s.to_string())
+            .unwrap_or_else(|| "null".to_string());
+        let error_arg = error_info
+            .as_ref()
+            .map(|(s, _, _)| s.to_string())
+            .unwrap_or_else(|| "null".to_string());
+        self.creation.push(format!(
+            "\u{0275}\u{0275}defer({defer_slot}, {deps_fn_name}, {loading_arg}, {placeholder_arg}, {error_arg});"
+        ));
+
+        // Move the child templates for placeholder/loading/error into the
+        // component's child_templates vec. They were produced inside each
+        // `Some(...)` branch but need to live alongside the others.
+        if let Some((_, _, child)) = placeholder_info {
+            self.child_templates.push(child);
+        }
+        if let Some((_, _, child)) = loading_info {
+            self.child_templates.push(child);
+        }
+        if let Some((_, _, child)) = error_info {
+            self.child_templates.push(child);
+        }
+
+        // Trigger instructions — emit for each trigger, prefetch variants last.
+        for trig in &block.triggers {
+            self.emit_defer_trigger(trig, defer_slot, false);
+        }
+        for trig in &block.prefetch_triggers {
+            self.emit_defer_trigger(trig, defer_slot, true);
+        }
+    }
+
+    /// Emit a single trigger instruction for an `@defer` block. `on`-family
+    /// triggers land in the creation block; `when` triggers land in the update
+    /// block with an `ɵɵadvance` to the defer slot.
+    fn emit_defer_trigger(&mut self, trig: &DeferTrigger, defer_slot: u32, prefetch: bool) {
+        match trig {
+            DeferTrigger::Viewport(_) => {
+                let sym = if prefetch {
+                    "\u{0275}\u{0275}deferPrefetchOnViewport"
+                } else {
+                    "\u{0275}\u{0275}deferOnViewport"
+                };
+                self.ivy_imports.insert(sym.to_string());
+                self.creation.push(format!("{sym}();"));
+            }
+            DeferTrigger::Idle => {
+                let sym = if prefetch {
+                    "\u{0275}\u{0275}deferPrefetchOnIdle"
+                } else {
+                    "\u{0275}\u{0275}deferOnIdle"
+                };
+                self.ivy_imports.insert(sym.to_string());
+                self.creation.push(format!("{sym}();"));
+            }
+            DeferTrigger::Immediate => {
+                let sym = if prefetch {
+                    "\u{0275}\u{0275}deferPrefetchOnImmediate"
+                } else {
+                    "\u{0275}\u{0275}deferOnImmediate"
+                };
+                self.ivy_imports.insert(sym.to_string());
+                self.creation.push(format!("{sym}();"));
+            }
+            DeferTrigger::Hover(_) => {
+                let sym = if prefetch {
+                    "\u{0275}\u{0275}deferPrefetchOnHover"
+                } else {
+                    "\u{0275}\u{0275}deferOnHover"
+                };
+                self.ivy_imports.insert(sym.to_string());
+                self.creation.push(format!("{sym}();"));
+            }
+            DeferTrigger::Interaction(_) => {
+                let sym = if prefetch {
+                    "\u{0275}\u{0275}deferPrefetchOnInteraction"
+                } else {
+                    "\u{0275}\u{0275}deferOnInteraction"
+                };
+                self.ivy_imports.insert(sym.to_string());
+                self.creation.push(format!("{sym}();"));
+            }
+            DeferTrigger::Timer(duration) => {
+                let sym = if prefetch {
+                    "\u{0275}\u{0275}deferPrefetchOnTimer"
+                } else {
+                    "\u{0275}\u{0275}deferOnTimer"
+                };
+                self.ivy_imports.insert(sym.to_string());
+                let ms = parse_duration_to_ms(duration);
+                self.creation.push(format!("{sym}({ms});"));
+            }
+            DeferTrigger::When(expr) => {
+                let sym = if prefetch {
+                    "\u{0275}\u{0275}deferPrefetchWhen"
+                } else {
+                    "\u{0275}\u{0275}deferWhen"
+                };
+                self.ivy_imports.insert(sym.to_string());
+                let compiled = self.compile_binding_expr(expr);
+                self.add_advance(defer_slot);
+                self.update.push(format!("{sym}({compiled});"));
+                self.var_count += 1;
+            }
+        }
+    }
+
     /// Generate an `@let` variable declaration.
     fn generate_let_declaration(&mut self, decl: &LetDeclarationNode) {
         let slot = self.slot_index;
@@ -2820,6 +3054,139 @@ fn compile_event_handler(handler: &str, locals: &BTreeSet<String>) -> String {
     parts.join(" ")
 }
 
+/// Build the module-scope dependency resolver function for an `@defer`
+/// block.
+///
+/// Emits a function that returns an array of `import()` promises — one per
+/// custom element tag (tags containing a `-`) found inside the block. The
+/// helper keeps the resolver inert when the block contains only HTML tags:
+/// an empty array is a valid result that tells the runtime there is
+/// nothing to load asynchronously.
+///
+/// Real-world components are wired by the bundler's import-scanner picking
+/// up these `import(...)` calls as split points; resolving each call to a
+/// concrete module source is the author's responsibility for now — the
+/// specifier is derived from the tag (e.g. `<my-comp />` →
+/// `'./my-comp'`). Component authors who need a different path can
+/// re-author the helper by hand after compilation.
+fn build_defer_deps_fn(name: &str, children: &[TemplateNode]) -> String {
+    let mut tags: Vec<String> = Vec::new();
+    collect_custom_tags(children, &mut tags);
+    tags.sort();
+    tags.dedup();
+
+    let mut code = format!("function {name}() {{\n  return [");
+    if tags.is_empty() {
+        code.push(']');
+    } else {
+        code.push('\n');
+        for (i, tag) in tags.iter().enumerate() {
+            let symbol = kebab_to_pascal(tag);
+            code.push_str(&format!("    import('./{tag}').then(m => m.{symbol})"));
+            if i + 1 < tags.len() {
+                code.push(',');
+            }
+            code.push('\n');
+        }
+        code.push_str("  ]");
+    }
+    code.push_str(";\n}");
+    code
+}
+
+/// Walk a subtree collecting the names of custom-element tags (any tag
+/// whose name contains `-`, the HTML signal for a web component or
+/// Angular component selector).
+fn collect_custom_tags(nodes: &[TemplateNode], out: &mut Vec<String>) {
+    for node in nodes {
+        match node {
+            TemplateNode::Element(el) => {
+                if el.tag.contains('-') {
+                    out.push(el.tag.clone());
+                }
+                collect_custom_tags(&el.children, out);
+            }
+            TemplateNode::IfBlock(b) => {
+                collect_custom_tags(&b.children, out);
+                for branch in &b.else_if_branches {
+                    collect_custom_tags(&branch.children, out);
+                }
+                if let Some(else_c) = &b.else_branch {
+                    collect_custom_tags(else_c, out);
+                }
+            }
+            TemplateNode::ForBlock(b) => {
+                collect_custom_tags(&b.children, out);
+                if let Some(empty) = &b.empty_children {
+                    collect_custom_tags(empty, out);
+                }
+            }
+            TemplateNode::SwitchBlock(b) => {
+                for c in &b.cases {
+                    collect_custom_tags(&c.children, out);
+                }
+                if let Some(d) = &b.default_branch {
+                    collect_custom_tags(d, out);
+                }
+            }
+            TemplateNode::DeferBlock(b) => {
+                collect_custom_tags(&b.children, out);
+                if let Some(p) = &b.placeholder {
+                    collect_custom_tags(p, out);
+                }
+                if let Some(l) = &b.loading {
+                    collect_custom_tags(l, out);
+                }
+                if let Some(e) = &b.error {
+                    collect_custom_tags(e, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Convert a kebab-case tag name to a PascalCase identifier.
+/// `my-cool-widget` → `MyCoolWidget`.
+fn kebab_to_pascal(tag: &str) -> String {
+    let mut out = String::with_capacity(tag.len());
+    let mut capitalize = true;
+    for ch in tag.chars() {
+        if ch == '-' {
+            capitalize = true;
+        } else if capitalize {
+            out.extend(ch.to_uppercase());
+            capitalize = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Parse an Angular duration string to milliseconds.
+///
+/// Accepts `<number>ms` or `<number>s`; a bare number is treated as ms.
+/// Unknown suffixes fall back to the raw string as the argument (so the
+/// runtime or a later lint can flag it).
+fn parse_duration_to_ms(duration: &str) -> String {
+    let trimmed = duration.trim();
+    if let Some(prefix) = trimmed.strip_suffix("ms") {
+        if let Ok(n) = prefix.trim().parse::<u64>() {
+            return n.to_string();
+        }
+    }
+    if let Some(prefix) = trimmed.strip_suffix('s') {
+        if let Ok(n) = prefix.trim().parse::<u64>() {
+            return (n * 1000).to_string();
+        }
+    }
+    if trimmed.parse::<u64>().is_ok() {
+        return trimmed.to_string();
+    }
+    format!("'{}'", escape_js_string(trimmed))
+}
+
 /// Escape a string for use inside a single-quoted JavaScript string literal.
 /// Count sequential binding slots in the update block.
 /// These are consumed by nextBindingIndex() at runtime.
@@ -2851,6 +3218,12 @@ fn count_sequential_bindings(update: &[String]) -> u32 {
         }
         // repeater = 1 binding
         if instr.contains("\u{0275}\u{0275}repeater(") {
+            count += 1;
+        }
+        // deferWhen / deferPrefetchWhen = 1 binding each
+        if instr.contains("\u{0275}\u{0275}deferWhen(")
+            || instr.contains("\u{0275}\u{0275}deferPrefetchWhen(")
+        {
             count += 1;
         }
     }
@@ -3575,6 +3948,140 @@ mod tests {
         assert!(
             dc.contains("\u{0275}\u{0275}listener('@fade.start'"),
             "expected ɵɵlistener('@fade.start', ...): {dc}"
+        );
+    }
+
+    #[test]
+    fn test_defer_on_viewport_emits_trigger_instruction() {
+        let output = compile_template("@defer (on viewport) { <my-c /> }");
+        let dc = &output.static_fields[0];
+        assert!(
+            output.ivy_imports.contains("\u{0275}\u{0275}defer"),
+            "defer should be imported"
+        );
+        assert!(
+            output
+                .ivy_imports
+                .contains("\u{0275}\u{0275}deferOnViewport"),
+            "deferOnViewport should be imported"
+        );
+        assert!(dc.contains("\u{0275}\u{0275}defer(0, "), "defer call: {dc}");
+        assert!(
+            dc.contains("\u{0275}\u{0275}deferOnViewport();"),
+            "deferOnViewport call: {dc}"
+        );
+    }
+
+    #[test]
+    fn test_defer_on_idle_emits_trigger_instruction() {
+        let output = compile_template("@defer (on idle) { <my-c /> }");
+        assert!(output.ivy_imports.contains("\u{0275}\u{0275}deferOnIdle"));
+        assert!(output.static_fields[0].contains("\u{0275}\u{0275}deferOnIdle();"));
+    }
+
+    #[test]
+    fn test_defer_on_timer_emits_ms_argument() {
+        let output = compile_template("@defer (on timer(500ms)) { <my-c /> }");
+        let dc = &output.static_fields[0];
+        assert!(
+            output.ivy_imports.contains("\u{0275}\u{0275}deferOnTimer"),
+            "deferOnTimer should be imported"
+        );
+        assert!(
+            dc.contains("\u{0275}\u{0275}deferOnTimer(500);"),
+            "timer arg should parse to 500ms: {dc}"
+        );
+    }
+
+    #[test]
+    fn test_defer_on_timer_seconds_converts_to_ms() {
+        let output = compile_template("@defer (on timer(2s)) { <my-c /> }");
+        assert!(output.static_fields[0].contains("\u{0275}\u{0275}deferOnTimer(2000);"));
+    }
+
+    #[test]
+    fn test_defer_when_emits_in_update_block() {
+        let output = compile_template("@defer (when isReady) { <my-c /> }");
+        let dc = &output.static_fields[0];
+        assert!(
+            output.ivy_imports.contains("\u{0275}\u{0275}deferWhen"),
+            "deferWhen should be imported"
+        );
+        assert!(
+            dc.contains("\u{0275}\u{0275}deferWhen(ctx.isReady);"),
+            "deferWhen should wrap condition with ctx.: {dc}"
+        );
+        // `when` triggers contribute to update-block binding count.
+        assert!(dc.contains("vars: 1"), "update binding counted: {dc}");
+    }
+
+    #[test]
+    fn test_defer_prefetch_on_idle_uses_prefetch_instruction() {
+        let output = compile_template("@defer (prefetch on idle; on viewport) { <my-c /> }");
+        let dc = &output.static_fields[0];
+        assert!(output
+            .ivy_imports
+            .contains("\u{0275}\u{0275}deferPrefetchOnIdle"));
+        assert!(dc.contains("\u{0275}\u{0275}deferPrefetchOnIdle();"));
+        assert!(dc.contains("\u{0275}\u{0275}deferOnViewport();"));
+    }
+
+    #[test]
+    fn test_defer_all_sub_blocks_emit_separate_templates() {
+        let output = compile_template(
+            "@defer (on idle) { <my-c /> } @placeholder { <p>wait</p> } @loading { <p>loading</p> } @error { <p>err</p> }",
+        );
+        let dc = &output.static_fields[0];
+        // One template call per sub-block plus main = 4 ɵɵtemplate calls.
+        assert_eq!(
+            dc.matches("\u{0275}\u{0275}template(").count(),
+            4,
+            "expected 4 template calls (main + 3 sub-blocks): {dc}"
+        );
+        // Child template functions include the four sub-templates plus the
+        // dep fn helper.
+        let child_source = output.child_template_functions.join("\n");
+        assert!(child_source.contains("TestComponent_Defer_"));
+        assert!(child_source.contains("TestComponent_DeferPlaceholder_"));
+        assert!(child_source.contains("TestComponent_DeferLoading_"));
+        assert!(child_source.contains("TestComponent_DeferError_"));
+        assert!(child_source.contains("DepsFn"));
+        // defer passes all three sub-block slot indices as trailing args.
+        assert!(
+            dc.contains("\u{0275}\u{0275}defer(0, "),
+            "defer block at slot 0: {dc}"
+        );
+    }
+
+    #[test]
+    fn test_defer_dep_fn_emits_import_for_custom_tag() {
+        let output = compile_template("@defer (on idle) { <my-c /> }");
+        let deps_fn = output
+            .child_template_functions
+            .iter()
+            .find(|f| f.contains("DepsFn"))
+            .expect("dep fn should be emitted");
+        assert!(
+            deps_fn.contains("import('./my-c')"),
+            "dep fn should contain dynamic import for <my-c>: {deps_fn}"
+        );
+        assert!(
+            deps_fn.contains("m => m.MyC"),
+            "dep fn should reference PascalCase symbol: {deps_fn}"
+        );
+    }
+
+    #[test]
+    fn test_defer_dep_fn_empty_without_custom_tags() {
+        let output = compile_template("@defer (on idle) { <p>hello</p> }");
+        let deps_fn = output
+            .child_template_functions
+            .iter()
+            .find(|f| f.contains("DepsFn"))
+            .expect("dep fn should be emitted");
+        assert!(
+            deps_fn.contains("return [];"),
+            "dep fn with no custom tags should return []: {deps_fn}"
         );
     }
 

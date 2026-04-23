@@ -15,6 +15,8 @@ pub enum TemplateNode {
     SwitchBlock(SwitchBlockNode),
     /// An `@let` variable declaration.
     LetDeclaration(LetDeclarationNode),
+    /// An `@defer` block with optional `@placeholder` / `@loading` / `@error` sub-blocks.
+    DeferBlock(DeferBlockNode),
 }
 
 /// An HTML element node.
@@ -187,4 +189,43 @@ pub struct CaseBranch {
     pub expression: String,
     /// Children rendered when matched.
     pub children: Vec<TemplateNode>,
+}
+
+/// An `@defer` block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeferBlockNode {
+    /// Triggers that fetch and render the deferred content.
+    pub triggers: Vec<DeferTrigger>,
+    /// Triggers with the `prefetch` prefix — fetch without rendering.
+    pub prefetch_triggers: Vec<DeferTrigger>,
+    /// Main deferred content.
+    pub children: Vec<TemplateNode>,
+    /// Optional `@placeholder { ... }` block (rendered before trigger fires).
+    pub placeholder: Option<Vec<TemplateNode>>,
+    /// Optional `@loading { ... }` block (rendered while deferred resources load).
+    pub loading: Option<Vec<TemplateNode>>,
+    /// Optional `@error { ... }` block (rendered if loading fails).
+    pub error: Option<Vec<TemplateNode>>,
+}
+
+/// A single `@defer` trigger. `viewport` / `hover` / `interaction` may carry
+/// an optional template-reference name (e.g. `on hover(triggerRef)`); ngc-rs
+/// records the reference for future wiring but currently emits the keyword-
+/// only form of the runtime instruction.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeferTrigger {
+    /// `on viewport` / `on viewport(ref)`.
+    Viewport(Option<String>),
+    /// `on idle`.
+    Idle,
+    /// `on immediate`.
+    Immediate,
+    /// `on hover` / `on hover(ref)`.
+    Hover(Option<String>),
+    /// `on interaction` / `on interaction(ref)`.
+    Interaction(Option<String>),
+    /// `on timer(<duration>)` — duration stored verbatim (e.g. `500ms`).
+    Timer(String),
+    /// `when <expression>` — expression evaluated each change detection cycle.
+    When(String),
 }
