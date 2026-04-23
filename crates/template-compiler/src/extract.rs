@@ -58,6 +58,10 @@ pub struct ExtractedComponent {
     pub style_urls: Vec<String>,
     /// Property names decorated with `@Input()`.
     pub input_properties: Vec<String>,
+    /// Raw source text of the `animations` array (e.g. `[trigger('fade', [...])]`).
+    /// Passed through to the `defineComponent({ data: { animation: [...] } })`
+    /// field so Angular's runtime can register triggers with the animation renderer.
+    pub animations_source: Option<String>,
 }
 
 impl ExtractedComponent {
@@ -196,6 +200,7 @@ pub fn extract_component(source: &str, file_path: &Path) -> NgcResult<Option<Ext
             inline_styles: metadata.inline_styles,
             style_urls: metadata.style_urls,
             input_properties,
+            animations_source: metadata.animations_source,
         }));
     }
 
@@ -872,6 +877,7 @@ struct DecoratorMetadata {
     styles_source: Option<String>,
     inline_styles: Vec<String>,
     style_urls: Vec<String>,
+    animations_source: Option<String>,
 }
 
 /// Extract metadata from the `@Component({...})` decorator argument.
@@ -889,6 +895,7 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
                 styles_source: None,
                 inline_styles: Vec::new(),
                 style_urls: Vec::new(),
+                animations_source: None,
             });
         }
     };
@@ -906,6 +913,7 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
                 styles_source: None,
                 inline_styles: Vec::new(),
                 style_urls: Vec::new(),
+                animations_source: None,
             });
         }
     };
@@ -919,6 +927,7 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
     let mut styles_source = None;
     let mut inline_styles: Vec<String> = Vec::new();
     let mut style_urls: Vec<String> = Vec::new();
+    let mut animations_source = None;
 
     for prop in &arg.properties {
         if let ObjectPropertyKind::ObjectProperty(prop) = prop {
@@ -1029,6 +1038,13 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
                         }
                     }
                 }
+                "animations" => {
+                    let start = prop.value.span().start as usize;
+                    let end = prop.value.span().end as usize;
+                    if start < source.len() && end <= source.len() {
+                        animations_source = Some(source[start..end].to_string());
+                    }
+                }
                 _ => {}
             }
         }
@@ -1044,6 +1060,7 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
         styles_source,
         inline_styles,
         style_urls,
+        animations_source,
     })
 }
 
