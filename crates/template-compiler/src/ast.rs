@@ -15,6 +15,8 @@ pub enum TemplateNode {
     SwitchBlock(SwitchBlockNode),
     /// An `@let` variable declaration.
     LetDeclaration(LetDeclarationNode),
+    /// An `@defer` block with optional `@placeholder` / `@loading` / `@error` sub-blocks.
+    DeferBlock(DeferBlockNode),
 }
 
 /// An HTML element node.
@@ -187,4 +189,42 @@ pub struct CaseBranch {
     pub expression: String,
     /// Children rendered when matched.
     pub children: Vec<TemplateNode>,
+}
+
+/// An `@defer` block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeferBlockNode {
+    /// Triggers that fetch and render the deferred content.
+    pub triggers: Vec<DeferTrigger>,
+    /// Triggers with the `prefetch` prefix — fetch without rendering.
+    pub prefetch_triggers: Vec<DeferTrigger>,
+    /// Main deferred content.
+    pub children: Vec<TemplateNode>,
+    /// Optional `@placeholder { ... }` block (rendered before trigger fires).
+    pub placeholder: Option<Vec<TemplateNode>>,
+    /// Optional `@loading { ... }` block (rendered while deferred resources load).
+    pub loading: Option<Vec<TemplateNode>>,
+    /// Optional `@error { ... }` block (rendered if loading fails).
+    pub error: Option<Vec<TemplateNode>>,
+}
+
+/// A single `@defer` trigger. `viewport` / `idle` / `hover` / `interaction`
+/// can carry a template-reference name in real Angular; ngc-rs currently
+/// accepts the keyword-only forms.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeferTrigger {
+    /// `on viewport`.
+    Viewport,
+    /// `on idle`.
+    Idle,
+    /// `on immediate`.
+    Immediate,
+    /// `on hover`.
+    Hover,
+    /// `on interaction`.
+    Interaction,
+    /// `on timer(<duration>)` — duration stored verbatim (e.g. `500ms`).
+    Timer(String),
+    /// `when <expression>` — expression evaluated each change detection cycle.
+    When(String),
 }
