@@ -14,6 +14,7 @@ mod injectable_codegen;
 mod ng_module_codegen;
 mod parser;
 mod pipe_codegen;
+pub mod preprocessor;
 mod rewrite;
 mod selector;
 
