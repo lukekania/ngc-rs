@@ -571,11 +571,17 @@ fn parse_defer_trigger(
             Rule::defer_on => {
                 for on_child in sub.into_inner() {
                     trigger = match on_child.as_rule() {
-                        Rule::on_viewport => Some(crate::ast::DeferTrigger::Viewport),
+                        Rule::on_viewport => Some(crate::ast::DeferTrigger::Viewport(
+                            extract_trigger_ref(on_child),
+                        )),
                         Rule::on_idle => Some(crate::ast::DeferTrigger::Idle),
                         Rule::on_immediate => Some(crate::ast::DeferTrigger::Immediate),
-                        Rule::on_hover => Some(crate::ast::DeferTrigger::Hover),
-                        Rule::on_interaction => Some(crate::ast::DeferTrigger::Interaction),
+                        Rule::on_hover => Some(crate::ast::DeferTrigger::Hover(
+                            extract_trigger_ref(on_child),
+                        )),
+                        Rule::on_interaction => Some(crate::ast::DeferTrigger::Interaction(
+                            extract_trigger_ref(on_child),
+                        )),
                         Rule::timer_trigger => {
                             let duration = on_child
                                 .into_inner()
@@ -603,6 +609,16 @@ fn parse_defer_trigger(
         }
     }
     (is_prefetch, trigger)
+}
+
+/// Extract the optional `(triggerRef)` identifier from a viewport / hover /
+/// interaction on-trigger pair. Returns `None` when the trigger is used in
+/// keyword-only form.
+fn extract_trigger_ref(pair: pest::iterators::Pair<Rule>) -> Option<String> {
+    pair.into_inner()
+        .find(|p| p.as_rule() == Rule::trigger_ref)
+        .and_then(|tr| tr.into_inner().next())
+        .map(|id| id.as_str().to_string())
 }
 
 /// Parse the children of a `@placeholder`/`@loading`/`@error` sub-block,
@@ -907,10 +923,10 @@ mod tests {
         match &nodes[0] {
             TemplateNode::DeferBlock(b) => {
                 assert_eq!(b.triggers.len(), 6);
-                assert!(matches!(b.triggers[0], DeferTrigger::Viewport));
+                assert!(matches!(b.triggers[0], DeferTrigger::Viewport(None)));
                 assert!(matches!(b.triggers[1], DeferTrigger::Idle));
-                assert!(matches!(b.triggers[2], DeferTrigger::Hover));
-                assert!(matches!(b.triggers[3], DeferTrigger::Interaction));
+                assert!(matches!(b.triggers[2], DeferTrigger::Hover(None)));
+                assert!(matches!(b.triggers[3], DeferTrigger::Interaction(None)));
                 assert!(matches!(b.triggers[4], DeferTrigger::Immediate));
                 match &b.triggers[5] {
                     DeferTrigger::Timer(d) => assert_eq!(d, "500ms"),
@@ -944,8 +960,35 @@ mod tests {
                 assert_eq!(b.prefetch_triggers.len(), 1);
                 assert!(matches!(b.prefetch_triggers[0], DeferTrigger::Idle));
                 assert_eq!(b.triggers.len(), 1);
-                assert!(matches!(b.triggers[0], DeferTrigger::Viewport));
+                assert!(matches!(b.triggers[0], DeferTrigger::Viewport(None)));
             }
+            _ => panic!("expected defer block"),
+        }
+    }
+
+    #[test]
+    fn test_defer_on_hover_with_trigger_ref() {
+        let nodes = parse("@defer (on hover(triggerEl)) { <d-c /> }");
+        match &nodes[0] {
+            TemplateNode::DeferBlock(b) => {
+                assert_eq!(b.triggers.len(), 1);
+                match &b.triggers[0] {
+                    DeferTrigger::Hover(Some(r)) => assert_eq!(r, "triggerEl"),
+                    other => panic!("expected Hover(Some(...)), got {other:?}"),
+                }
+            }
+            _ => panic!("expected defer block"),
+        }
+    }
+
+    #[test]
+    fn test_defer_on_viewport_with_trigger_ref() {
+        let nodes = parse("@defer (on viewport(el)) { <d-c /> }");
+        match &nodes[0] {
+            TemplateNode::DeferBlock(b) => match &b.triggers[0] {
+                DeferTrigger::Viewport(Some(r)) => assert_eq!(r, "el"),
+                other => panic!("expected Viewport(Some(...)), got {other:?}"),
+            },
             _ => panic!("expected defer block"),
         }
     }

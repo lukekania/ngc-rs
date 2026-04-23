@@ -1650,7 +1650,7 @@ impl IvyCodegen {
     /// block with an `ɵɵadvance` to the defer slot.
     fn emit_defer_trigger(&mut self, trig: &DeferTrigger, defer_slot: u32, prefetch: bool) {
         match trig {
-            DeferTrigger::Viewport => {
+            DeferTrigger::Viewport(_) => {
                 let sym = if prefetch {
                     "\u{0275}\u{0275}deferPrefetchOnViewport"
                 } else {
@@ -1677,7 +1677,7 @@ impl IvyCodegen {
                 self.ivy_imports.insert(sym.to_string());
                 self.creation.push(format!("{sym}();"));
             }
-            DeferTrigger::Hover => {
+            DeferTrigger::Hover(_) => {
                 let sym = if prefetch {
                     "\u{0275}\u{0275}deferPrefetchOnHover"
                 } else {
@@ -1686,7 +1686,7 @@ impl IvyCodegen {
                 self.ivy_imports.insert(sym.to_string());
                 self.creation.push(format!("{sym}();"));
             }
-            DeferTrigger::Interaction => {
+            DeferTrigger::Interaction(_) => {
                 let sym = if prefetch {
                     "\u{0275}\u{0275}deferPrefetchOnInteraction"
                 } else {

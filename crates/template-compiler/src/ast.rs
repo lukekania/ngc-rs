@@ -208,21 +208,22 @@ pub struct DeferBlockNode {
     pub error: Option<Vec<TemplateNode>>,
 }
 
-/// A single `@defer` trigger. `viewport` / `idle` / `hover` / `interaction`
-/// can carry a template-reference name in real Angular; ngc-rs currently
-/// accepts the keyword-only forms.
+/// A single `@defer` trigger. `viewport` / `hover` / `interaction` may carry
+/// an optional template-reference name (e.g. `on hover(triggerRef)`); ngc-rs
+/// records the reference for future wiring but currently emits the keyword-
+/// only form of the runtime instruction.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DeferTrigger {
-    /// `on viewport`.
-    Viewport,
+    /// `on viewport` / `on viewport(ref)`.
+    Viewport(Option<String>),
     /// `on idle`.
     Idle,
     /// `on immediate`.
     Immediate,
-    /// `on hover`.
-    Hover,
-    /// `on interaction`.
-    Interaction,
+    /// `on hover` / `on hover(ref)`.
+    Hover(Option<String>),
+    /// `on interaction` / `on interaction(ref)`.
+    Interaction(Option<String>),
     /// `on timer(<duration>)` — duration stored verbatim (e.g. `500ms`).
     Timer(String),
     /// `when <expression>` — expression evaluated each change detection cycle.
