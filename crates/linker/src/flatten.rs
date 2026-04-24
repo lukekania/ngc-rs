@@ -24,7 +24,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-use ngc_diagnostics::{NgcError, NgcResult};
+use ngc_diagnostics::NgcResult;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     ArrayExpression, ArrayExpressionElement, CallExpression, Declaration,
@@ -119,11 +119,23 @@ fn flatten_one(
 ) -> NgcResult<Option<String>> {
     let alloc = Allocator::default();
     let parsed = Parser::new(&alloc, source, SourceType::mjs()).parse();
-    if !parsed.errors.is_empty() {
-        return Err(NgcError::LinkerError {
-            path: path.to_path_buf(),
-            message: format!("parse error: {}", parsed.errors[0]),
-        });
+    if parsed.panicked || !parsed.errors.is_empty() {
+        // Dependency flattening is a best-effort post-pass. If the source is
+        // unparseable (e.g. a file that already took the transform-fallback
+        // path in the CLI after an upstream bug), surface a diagnostic and
+        // leave the source untouched rather than aborting the whole build.
+        // The earlier warning from the transform step already tells the user
+        // what broke.
+        let msg = if parsed.panicked {
+            "parser panicked".to_string()
+        } else {
+            format!("{}", parsed.errors[0])
+        };
+        tracing::warn!(
+            path = %path.display(),
+            "skipping dependency flatten: {msg}"
+        );
+        return Ok(None);
     }
 
     let mut imports = collect_named_imports(&parsed.program);
@@ -1157,5 +1169,32 @@ D.\u{0275}cmp = \u{0275}\u{0275}defineComponent({ type: D, dependencies: [Dialog
             .expect("portal import injected");
         assert!(portal_line.contains("CdkPortal"));
         assert!(portal_line.contains("CdkPortalOutlet"));
+    }
+
+    #[test]
+    fn test_flatten_one_skips_unparseable_source() {
+        // Regression guard for GH #81. When the CLI's transform-fallback
+        // path forwards a file that oxc could not parse, this pass must not
+        // surface a second `parse error: Expected \`,\` or \`)\` but found \`:\``
+        // — it should log a warning and leave the source untouched.
+        let broken = r#"export class Broken {
+  static \u{0275}cmp = \u{0275}\u{0275}defineComponent({
+    styles: [`.a[_ngcontent-%COMP%]{ color: red; }`[_ngcontent-%COMP%], `.b`]
+  });
+}"#;
+        let registry = ModuleRegistry::new();
+        registry.register("AnyModule", vec!["X".into()]);
+        let public_exports = PublicExports::new();
+        let result = flatten_one(
+            broken,
+            Path::new("/project/src/broken.component.ts"),
+            &registry,
+            &public_exports,
+        );
+        let none = result.expect("unparseable source must not error");
+        assert!(
+            none.is_none(),
+            "unparseable source should be skipped, not rewritten"
+        );
     }
 }

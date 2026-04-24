@@ -3003,24 +3003,69 @@ fn build_conditional_expr(
 /// - `:host { ... }` → `[_nghost-%COMP%] { ... }`
 /// - `:host-context(X) .class { ... }` → `X[_nghost-%COMP%] .class[_ngcontent-%COMP%], X [_nghost-%COMP%] .class[_ngcontent-%COMP%] { ... }`
 fn scope_component_styles(styles_src: &str) -> String {
-    // The styles_src is a JavaScript array like [`...css...`]
-    // We need to transform the CSS content inside the backticks.
-    // Extract the CSS content between the first ` and last `
-    let css_start = styles_src.find('`').unwrap_or(0) + 1;
-    let css_end = styles_src.rfind('`').unwrap_or(styles_src.len());
-    if css_start >= css_end {
-        return styles_src.to_string();
+    // `styles_src` is a JavaScript array expression of string / template
+    // literals — `[\`css\`]`, `['css']`, or multi-element forms like
+    // `[\`a\`, \`b\`]`. Walk the source and scope each literal's *content*
+    // independently, preserving everything outside the literals (brackets,
+    // commas, whitespace) verbatim. The prior implementation used
+    // `find('`')..rfind('`')` and treated every character in between as CSS,
+    // which swept intermediate `\`,\`` boundaries into the selector walker
+    // and emitted the trailing `[_ngcontent-%COMP%]` outside the template
+    // literal — producing invalid TypeScript that panics oxc (GH #81).
+    let mut result = String::with_capacity(styles_src.len());
+    let mut iter = styles_src.char_indices().peekable();
+    while let Some((i, ch)) = iter.next() {
+        if matches!(ch, '`' | '"' | '\'') {
+            let delim = ch;
+            let content_start = i + ch.len_utf8();
+            let mut content_end: Option<usize> = None;
+            while let Some((j, c)) = iter.next() {
+                if c == '\\' {
+                    // Preserve the escape — skip whatever follows the backslash.
+                    let _ = iter.next();
+                    continue;
+                }
+                if c == delim {
+                    content_end = Some(j);
+                    break;
+                }
+            }
+            match content_end {
+                Some(end) => {
+                    let content = &styles_src[content_start..end];
+                    result.push(delim);
+                    // Skip scoping if a template literal has an interpolation
+                    // — `${...}` spans JS, not CSS, and a naive brace walk
+                    // would mangle it.
+                    if delim == '`' && content.contains("${") {
+                        result.push_str(content);
+                    } else {
+                        result.push_str(&scope_single_css(content));
+                    }
+                    result.push(delim);
+                }
+                None => {
+                    // Unterminated literal (malformed input). Bail out —
+                    // emit the remainder verbatim so we do no further harm.
+                    result.push_str(&styles_src[i..]);
+                    return result;
+                }
+            }
+        } else {
+            result.push(ch);
+        }
     }
+    result
+}
 
-    let css = &styles_src[css_start..css_end];
+/// Scope a single CSS string with `%COMP%` placeholders. Extracted from
+/// [`scope_component_styles`] so we can apply the transform per array
+/// element instead of across the entire array source.
+fn scope_single_css(css: &str) -> String {
     let content_attr = "[_ngcontent-%COMP%]";
     let host_attr = "[_nghost-%COMP%]";
 
     let mut result = String::new();
-
-    // Simple CSS rule parser: split on { and }
-    // Simple string-based matching instead of regex
-
     let mut selector = String::new();
     let mut in_block = false;
     let mut brace_depth = 0;
@@ -3038,7 +3083,6 @@ fn scope_component_styles(styles_src: &str) -> String {
                 }
             }
         } else if ch == '{' {
-            // Process the selector
             let sel = selector.trim().to_string();
             if sel.is_empty() {
                 result.push('{');
@@ -3048,14 +3092,11 @@ fn scope_component_styles(styles_src: &str) -> String {
                 continue;
             }
 
-            // Transform selector
             if sel.contains(":host-context(") {
-                // :host-context(X) .rest → X[_nghost-%COMP%] .rest[_ngcontent-%COMP%], X [_nghost-%COMP%] .rest[_ngcontent-%COMP%]
                 let after_hc = sel
                     .find(":host-context(")
                     .map(|i| &sel[i + ":host-context(".len()..])
                     .unwrap_or("");
-                // Find matching )
                 let close = after_hc.find(')').unwrap_or(after_hc.len());
                 let context = after_hc[..close].trim();
                 let rest = after_hc[close + 1..].trim();
@@ -3078,7 +3119,6 @@ fn scope_component_styles(styles_src: &str) -> String {
                     result.push_str(&format!("{host_attr} {rest}"));
                 }
             } else {
-                // Regular selector — append content attr to each part
                 let parts: Vec<&str> = sel.split(',').collect();
                 let scoped: Vec<String> = parts
                     .iter()
@@ -3096,10 +3136,13 @@ fn scope_component_styles(styles_src: &str) -> String {
         }
     }
 
-    // Reconstruct the styles array with scoped CSS
-    let prefix = &styles_src[..css_start];
-    let suffix = &styles_src[css_end..];
-    format!("{prefix}{result}{suffix}")
+    // Preserve any trailing whitespace / comments that never made it into a
+    // block so round-tripping of a pure-whitespace CSS string is a no-op.
+    if !selector.is_empty() && selector.trim().is_empty() {
+        result.push_str(&selector);
+    }
+
+    result
 }
 
 /// Append `[_ngcontent-%COMP%]` to the last element in a simple CSS selector.
@@ -4390,5 +4433,46 @@ mod tests {
             dc.contains("=0 {none}") && dc.contains("other {many}"),
             "ICU case bodies should be preserved: {dc}"
         );
+    }
+
+    #[test]
+    fn test_scope_component_styles_single_element_array() {
+        let scoped = scope_component_styles("[`.a { color: red; }`]");
+        assert_eq!(scoped, "[`.a[_ngcontent-%COMP%]{ color: red; }`]");
+    }
+
+    #[test]
+    fn test_scope_component_styles_multi_element_array_preserves_boundaries() {
+        // Regression guard for GH #81. With two template literals in the
+        // array, the old `find('`')..rfind('`')` logic treated the whole
+        // middle as CSS and emitted `[_ngcontent-%COMP%]` OUTSIDE a template
+        // literal, producing invalid TypeScript. Each literal must be
+        // scoped independently.
+        let scoped = scope_component_styles("[`.a { color: red; }`, `.b { color: blue; }`]");
+        assert_eq!(
+            scoped,
+            "[`.a[_ngcontent-%COMP%]{ color: red; }`, `.b[_ngcontent-%COMP%]{ color: blue; }`]"
+        );
+    }
+
+    #[test]
+    fn test_scope_component_styles_skips_interpolation() {
+        // Template literal with `${expr}` spans JS, not CSS; the scoper
+        // must leave it alone.
+        let src = r#"[`.a { width: ${n}px; }`]"#;
+        let scoped = scope_component_styles(src);
+        assert_eq!(scoped, src);
+    }
+
+    #[test]
+    fn test_scope_component_styles_handles_string_literals() {
+        let scoped = scope_component_styles("['.a { color: red; }']");
+        assert_eq!(scoped, "['.a[_ngcontent-%COMP%]{ color: red; }']");
+    }
+
+    #[test]
+    fn test_scope_component_styles_host_selector() {
+        let scoped = scope_component_styles("[`:host { display: block; }`]");
+        assert_eq!(scoped, "[`[_nghost-%COMP%]{ display: block; }`]");
     }
 }
