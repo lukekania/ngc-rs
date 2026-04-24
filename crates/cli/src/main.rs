@@ -62,6 +62,20 @@ enum Commands {
         #[arg(long)]
         localize: bool,
     },
+    /// Extract translatable messages from every component template in the
+    /// project and emit a `messages.xlf` (XLIFF 1.2) file.
+    ExtractI18n {
+        /// Path to tsconfig.json
+        #[arg(long, default_value = "tsconfig.json")]
+        project: PathBuf,
+        /// Output file path (defaults to `messages.xlf` in the project dir).
+        #[arg(long, short = 'o')]
+        out_file: Option<PathBuf>,
+        /// Source locale recorded in the XLIFF `source-language` attribute.
+        /// Defaults to the value from `angular.json` or `"en-US"`.
+        #[arg(long)]
+        source_locale: Option<String>,
+    },
 }
 
 fn main() {
@@ -85,6 +99,21 @@ fn main() {
                     "Unresolved:".dimmed(),
                     summary.unresolved_count
                 );
+            }
+            Err(e) => {
+                eprintln!("{} {e}", "Error:".red().bold());
+                process::exit(1);
+            }
+        },
+        Commands::ExtractI18n {
+            project,
+            out_file,
+            source_locale,
+        } => match run_extract_i18n(&project, out_file.as_deref(), source_locale.as_deref()) {
+            Ok(report) => {
+                println!("{}", "ngc-rs i18n extraction complete".bold().green());
+                println!("  {:<16}{}", "Messages:".dimmed(), report.message_count);
+                println!("  {:<16}{}", "Output:".dimmed(), report.out_file.display());
             }
             Err(e) => {
                 eprintln!("{} {e}", "Error:".red().bold());
@@ -693,6 +722,163 @@ fn is_translatable(rel: &Path) -> bool {
         rel.extension().and_then(|e| e.to_str()),
         Some("js") | Some("mjs")
     )
+}
+
+/// Result of a single `extract-i18n` run.
+struct ExtractI18nReport {
+    message_count: usize,
+    out_file: PathBuf,
+}
+
+/// Walk every component file reachable from the tsconfig graph, collect
+/// translatable messages, and write a deduplicated `messages.xlf` to
+/// `out_file` (default: `<project_dir>/messages.xlf`).
+fn run_extract_i18n(
+    project: &Path,
+    out_file: Option<&Path>,
+    source_locale_override: Option<&str>,
+) -> NgcResult<ExtractI18nReport> {
+    let angular_project = find_and_resolve_angular_json(project, None)?;
+    let tsconfig_path = angular_project
+        .as_ref()
+        .map(|ap| ap.ts_config.clone())
+        .unwrap_or_else(|| project.to_path_buf());
+
+    let file_graph = ngc_project_resolver::resolve_project(&tsconfig_path)?;
+    let files: Vec<PathBuf> = file_graph.graph.node_weights().cloned().collect();
+
+    let mut messages: Vec<(PathBuf, ngc_template_compiler::i18n::ExtractedI18nMessage)> =
+        Vec::new();
+    for file in &files {
+        let extracted = ngc_template_compiler::extract_i18n_from_file(file)?;
+        for m in extracted {
+            messages.push((file.clone(), m));
+        }
+    }
+
+    // Deduplicate by id (when present); messages without an id collapse on
+    // their source text so two identical occurrences become one trans-unit.
+    use std::collections::BTreeMap;
+    let mut by_key: BTreeMap<String, (PathBuf, ngc_template_compiler::i18n::ExtractedI18nMessage)> =
+        BTreeMap::new();
+    for (path, msg) in messages {
+        let key = msg
+            .id
+            .clone()
+            .unwrap_or_else(|| auto_id_for(&msg.source, msg.meaning.as_deref()));
+        by_key.entry(key).or_insert((path, msg));
+    }
+
+    let source_locale = source_locale_override
+        .map(String::from)
+        .or_else(|| {
+            angular_project
+                .as_ref()
+                .and_then(|ap| ap.i18n.as_ref())
+                .map(|i| i.source_locale.clone())
+        })
+        .unwrap_or_else(|| "en-US".to_string());
+
+    let xlf = build_xliff(&source_locale, &by_key);
+
+    let project_dir = project.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let out_path = out_file
+        .map(PathBuf::from)
+        .unwrap_or_else(|| project_dir.join("messages.xlf"));
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| NgcError::Io {
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
+    }
+    std::fs::write(&out_path, xlf).map_err(|e| NgcError::Io {
+        path: out_path.clone(),
+        source: e,
+    })?;
+
+    Ok(ExtractI18nReport {
+        message_count: by_key.len(),
+        out_file: out_path,
+    })
+}
+
+/// Generate a stable id for messages that do not declare `@@id` explicitly.
+/// Hashing the (meaning, source) pair matches Angular's own convention so
+/// downstream `xlf-merge` tooling can correlate runs.
+fn auto_id_for(source: &str, meaning: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    if let Some(m) = meaning {
+        hasher.update(m.as_bytes());
+        hasher.update(b"|");
+    }
+    hasher.update(source.as_bytes());
+    let bytes = hasher.finalize();
+    bytes.iter().take(10).fold(String::new(), |mut acc, b| {
+        acc.push_str(&format!("{b:02x}"));
+        acc
+    })
+}
+
+/// Render a `BTreeMap<id, message>` as an XLIFF 1.2 document.
+fn build_xliff(
+    source_locale: &str,
+    messages: &std::collections::BTreeMap<
+        String,
+        (PathBuf, ngc_template_compiler::i18n::ExtractedI18nMessage),
+    >,
+) -> String {
+    let mut s = String::new();
+    s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n");
+    s.push_str(&format!(
+        "<xliff version=\"1.2\" xmlns=\"urn:oasis:names:tc:xliff:document:1.2\">\n  <file source-language=\"{}\" datatype=\"plaintext\" original=\"ng2.template\">\n    <body>\n",
+        xml_escape(source_locale)
+    ));
+    for (id, (path, msg)) in messages {
+        s.push_str(&format!(
+            "      <trans-unit id=\"{}\" datatype=\"html\">\n",
+            xml_escape(id)
+        ));
+        s.push_str(&format!(
+            "        <source>{}</source>\n",
+            xml_escape(&msg.source)
+        ));
+        s.push_str(&format!(
+            "        <context-group purpose=\"location\">\n          <context context-type=\"sourcefile\">{}</context>\n        </context-group>\n",
+            xml_escape(&path.display().to_string())
+        ));
+        if let Some(m) = &msg.meaning {
+            s.push_str(&format!(
+                "        <note priority=\"1\" from=\"meaning\">{}</note>\n",
+                xml_escape(m)
+            ));
+        }
+        if let Some(d) = &msg.description {
+            s.push_str(&format!(
+                "        <note priority=\"1\" from=\"description\">{}</note>\n",
+                xml_escape(d)
+            ));
+        }
+        s.push_str("      </trans-unit>\n");
+    }
+    s.push_str("    </body>\n  </file>\n</xliff>\n");
+    s
+}
+
+/// Minimal XML attribute / text escaping for the five canonical entities.
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Derive bundle options from the build configuration name.
