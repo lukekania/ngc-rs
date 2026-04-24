@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use ngc_diagnostics::{NgcError, NgcResult};
 
-use crate::package_json::{parse_specifier, resolve_package_entry};
+use crate::package_json::{match_imports_field, parse_specifier, resolve_package_entry};
 
 /// Resolve a bare module specifier to an absolute file path.
 ///
@@ -32,6 +32,85 @@ pub fn resolve_bare_specifier(
     }
 
     resolve_package_entry(&pkg_dir, &subpath, conditions)
+}
+
+/// Resolve a `#`-prefixed subpath import against the nearest ancestor
+/// `package.json` that owns the importing file.
+///
+/// Node's resolver scopes `imports` to the importing package, not the package
+/// being imported *from*. So we walk up from `from_file` (or from
+/// `project_root` when a top-level specifier has no anchoring file) until we
+/// hit a `package.json`, then consult its `imports` field.
+///
+/// Targets that start with `./` / `../` / `/` are resolved relative to the
+/// owning package directory. Anything else is treated as a bare specifier and
+/// routed through the regular node_modules resolver.
+pub fn resolve_subpath_import(
+    specifier: &str,
+    from_file: Option<&Path>,
+    project_root: &Path,
+    conditions: &[&str],
+) -> NgcResult<PathBuf> {
+    let start: &Path = from_file.and_then(|f| f.parent()).unwrap_or(project_root);
+    let pkg_dir = find_ancestor_pkg_dir(start).ok_or_else(|| NgcError::NpmResolutionError {
+        specifier: specifier.to_string(),
+        message: format!("no ancestor package.json from {}", start.display()),
+    })?;
+
+    let pkg_json_path = pkg_dir.join("package.json");
+    let content = std::fs::read_to_string(&pkg_json_path).map_err(|e| NgcError::Io {
+        path: pkg_json_path.clone(),
+        source: e,
+    })?;
+    let pkg: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| NgcError::NpmResolutionError {
+            specifier: specifier.to_string(),
+            message: format!("invalid package.json at {}: {e}", pkg_json_path.display()),
+        })?;
+
+    let imports = pkg
+        .get("imports")
+        .ok_or_else(|| NgcError::NpmResolutionError {
+            specifier: specifier.to_string(),
+            message: format!("no \"imports\" field in {}", pkg_json_path.display()),
+        })?;
+
+    let target = match_imports_field(imports, specifier, conditions).ok_or_else(|| {
+        NgcError::NpmResolutionError {
+            specifier: specifier.to_string(),
+            message: format!("no matching entry in {}", pkg_json_path.display()),
+        }
+    })?;
+
+    if target.starts_with("./") || target.starts_with("../") || target.starts_with('/') {
+        let rel = target.trim_start_matches('/');
+        let resolved = pkg_dir.join(rel);
+        if resolved.is_file() {
+            return Ok(resolved);
+        }
+        if let Some(with_ext) = crate::package_json::try_extensions(&resolved) {
+            return Ok(with_ext);
+        }
+        return Err(NgcError::NpmResolutionError {
+            specifier: specifier.to_string(),
+            message: format!("imports target does not exist: {}", resolved.display()),
+        });
+    }
+
+    resolve_bare_specifier(&target, project_root, conditions)
+}
+
+/// Walk upwards from `start` looking for a directory that contains
+/// `package.json`. Returns the directory path if found.
+fn find_ancestor_pkg_dir(start: &Path) -> Option<PathBuf> {
+    let mut cur: Option<&Path> = Some(start);
+    while let Some(d) = cur {
+        if d.join("package.json").is_file() {
+            return Some(d.to_path_buf());
+        }
+        cur = d.parent();
+    }
+    None
 }
 
 /// Resolve a relative import specifier from within an npm package file.

@@ -80,8 +80,13 @@ pub fn resolve_npm_dependencies(
     // probes — fully independent per specifier.
     let initial_entries: Vec<(String, PathBuf)> = specifiers
         .par_iter()
-        .filter_map(
-            |spec| match resolve::resolve_bare_specifier(spec, project_root, conditions) {
+        .filter_map(|spec| {
+            let outcome = if spec.starts_with('#') {
+                resolve::resolve_subpath_import(spec, None, project_root, conditions)
+            } else {
+                resolve::resolve_bare_specifier(spec, project_root, conditions)
+            };
+            match outcome {
                 Ok(entry_path) => {
                     let canonical = canonicalize_cached(entry_path);
                     Some((spec.clone(), canonical))
@@ -90,8 +95,8 @@ pub fn resolve_npm_dependencies(
                     debug!(specifier = spec, error = %e, "skipping unresolvable npm package");
                     None
                 }
-            },
-        )
+            }
+        })
         .collect();
 
     let mut frontier: Vec<PathBuf> = Vec::new();
@@ -140,6 +145,23 @@ pub fn resolve_npm_dependencies(
                             resolve::resolve_relative_import(&import.specifier, file_path).ok(),
                             None,
                         )
+                    } else if import.specifier.starts_with('#') {
+                        match resolve::resolve_subpath_import(
+                            &import.specifier,
+                            Some(file_path),
+                            project_root,
+                            conditions,
+                        ) {
+                            Ok(p) => (Some(p), Some(import.specifier.clone())),
+                            Err(_) => {
+                                debug!(
+                                    specifier = import.specifier,
+                                    from = %file_path.display(),
+                                    "skipping unresolvable subpath import"
+                                );
+                                (None, None)
+                            }
+                        }
                     } else {
                         match resolve::resolve_bare_specifier(
                             &import.specifier,
