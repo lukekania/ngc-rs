@@ -7,10 +7,12 @@ use colored::Colorize;
 use ngc_bundler::{BundleInput, BundleOptions};
 use ngc_diagnostics::{NgcError, NgcResult};
 use ngc_project_resolver::angular_json::{
-    CrossOrigin, FileReplacement, InlineStyleLanguage, ResolvedAngularProject, ResolvedAsset,
-    ResolvedStyle,
+    CrossOrigin, FileReplacement, I18nConfig, InlineStyleLanguage, ResolvedAngularProject,
+    ResolvedAsset, ResolvedStyle,
 };
 use ngc_template_compiler::{StyleContext, StyleLanguage};
+
+mod localize;
 
 /// Result of the bundled build pipeline.
 #[derive(serde::Serialize)]
@@ -52,6 +54,13 @@ enum Commands {
         /// Print machine-readable JSON output to stdout.
         #[arg(long)]
         output_json: bool,
+        /// Emit one `<out_dir>/<locale>/` tree per locale defined in
+        /// `angular.json`'s `i18n.locales` block, applying translations to
+        /// every `$localize\`...\`` literal in the bundled output. The
+        /// source-locale build is moved under
+        /// `<out_dir>/<sourceLocale>/`.
+        #[arg(long)]
+        localize: bool,
     },
 }
 
@@ -87,7 +96,13 @@ fn main() {
             out_dir,
             configuration,
             output_json,
-        } => match run_build(&project, out_dir.as_deref(), configuration.as_deref()) {
+            localize,
+        } => match run_build(
+            &project,
+            out_dir.as_deref(),
+            configuration.as_deref(),
+            localize,
+        ) {
             Ok(result) => {
                 if output_json {
                     let json = serde_json::to_string_pretty(&result)
@@ -140,6 +155,7 @@ fn run_build(
     project: &Path,
     out_dir_override: Option<&Path>,
     configuration: Option<&str>,
+    localize: bool,
 ) -> NgcResult<BuildResult> {
     // Step 1: Try to find angular.json
     let angular_project = find_and_resolve_angular_json(project, configuration)?;
@@ -559,6 +575,22 @@ fn run_build(
         output_files.push(lp);
     }
 
+    // Step 13: --localize → fan the source-locale build out to
+    // `<out_dir>/<sourceLocale>/` and produce a translated copy under
+    // `<out_dir>/<locale>/` for each entry in `i18n.locales`.
+    if localize {
+        let i18n = angular_project
+            .as_ref()
+            .and_then(|ap| ap.i18n.as_ref())
+            .ok_or_else(|| NgcError::ConfigError {
+                message:
+                    "--localize was passed but angular.json does not declare a `projects.<name>.i18n` block"
+                        .to_string(),
+            })?;
+        let localized_files = fan_out_locales(&out_dir, i18n, &output_files)?;
+        output_files = localized_files;
+    }
+
     // Compute total size
     let total_size_bytes = output_files
         .iter()
@@ -572,6 +604,95 @@ fn run_build(
         output_files,
         total_size_bytes,
     })
+}
+
+/// Move the source-locale build under `<out_dir>/<sourceLocale>/` and
+/// emit a translated copy under `<out_dir>/<locale>/` for every entry in
+/// `i18n.locales`. Returns the new full set of output files.
+fn fan_out_locales(
+    out_dir: &Path,
+    i18n: &I18nConfig,
+    original_files: &[PathBuf],
+) -> NgcResult<Vec<PathBuf>> {
+    // Materialize file contents from the original (source-locale) build so
+    // we can write them back into per-locale directories without worrying
+    // about the source-locale move clobbering them.
+    let mut sources: Vec<(PathBuf, Vec<u8>)> = Vec::with_capacity(original_files.len());
+    for f in original_files {
+        let rel = f.strip_prefix(out_dir).unwrap_or(f).to_path_buf();
+        let bytes = std::fs::read(f).map_err(|e| NgcError::Io {
+            path: f.clone(),
+            source: e,
+        })?;
+        sources.push((rel, bytes));
+    }
+
+    // Remove the original outputs so the source-locale subdirectory takes
+    // over the layout cleanly.
+    for f in original_files {
+        let _ = std::fs::remove_file(f);
+    }
+
+    let mut new_outputs: Vec<PathBuf> = Vec::new();
+
+    let source_dir = out_dir.join(&i18n.source_locale);
+    write_locale_tree(&source_dir, &sources, None, &mut new_outputs)?;
+
+    for entry in i18n.locales.values() {
+        let translations = match &entry.translation_path {
+            Some(path) => Some(localize::parse_xliff(path)?),
+            None => None,
+        };
+        let dir = out_dir.join(&entry.locale);
+        write_locale_tree(&dir, &sources, translations.as_ref(), &mut new_outputs)?;
+    }
+    Ok(new_outputs)
+}
+
+/// Write `(rel_path, contents)` pairs into `dir`, applying translation
+/// substitution to `.js`/`.mjs` files when `translations` is `Some`.
+fn write_locale_tree(
+    dir: &Path,
+    sources: &[(PathBuf, Vec<u8>)],
+    translations: Option<&localize::TranslationMap>,
+    new_outputs: &mut Vec<PathBuf>,
+) -> NgcResult<()> {
+    std::fs::create_dir_all(dir).map_err(|e| NgcError::Io {
+        path: dir.to_path_buf(),
+        source: e,
+    })?;
+    for (rel, bytes) in sources {
+        let target = dir.join(rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| NgcError::Io {
+                path: parent.to_path_buf(),
+                source: e,
+            })?;
+        }
+        let final_bytes = match (translations, is_translatable(rel)) {
+            (Some(map), true) => {
+                let text = String::from_utf8_lossy(bytes).into_owned();
+                localize::apply_translations(&text, map).into_bytes()
+            }
+            _ => bytes.clone(),
+        };
+        std::fs::write(&target, &final_bytes).map_err(|e| NgcError::Io {
+            path: target.clone(),
+            source: e,
+        })?;
+        new_outputs.push(target);
+    }
+    Ok(())
+}
+
+/// Files that may contain `$localize\`...\`` calls and so receive
+/// translation substitution. Source maps and binary assets are copied
+/// verbatim.
+fn is_translatable(rel: &Path) -> bool {
+    matches!(
+        rel.extension().and_then(|e| e.to_str()),
+        Some("js") | Some("mjs")
+    )
 }
 
 /// Derive bundle options from the build configuration name.
