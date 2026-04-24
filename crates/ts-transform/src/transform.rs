@@ -446,4 +446,41 @@ export class AppComponent {
     fn test_map_extension_js_passthrough() {
         assert_eq!(map_extension(Path::new("foo.js")), PathBuf::from("foo.js"));
     }
+
+    #[test]
+    fn test_inline_scss_styles_template_literal_passes_through() {
+        // Regression guard for GH #81. A component file whose `styles` array
+        // contains a backtick template literal with SCSS `@use 'sass:color';`
+        // pragmas and keyword-argument function calls (`$lightness: 60%`)
+        // must parse cleanly as TypeScript — the SCSS text is opaque string
+        // content, not JS syntax. Transform must not panic and must not
+        // surface a parse error back to the caller.
+        let source = "import { Component } from '@angular/core';\n\
+\n\
+@Component({\n\
+  selector: 'app-scss-styles',\n\
+  styleUrl: './scss-styles.component.scss',\n\
+  styles: [`\n\
+    @use 'sass:color';\n\
+\n\
+    $inline-color: #2e7d32;\n\
+\n\
+    .scss-inline {\n\
+      background: color.adjust($inline-color, $lightness: 60%);\n\
+    }\n\
+  `],\n\
+  template: `<p>hi</p>`,\n\
+})\n\
+export class ScssStylesComponent {}\n";
+        let result = transform_source(source, "scss-styles.component.ts")
+            .expect("inline SCSS styles should survive TS transform");
+        assert!(
+            result.contains("class ScssStylesComponent"),
+            "class should be preserved: {result}"
+        );
+        assert!(
+            !result.contains("@Component("),
+            "decorator should be stripped: {result}"
+        );
+    }
 }
