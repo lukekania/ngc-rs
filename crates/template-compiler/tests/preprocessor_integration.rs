@@ -405,3 +405,46 @@ fn compile_all_decorators_processes_scss_component_in_parallel_path() {
         cf.source
     );
 }
+
+// ---------------------------------------------------------------------------
+// GH #81: inline SCSS `styles: [\`...\`]` alongside a `styleUrl` must emit a
+// valid multi-element array that survives ts-transform without fallback.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn inline_scss_alongside_style_url_emits_valid_multi_element_array() {
+    let Some((_guard, project_root)) = make_project_with_node_modules() else {
+        return;
+    };
+    let component_path = project_root.join("scss_styles.component.ts");
+    std::fs::write(
+        project_root.join("scss_styles.component.scss"),
+        "$c: #112233;\n.external { color: $c; }\n",
+    )
+    .unwrap();
+    let body = "styleUrl: './scss_styles.component.scss',\n\
+            styles: [`\n\
+                @use 'sass:color';\n\
+                $inline-color: #2e7d32;\n\
+                .scss-inline { background: color.adjust($inline-color, $lightness: 60%); }\n\
+            `]";
+    std::fs::write(&component_path, component_source("", body)).unwrap();
+
+    let ctx = StyleContext {
+        project_root: project_root.clone(),
+        inline_style_language: StyleLanguage::Scss,
+    };
+    let result = compile_component_with_styles(
+        &std::fs::read_to_string(&component_path).unwrap(),
+        &component_path,
+        &ctx,
+    )
+    .expect("compile inline SCSS + styleUrl");
+    assert!(result.compiled);
+    let out = &result.source;
+
+    // Round-trip through ts-transform: the compiled source must be valid
+    // TypeScript, so oxc parses it cleanly and no fallback is taken.
+    ngc_ts_transform::transform_source(out, "scss_styles.component.ts")
+        .expect("ts-transform must accept the compiled source");
+}
