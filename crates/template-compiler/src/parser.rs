@@ -1148,6 +1148,82 @@ mod tests {
     }
 
     #[test]
+    fn test_icu_plural_multiline_inside_element() {
+        let nodes = parse(
+            "<p i18n=\"@@x\">\n  { count, plural,\n    =0 {no items}\n    =1 {one item}\n    other {many items}\n  }\n</p>",
+        );
+        assert_eq!(nodes.len(), 1);
+        match &nodes[0] {
+            TemplateNode::Element(e) => {
+                let icu = e
+                    .children
+                    .iter()
+                    .find_map(|n| match n {
+                        TemplateNode::IcuExpression(i) => Some(i),
+                        _ => None,
+                    })
+                    .expect("expected an ICU child");
+                assert_eq!(icu.cases.len(), 3);
+            }
+            _ => panic!("expected element"),
+        }
+    }
+
+    #[test]
+    fn test_icu_inside_text_with_surrounding_words() {
+        // Reproduces the canonical Angular i18n shape:
+        // `<p>You have {count, plural, ...} in your cart.</p>` — text
+        // surrounds the ICU on both sides. The ICU's leading `{` must not
+        // be swallowed by the text run that precedes it.
+        let nodes = parse(
+            "<p i18n=\"@@cart.items\">\n  You have {count, plural,\n    =0 {no items}\n    =1 {one item}\n    other {# items}\n  } in your cart.\n</p>",
+        );
+        match &nodes[0] {
+            TemplateNode::Element(e) => {
+                let icu = e
+                    .children
+                    .iter()
+                    .find_map(|n| match n {
+                        TemplateNode::IcuExpression(i) => Some(i),
+                        _ => None,
+                    })
+                    .expect("expected an ICU child");
+                assert_eq!(icu.cases.len(), 3);
+                assert_eq!(icu.switch_expression, "count");
+            }
+            _ => panic!("expected element"),
+        }
+    }
+
+    #[test]
+    fn test_icu_with_nested_interpolation_in_case_body() {
+        // Common Angular i18n pattern: the `other` case interpolates the
+        // pluralized expression back into the message via `{{...}}`.
+        let nodes = parse(
+            "<p i18n>{ count, plural,\n=0 {no items}\n=1 {one item}\nother {{{count}} items}\n}</p>",
+        );
+        match &nodes[0] {
+            TemplateNode::Element(e) => {
+                let icu = e
+                    .children
+                    .iter()
+                    .find_map(|n| match n {
+                        TemplateNode::IcuExpression(i) => Some(i),
+                        _ => None,
+                    })
+                    .expect("ICU child");
+                assert_eq!(icu.cases.len(), 3);
+                assert!(
+                    icu.cases[2].body.contains("{{count}}"),
+                    "case body should preserve nested interpolation, got: {:?}",
+                    icu.cases[2].body
+                );
+            }
+            _ => panic!("expected element"),
+        }
+    }
+
+    #[test]
     fn test_icu_select() {
         let nodes = parse("{ gender, select, male {he} female {she} other {they} }");
         match &nodes[0] {
