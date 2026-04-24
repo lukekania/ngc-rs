@@ -355,6 +355,28 @@ mod tests {
     }
 
     #[test]
+    fn test_localize_tagged_template_passthrough() {
+        let source = "export const msg = $localize`:@@intro|greeting:Hello, ${name}:USER:!`;\n";
+        let result = transform_source(source, "test.ts").expect("should transform");
+        assert!(
+            result.contains("$localize"),
+            "$localize identifier should be preserved: {result}"
+        );
+        assert!(
+            result.contains(":@@intro|greeting:"),
+            "metadata block should be preserved verbatim: {result}"
+        );
+        assert!(
+            result.contains(":USER:"),
+            "placeholder name should be preserved: {result}"
+        );
+        assert!(
+            result.contains("Hello, "),
+            "static text should be preserved: {result}"
+        );
+    }
+
+    #[test]
     fn test_strip_decorator() {
         let source = r#"function Component(config: any) { return (target: any) => target; }
 
