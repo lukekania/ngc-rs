@@ -7,10 +7,12 @@ use colored::Colorize;
 use ngc_bundler::{BundleInput, BundleOptions};
 use ngc_diagnostics::{NgcError, NgcResult};
 use ngc_project_resolver::angular_json::{
-    CrossOrigin, FileReplacement, InlineStyleLanguage, ResolvedAngularProject, ResolvedAsset,
-    ResolvedStyle,
+    CrossOrigin, FileReplacement, I18nConfig, InlineStyleLanguage, ResolvedAngularProject,
+    ResolvedAsset, ResolvedStyle,
 };
 use ngc_template_compiler::{StyleContext, StyleLanguage};
+
+mod localize;
 
 /// Result of the bundled build pipeline.
 #[derive(serde::Serialize)]
@@ -52,6 +54,27 @@ enum Commands {
         /// Print machine-readable JSON output to stdout.
         #[arg(long)]
         output_json: bool,
+        /// Emit one `<out_dir>/<locale>/` tree per locale defined in
+        /// `angular.json`'s `i18n.locales` block, applying translations to
+        /// every `$localize\`...\`` literal in the bundled output. The
+        /// source-locale build is moved under
+        /// `<out_dir>/<sourceLocale>/`.
+        #[arg(long)]
+        localize: bool,
+    },
+    /// Extract translatable messages from every component template in the
+    /// project and emit a `messages.xlf` (XLIFF 1.2) file.
+    ExtractI18n {
+        /// Path to tsconfig.json
+        #[arg(long, default_value = "tsconfig.json")]
+        project: PathBuf,
+        /// Output file path (defaults to `messages.xlf` in the project dir).
+        #[arg(long, short = 'o')]
+        out_file: Option<PathBuf>,
+        /// Source locale recorded in the XLIFF `source-language` attribute.
+        /// Defaults to the value from `angular.json` or `"en-US"`.
+        #[arg(long)]
+        source_locale: Option<String>,
     },
 }
 
@@ -82,12 +105,33 @@ fn main() {
                 process::exit(1);
             }
         },
+        Commands::ExtractI18n {
+            project,
+            out_file,
+            source_locale,
+        } => match run_extract_i18n(&project, out_file.as_deref(), source_locale.as_deref()) {
+            Ok(report) => {
+                println!("{}", "ngc-rs i18n extraction complete".bold().green());
+                println!("  {:<16}{}", "Messages:".dimmed(), report.message_count);
+                println!("  {:<16}{}", "Output:".dimmed(), report.out_file.display());
+            }
+            Err(e) => {
+                eprintln!("{} {e}", "Error:".red().bold());
+                process::exit(1);
+            }
+        },
         Commands::Build {
             project,
             out_dir,
             configuration,
             output_json,
-        } => match run_build(&project, out_dir.as_deref(), configuration.as_deref()) {
+            localize,
+        } => match run_build(
+            &project,
+            out_dir.as_deref(),
+            configuration.as_deref(),
+            localize,
+        ) {
             Ok(result) => {
                 if output_json {
                     let json = serde_json::to_string_pretty(&result)
@@ -140,6 +184,7 @@ fn run_build(
     project: &Path,
     out_dir_override: Option<&Path>,
     configuration: Option<&str>,
+    localize: bool,
 ) -> NgcResult<BuildResult> {
     // Step 1: Try to find angular.json
     let angular_project = find_and_resolve_angular_json(project, configuration)?;
@@ -559,6 +604,22 @@ fn run_build(
         output_files.push(lp);
     }
 
+    // Step 13: --localize → fan the source-locale build out to
+    // `<out_dir>/<sourceLocale>/` and produce a translated copy under
+    // `<out_dir>/<locale>/` for each entry in `i18n.locales`.
+    if localize {
+        let i18n = angular_project
+            .as_ref()
+            .and_then(|ap| ap.i18n.as_ref())
+            .ok_or_else(|| NgcError::ConfigError {
+                message:
+                    "--localize was passed but angular.json does not declare a `projects.<name>.i18n` block"
+                        .to_string(),
+            })?;
+        let localized_files = fan_out_locales(&out_dir, i18n, &output_files)?;
+        output_files = localized_files;
+    }
+
     // Compute total size
     let total_size_bytes = output_files
         .iter()
@@ -572,6 +633,252 @@ fn run_build(
         output_files,
         total_size_bytes,
     })
+}
+
+/// Move the source-locale build under `<out_dir>/<sourceLocale>/` and
+/// emit a translated copy under `<out_dir>/<locale>/` for every entry in
+/// `i18n.locales`. Returns the new full set of output files.
+fn fan_out_locales(
+    out_dir: &Path,
+    i18n: &I18nConfig,
+    original_files: &[PathBuf],
+) -> NgcResult<Vec<PathBuf>> {
+    // Materialize file contents from the original (source-locale) build so
+    // we can write them back into per-locale directories without worrying
+    // about the source-locale move clobbering them.
+    let mut sources: Vec<(PathBuf, Vec<u8>)> = Vec::with_capacity(original_files.len());
+    for f in original_files {
+        let rel = f.strip_prefix(out_dir).unwrap_or(f).to_path_buf();
+        let bytes = std::fs::read(f).map_err(|e| NgcError::Io {
+            path: f.clone(),
+            source: e,
+        })?;
+        sources.push((rel, bytes));
+    }
+
+    // Remove the original outputs so the source-locale subdirectory takes
+    // over the layout cleanly.
+    for f in original_files {
+        let _ = std::fs::remove_file(f);
+    }
+
+    let mut new_outputs: Vec<PathBuf> = Vec::new();
+
+    let source_dir = out_dir.join(&i18n.source_locale);
+    write_locale_tree(&source_dir, &sources, None, &mut new_outputs)?;
+
+    for entry in i18n.locales.values() {
+        let translations = match &entry.translation_path {
+            Some(path) => Some(localize::parse_xliff(path)?),
+            None => None,
+        };
+        let dir = out_dir.join(&entry.locale);
+        write_locale_tree(&dir, &sources, translations.as_ref(), &mut new_outputs)?;
+    }
+    Ok(new_outputs)
+}
+
+/// Write `(rel_path, contents)` pairs into `dir`, applying translation
+/// substitution to `.js`/`.mjs` files when `translations` is `Some`.
+fn write_locale_tree(
+    dir: &Path,
+    sources: &[(PathBuf, Vec<u8>)],
+    translations: Option<&localize::TranslationMap>,
+    new_outputs: &mut Vec<PathBuf>,
+) -> NgcResult<()> {
+    std::fs::create_dir_all(dir).map_err(|e| NgcError::Io {
+        path: dir.to_path_buf(),
+        source: e,
+    })?;
+    for (rel, bytes) in sources {
+        let target = dir.join(rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| NgcError::Io {
+                path: parent.to_path_buf(),
+                source: e,
+            })?;
+        }
+        let final_bytes = match (translations, is_translatable(rel)) {
+            (Some(map), true) => {
+                let text = String::from_utf8_lossy(bytes).into_owned();
+                localize::apply_translations(&text, map).into_bytes()
+            }
+            _ => bytes.clone(),
+        };
+        std::fs::write(&target, &final_bytes).map_err(|e| NgcError::Io {
+            path: target.clone(),
+            source: e,
+        })?;
+        new_outputs.push(target);
+    }
+    Ok(())
+}
+
+/// Files that may contain `$localize\`...\`` calls and so receive
+/// translation substitution. Source maps and binary assets are copied
+/// verbatim.
+fn is_translatable(rel: &Path) -> bool {
+    matches!(
+        rel.extension().and_then(|e| e.to_str()),
+        Some("js") | Some("mjs")
+    )
+}
+
+/// Result of a single `extract-i18n` run.
+struct ExtractI18nReport {
+    message_count: usize,
+    out_file: PathBuf,
+}
+
+/// Walk every component file reachable from the tsconfig graph, collect
+/// translatable messages, and write a deduplicated `messages.xlf` to
+/// `out_file` (default: `<project_dir>/messages.xlf`).
+fn run_extract_i18n(
+    project: &Path,
+    out_file: Option<&Path>,
+    source_locale_override: Option<&str>,
+) -> NgcResult<ExtractI18nReport> {
+    let angular_project = find_and_resolve_angular_json(project, None)?;
+    let tsconfig_path = angular_project
+        .as_ref()
+        .map(|ap| ap.ts_config.clone())
+        .unwrap_or_else(|| project.to_path_buf());
+
+    let file_graph = ngc_project_resolver::resolve_project(&tsconfig_path)?;
+    let files: Vec<PathBuf> = file_graph.graph.node_weights().cloned().collect();
+
+    let mut messages: Vec<(PathBuf, ngc_template_compiler::i18n::ExtractedI18nMessage)> =
+        Vec::new();
+    for file in &files {
+        let extracted = ngc_template_compiler::extract_i18n_from_file(file)?;
+        for m in extracted {
+            messages.push((file.clone(), m));
+        }
+    }
+
+    // Deduplicate by id (when present); messages without an id collapse on
+    // their source text so two identical occurrences become one trans-unit.
+    use std::collections::BTreeMap;
+    let mut by_key: BTreeMap<String, (PathBuf, ngc_template_compiler::i18n::ExtractedI18nMessage)> =
+        BTreeMap::new();
+    for (path, msg) in messages {
+        let key = msg
+            .id
+            .clone()
+            .unwrap_or_else(|| auto_id_for(&msg.source, msg.meaning.as_deref()));
+        by_key.entry(key).or_insert((path, msg));
+    }
+
+    let source_locale = source_locale_override
+        .map(String::from)
+        .or_else(|| {
+            angular_project
+                .as_ref()
+                .and_then(|ap| ap.i18n.as_ref())
+                .map(|i| i.source_locale.clone())
+        })
+        .unwrap_or_else(|| "en-US".to_string());
+
+    let xlf = build_xliff(&source_locale, &by_key);
+
+    let project_dir = project.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let out_path = out_file
+        .map(PathBuf::from)
+        .unwrap_or_else(|| project_dir.join("messages.xlf"));
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| NgcError::Io {
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
+    }
+    std::fs::write(&out_path, xlf).map_err(|e| NgcError::Io {
+        path: out_path.clone(),
+        source: e,
+    })?;
+
+    Ok(ExtractI18nReport {
+        message_count: by_key.len(),
+        out_file: out_path,
+    })
+}
+
+/// Generate a stable id for messages that do not declare `@@id` explicitly.
+/// Hashing the (meaning, source) pair matches Angular's own convention so
+/// downstream `xlf-merge` tooling can correlate runs.
+fn auto_id_for(source: &str, meaning: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    if let Some(m) = meaning {
+        hasher.update(m.as_bytes());
+        hasher.update(b"|");
+    }
+    hasher.update(source.as_bytes());
+    let bytes = hasher.finalize();
+    bytes.iter().take(10).fold(String::new(), |mut acc, b| {
+        acc.push_str(&format!("{b:02x}"));
+        acc
+    })
+}
+
+/// Render a `BTreeMap<id, message>` as an XLIFF 1.2 document.
+fn build_xliff(
+    source_locale: &str,
+    messages: &std::collections::BTreeMap<
+        String,
+        (PathBuf, ngc_template_compiler::i18n::ExtractedI18nMessage),
+    >,
+) -> String {
+    let mut s = String::new();
+    s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n");
+    s.push_str(&format!(
+        "<xliff version=\"1.2\" xmlns=\"urn:oasis:names:tc:xliff:document:1.2\">\n  <file source-language=\"{}\" datatype=\"plaintext\" original=\"ng2.template\">\n    <body>\n",
+        xml_escape(source_locale)
+    ));
+    for (id, (path, msg)) in messages {
+        s.push_str(&format!(
+            "      <trans-unit id=\"{}\" datatype=\"html\">\n",
+            xml_escape(id)
+        ));
+        s.push_str(&format!(
+            "        <source>{}</source>\n",
+            xml_escape(&msg.source)
+        ));
+        s.push_str(&format!(
+            "        <context-group purpose=\"location\">\n          <context context-type=\"sourcefile\">{}</context>\n        </context-group>\n",
+            xml_escape(&path.display().to_string())
+        ));
+        if let Some(m) = &msg.meaning {
+            s.push_str(&format!(
+                "        <note priority=\"1\" from=\"meaning\">{}</note>\n",
+                xml_escape(m)
+            ));
+        }
+        if let Some(d) = &msg.description {
+            s.push_str(&format!(
+                "        <note priority=\"1\" from=\"description\">{}</note>\n",
+                xml_escape(d)
+            ));
+        }
+        s.push_str("      </trans-unit>\n");
+    }
+    s.push_str("    </body>\n  </file>\n</xliff>\n");
+    s
+}
+
+/// Minimal XML attribute / text escaping for the five canonical entities.
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Derive bundle options from the build configuration name.

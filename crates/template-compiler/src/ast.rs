@@ -17,6 +17,8 @@ pub enum TemplateNode {
     LetDeclaration(LetDeclarationNode),
     /// An `@defer` block with optional `@placeholder` / `@loading` / `@error` sub-blocks.
     DeferBlock(DeferBlockNode),
+    /// An ICU expression `{ expr, plural|select|selectordinal, ... }`.
+    IcuExpression(IcuExpressionNode),
 }
 
 /// An HTML element node.
@@ -98,6 +100,66 @@ pub enum TemplateAttribute {
         /// Optional export-as value (e.g. `"ngForm"`).
         export_as: Option<String>,
     },
+    /// An `i18n` marker attribute on an element (e.g. `i18n="@@intro|meaning|desc"`).
+    /// Indicates this element's text content should be translated.
+    I18n(I18nMeta),
+    /// An `i18n-<name>` marker attribute for a translatable static attribute
+    /// (e.g. `i18n-title="@@tooltip"` alongside `title="Hello"`).
+    I18nAttr {
+        /// Target attribute name (the `<name>` part of `i18n-<name>`).
+        target: String,
+        /// Optional translation metadata attached to the marker.
+        meta: I18nMeta,
+    },
+}
+
+/// Parsed `i18n` attribute metadata.
+///
+/// Angular's `i18n` attribute syntax is `"meaning|description@@id"` — all
+/// segments optional. The message text itself comes from the element's
+/// content or the target attribute's value.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct I18nMeta {
+    /// Optional explicit message id (after `@@`).
+    pub id: Option<String>,
+    /// Optional translator meaning (before `|`).
+    pub meaning: Option<String>,
+    /// Optional translator description (between `|` and `@@`).
+    pub description: Option<String>,
+}
+
+impl I18nMeta {
+    /// Parse the raw attribute value into an `I18nMeta`. An empty or missing
+    /// value returns `I18nMeta::default()` (all fields `None`).
+    pub fn parse(raw: Option<&str>) -> Self {
+        let s = raw.unwrap_or("").trim();
+        if s.is_empty() {
+            return Self::default();
+        }
+        let (head, id) = match s.split_once("@@") {
+            Some((h, i)) => (h, Some(i.trim().to_string()).filter(|v| !v.is_empty())),
+            None => (s, None),
+        };
+        let (meaning, description) = match head.split_once('|') {
+            Some((m, d)) => {
+                let m = m.trim();
+                let d = d.trim();
+                (
+                    (!m.is_empty()).then(|| m.to_string()),
+                    (!d.is_empty()).then(|| d.to_string()),
+                )
+            }
+            None => {
+                let h = head.trim();
+                (None, (!h.is_empty()).then(|| h.to_string()))
+            }
+        };
+        Self {
+            id,
+            meaning,
+            description,
+        }
+    }
 }
 
 /// A text node.
@@ -206,6 +268,37 @@ pub struct DeferBlockNode {
     pub loading: Option<Vec<TemplateNode>>,
     /// Optional `@error { ... }` block (rendered if loading fails).
     pub error: Option<Vec<TemplateNode>>,
+}
+
+/// An ICU message node: `{ expr, plural|select|selectordinal, case {body} ... }`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IcuExpressionNode {
+    /// The switch expression (e.g. `count`, `gender`).
+    pub switch_expression: String,
+    /// Message category (`plural`, `select`, or `selectordinal`).
+    pub category: IcuCategory,
+    /// Case branches (`=0`, `one`, `other`, ...).
+    pub cases: Vec<IcuCase>,
+}
+
+/// ICU message category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IcuCategory {
+    /// Cardinal pluralization (`plural`).
+    Plural,
+    /// Ordinal pluralization (`selectordinal`).
+    SelectOrdinal,
+    /// Keyed selection (`select`).
+    Select,
+}
+
+/// A single ICU case branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IcuCase {
+    /// The case key (`=0`, `one`, `other`, `male`, ...).
+    pub key: String,
+    /// The raw case body content (may contain `#` / `{{...}}` placeholders).
+    pub body: String,
 }
 
 /// A single `@defer` trigger. `viewport` / `hover` / `interaction` may carry

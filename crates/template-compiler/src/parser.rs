@@ -56,6 +56,7 @@ fn parse_node(pair: pest::iterators::Pair<Rule>) -> NgcResult<Option<TemplateNod
         Rule::switch_block => Ok(Some(parse_switch_block(pair)?)),
         Rule::let_block => Ok(Some(parse_let_block(pair)?)),
         Rule::defer_block => Ok(Some(parse_defer_block(pair)?)),
+        Rule::icu_expression => Ok(Some(parse_icu_expression(pair)?)),
         Rule::node => {
             let inner = pair.into_inner().next();
             match inner {
@@ -273,7 +274,21 @@ fn parse_attributes(
                     .next()
                     .and_then(|p| p.into_inner().next())
                     .map(|p| p.as_str().to_string());
-                attrs.push(crate::ast::TemplateAttribute::Static { name, value });
+                // Recognize `i18n` / `i18n-<attr>` marker attributes and route
+                // them onto dedicated AST variants; everything else remains a
+                // plain static attribute.
+                if name == "i18n" {
+                    let meta = crate::ast::I18nMeta::parse(value.as_deref());
+                    attrs.push(crate::ast::TemplateAttribute::I18n(meta));
+                } else if let Some(target) = name.strip_prefix("i18n-") {
+                    let meta = crate::ast::I18nMeta::parse(value.as_deref());
+                    attrs.push(crate::ast::TemplateAttribute::I18nAttr {
+                        target: target.to_string(),
+                        meta,
+                    });
+                } else {
+                    attrs.push(crate::ast::TemplateAttribute::Static { name, value });
+                }
             }
             _ => {}
         }
@@ -634,6 +649,48 @@ fn parse_defer_sub_children(pair: pest::iterators::Pair<Rule>) -> NgcResult<Vec<
         }
     }
     Ok(nodes)
+}
+
+/// Parse an ICU `{ expr, plural|select|selectordinal, case {body} ... }` block.
+fn parse_icu_expression(pair: pest::iterators::Pair<Rule>) -> NgcResult<TemplateNode> {
+    use crate::ast::{IcuCase, IcuCategory, IcuExpressionNode};
+
+    let mut inner = pair.into_inner();
+    let switch_expression = inner
+        .next()
+        .map(|p| p.as_str().trim().to_string())
+        .unwrap_or_default();
+    let category = inner
+        .next()
+        .map(|p| match p.as_str().trim() {
+            "plural" => IcuCategory::Plural,
+            "selectordinal" => IcuCategory::SelectOrdinal,
+            _ => IcuCategory::Select,
+        })
+        .unwrap_or(IcuCategory::Select);
+
+    let mut cases = Vec::new();
+    for case_pair in inner {
+        if case_pair.as_rule() != Rule::icu_case {
+            continue;
+        }
+        let mut case_inner = case_pair.into_inner();
+        let key = case_inner
+            .next()
+            .map(|p| p.as_str().trim().to_string())
+            .unwrap_or_default();
+        let body = case_inner
+            .next()
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_default();
+        cases.push(IcuCase { key, body });
+    }
+
+    Ok(TemplateNode::IcuExpression(IcuExpressionNode {
+        switch_expression,
+        category,
+        cases,
+    }))
 }
 
 /// Extract the text content from an expression pair, handling nested rules.
@@ -1006,6 +1063,175 @@ mod tests {
                 assert!(b.error.is_some());
             }
             _ => panic!("expected defer block"),
+        }
+    }
+
+    #[test]
+    fn test_i18n_attribute_bare() {
+        let nodes = parse("<h1 i18n>Hello</h1>");
+        match &nodes[0] {
+            TemplateNode::Element(e) => {
+                assert!(e.attributes.iter().any(
+                    |a| matches!(a, TemplateAttribute::I18n(m) if m.id.is_none()
+                        && m.description.is_none()
+                        && m.meaning.is_none())
+                ));
+            }
+            _ => panic!("expected element"),
+        }
+    }
+
+    #[test]
+    fn test_i18n_attribute_with_id_meaning_description() {
+        let nodes = parse(r#"<h1 i18n="greeting|welcome message@@intro">Hello</h1>"#);
+        match &nodes[0] {
+            TemplateNode::Element(e) => {
+                let meta = match e.attributes.first() {
+                    Some(TemplateAttribute::I18n(m)) => m.clone(),
+                    other => panic!("expected i18n attr, got {other:?}"),
+                };
+                assert_eq!(meta.id.as_deref(), Some("intro"));
+                assert_eq!(meta.meaning.as_deref(), Some("greeting"));
+                assert_eq!(meta.description.as_deref(), Some("welcome message"));
+            }
+            _ => panic!("expected element"),
+        }
+    }
+
+    #[test]
+    fn test_i18n_attribute_description_only() {
+        let nodes = parse(r#"<h1 i18n="welcome message">Hello</h1>"#);
+        match &nodes[0] {
+            TemplateNode::Element(e) => match e.attributes.first() {
+                Some(TemplateAttribute::I18n(m)) => {
+                    assert_eq!(m.description.as_deref(), Some("welcome message"));
+                    assert!(m.meaning.is_none());
+                    assert!(m.id.is_none());
+                }
+                other => panic!("expected i18n attr, got {other:?}"),
+            },
+            _ => panic!("expected element"),
+        }
+    }
+
+    #[test]
+    fn test_i18n_attr_form() {
+        let nodes = parse(r#"<img alt="Hi" i18n-alt="@@alt-id" />"#);
+        match &nodes[0] {
+            TemplateNode::Element(e) => {
+                let found = e.attributes.iter().any(|a| {
+                    matches!(a, TemplateAttribute::I18nAttr { target, meta }
+                        if target == "alt" && meta.id.as_deref() == Some("alt-id"))
+                });
+                assert!(found, "expected i18n-alt attr");
+            }
+            _ => panic!("expected element"),
+        }
+    }
+
+    #[test]
+    fn test_icu_plural() {
+        let nodes = parse("{ count, plural, =0 {no items} =1 {one item} other {# items} }");
+        assert_eq!(nodes.len(), 1);
+        match &nodes[0] {
+            TemplateNode::IcuExpression(icu) => {
+                assert_eq!(icu.switch_expression, "count");
+                assert!(matches!(icu.category, IcuCategory::Plural));
+                assert_eq!(icu.cases.len(), 3);
+                assert_eq!(icu.cases[0].key, "=0");
+                assert_eq!(icu.cases[0].body, "no items");
+                assert_eq!(icu.cases[2].key, "other");
+                assert_eq!(icu.cases[2].body, "# items");
+            }
+            other => panic!("expected icu, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_icu_plural_multiline_inside_element() {
+        let nodes = parse(
+            "<p i18n=\"@@x\">\n  { count, plural,\n    =0 {no items}\n    =1 {one item}\n    other {many items}\n  }\n</p>",
+        );
+        assert_eq!(nodes.len(), 1);
+        match &nodes[0] {
+            TemplateNode::Element(e) => {
+                let icu = e
+                    .children
+                    .iter()
+                    .find_map(|n| match n {
+                        TemplateNode::IcuExpression(i) => Some(i),
+                        _ => None,
+                    })
+                    .expect("expected an ICU child");
+                assert_eq!(icu.cases.len(), 3);
+            }
+            _ => panic!("expected element"),
+        }
+    }
+
+    #[test]
+    fn test_icu_inside_text_with_surrounding_words() {
+        // Reproduces the canonical Angular i18n shape:
+        // `<p>You have {count, plural, ...} in your cart.</p>` — text
+        // surrounds the ICU on both sides. The ICU's leading `{` must not
+        // be swallowed by the text run that precedes it.
+        let nodes = parse(
+            "<p i18n=\"@@cart.items\">\n  You have {count, plural,\n    =0 {no items}\n    =1 {one item}\n    other {# items}\n  } in your cart.\n</p>",
+        );
+        match &nodes[0] {
+            TemplateNode::Element(e) => {
+                let icu = e
+                    .children
+                    .iter()
+                    .find_map(|n| match n {
+                        TemplateNode::IcuExpression(i) => Some(i),
+                        _ => None,
+                    })
+                    .expect("expected an ICU child");
+                assert_eq!(icu.cases.len(), 3);
+                assert_eq!(icu.switch_expression, "count");
+            }
+            _ => panic!("expected element"),
+        }
+    }
+
+    #[test]
+    fn test_icu_with_nested_interpolation_in_case_body() {
+        // Common Angular i18n pattern: the `other` case interpolates the
+        // pluralized expression back into the message via `{{...}}`.
+        let nodes = parse(
+            "<p i18n>{ count, plural,\n=0 {no items}\n=1 {one item}\nother {{{count}} items}\n}</p>",
+        );
+        match &nodes[0] {
+            TemplateNode::Element(e) => {
+                let icu = e
+                    .children
+                    .iter()
+                    .find_map(|n| match n {
+                        TemplateNode::IcuExpression(i) => Some(i),
+                        _ => None,
+                    })
+                    .expect("ICU child");
+                assert_eq!(icu.cases.len(), 3);
+                assert!(
+                    icu.cases[2].body.contains("{{count}}"),
+                    "case body should preserve nested interpolation, got: {:?}",
+                    icu.cases[2].body
+                );
+            }
+            _ => panic!("expected element"),
+        }
+    }
+
+    #[test]
+    fn test_icu_select() {
+        let nodes = parse("{ gender, select, male {he} female {she} other {they} }");
+        match &nodes[0] {
+            TemplateNode::IcuExpression(icu) => {
+                assert!(matches!(icu.category, IcuCategory::Select));
+                assert_eq!(icu.cases.len(), 3);
+            }
+            _ => panic!("expected icu"),
         }
     }
 

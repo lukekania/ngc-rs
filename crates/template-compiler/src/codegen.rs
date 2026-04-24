@@ -272,7 +272,30 @@ impl IvyCodegen {
             TemplateNode::SwitchBlock(block) => self.generate_switch_block(block),
             TemplateNode::LetDeclaration(decl) => self.generate_let_declaration(decl),
             TemplateNode::DeferBlock(block) => self.generate_defer_block(block),
+            TemplateNode::IcuExpression(icu) => self.generate_icu_expression(icu),
         }
+    }
+
+    /// Emit an ICU message as a `$localize`-tagged placeholder text node.
+    ///
+    /// Full ICU codegen (`ɵɵi18n` + runtime selector arms) is substantial;
+    /// this first pass renders the `other` branch (or the first case when
+    /// `other` is missing) so templates parse and render, while the
+    /// extractor still sees the complete message for translation.
+    fn generate_icu_expression(&mut self, icu: &crate::ast::IcuExpressionNode) {
+        let fallback = icu
+            .cases
+            .iter()
+            .find(|c| c.key == "other")
+            .or_else(|| icu.cases.first())
+            .map(|c| c.body.clone())
+            .unwrap_or_default();
+        let slot = self.slot_index;
+        self.slot_index += 1;
+        let escaped = escape_js_string(&fallback);
+        self.creation.push(format!(
+            "        \u{0275}\u{0275}text({slot}, '{escaped}');"
+        ));
     }
 
     /// Namespace the current position's elements inherit — top of the stack,
@@ -336,6 +359,19 @@ impl IvyCodegen {
         });
         if let Some((dir_name, dir_expr)) = structural {
             self.generate_structural_directive(el, &dir_name, &dir_expr);
+            return;
+        }
+
+        // Elements carrying an `i18n` attribute take the i18n code path:
+        // children are absorbed into a `$localize` message, and the
+        // standard creation/update instructions are replaced with
+        // `ɵɵi18n` / `ɵɵi18nExp` / `ɵɵi18nApply`.
+        let i18n_meta = el.attributes.iter().find_map(|a| match a {
+            TemplateAttribute::I18n(meta) => Some(meta.clone()),
+            _ => None,
+        });
+        if let Some(meta) = i18n_meta {
+            self.generate_i18n_element(el, &meta);
             return;
         }
 
@@ -529,6 +565,8 @@ impl IvyCodegen {
             // using the ref name can resolve to the correct ɵɵreference(slot).
             self.reserve_template_refs(&refs);
 
+            self.emit_i18n_attributes(el, slot);
+
             // Bindings for void elements
             self.emit_element_bindings(el, slot);
 
@@ -631,6 +669,8 @@ impl IvyCodegen {
                 }
             }
 
+            self.emit_i18n_attributes(el, slot);
+
             // Property bindings in update block — emitted before children
             // so ɵɵadvance() targets the correct element slot.
             self.emit_element_bindings(el, slot);
@@ -649,6 +689,146 @@ impl IvyCodegen {
             // refs at their pre-reserved slots (matches Angular's output).
             self.emit_reference_calls(&refs);
         }
+    }
+
+    /// Compile an element whose `i18n` attribute marks its children as a
+    /// translatable message. The element itself is emitted normally
+    /// (including any static attributes, property bindings, and
+    /// `i18n-<attr>` markers), then its children are replaced with an
+    /// `ɵɵi18n(slot, msgIdx)` creation instruction plus the matching
+    /// `ɵɵi18nExp` / `ɵɵi18nApply` update-block calls for each
+    /// interpolation placeholder in the message.
+    fn generate_i18n_element(&mut self, el: &ElementNode, meta: &I18nMeta) {
+        let message = crate::i18n::compile_message(&el.children, meta);
+        // Strip the `i18n` marker from attributes before emitting — it's
+        // metadata for the compiler, not a runtime attribute.
+        let attributes: Vec<TemplateAttribute> = el
+            .attributes
+            .iter()
+            .filter(|a| !matches!(a, TemplateAttribute::I18n(_)))
+            .cloned()
+            .collect();
+
+        // `ɵɵelementStart` takes the parent slot; the i18n block lives on
+        // the next slot inside the element.
+        let parent_slot = self.slot_index;
+        self.slot_index += 1;
+        let i18n_slot = self.slot_index;
+        self.slot_index += 1;
+
+        let msg_idx = self.register_i18n_const(&message.localize_expr);
+
+        // Static attributes / binding markers for the enclosing element.
+        let static_attrs: Vec<(&str, &str)> = attributes
+            .iter()
+            .filter_map(|a| match a {
+                TemplateAttribute::Static {
+                    name,
+                    value: Some(v),
+                } => Some((name.as_str(), v.as_str())),
+                TemplateAttribute::Static { name, value: None } => Some((name.as_str(), "")),
+                _ => None,
+            })
+            .collect();
+        let consts_idx = if static_attrs.is_empty() {
+            None
+        } else {
+            Some(self.register_const(&static_attrs))
+        };
+
+        let start_instr = "\u{0275}\u{0275}elementStart";
+        let end_instr = "\u{0275}\u{0275}elementEnd";
+        let i18n_instr = "\u{0275}\u{0275}i18n";
+        self.ivy_imports.insert(start_instr.to_string());
+        self.ivy_imports.insert(end_instr.to_string());
+        self.ivy_imports.insert(i18n_instr.to_string());
+
+        match consts_idx {
+            Some(ci) => self
+                .creation
+                .push(format!("{start_instr}({parent_slot}, '{}', {ci});", el.tag)),
+            None => self
+                .creation
+                .push(format!("{start_instr}({parent_slot}, '{}');", el.tag)),
+        }
+        self.creation
+            .push(format!("{i18n_instr}({i18n_slot}, {msg_idx});"));
+        self.creation.push(format!("{end_instr}();"));
+
+        // Update block: one ɵɵi18nExp per placeholder, followed by a
+        // single ɵɵi18nApply tying them to the i18n slot.
+        if !message.interpolations.is_empty() {
+            self.ivy_imports
+                .insert("\u{0275}\u{0275}i18nExp".to_string());
+            self.ivy_imports
+                .insert("\u{0275}\u{0275}i18nApply".to_string());
+            self.add_advance(i18n_slot);
+            for expr in &message.interpolations {
+                let compiled = ctx_expr_with_locals(expr, &self.local_vars);
+                self.update
+                    .push(format!("\u{0275}\u{0275}i18nExp({compiled});"));
+                self.var_count += 1;
+            }
+            self.update
+                .push(format!("\u{0275}\u{0275}i18nApply({i18n_slot});"));
+        }
+    }
+
+    /// Register a bare expression (e.g. a `$localize`-tagged template
+    /// literal) in the consts array and return its index. Unlike
+    /// `register_const`, the payload is inserted verbatim rather than
+    /// formatted as a static-attribute tuple array.
+    fn register_i18n_const(&mut self, expr: &str) -> usize {
+        let idx = self.consts.len();
+        self.consts.push(expr.to_string());
+        idx
+    }
+
+    /// Emit `ɵɵi18nAttributes(slot, idx)` for any `i18n-<attr>` markers on
+    /// the element. Each marker is paired with a matching static attribute
+    /// (by name); the attribute's value is compiled into a `$localize`
+    /// message and referenced from a consts array that lists the affected
+    /// attribute names under `AttributeMarker.I18n` (6).
+    fn emit_i18n_attributes(&mut self, el: &ElementNode, slot: u32) {
+        let mut markers: Vec<(String, I18nMeta)> = Vec::new();
+        for a in &el.attributes {
+            if let TemplateAttribute::I18nAttr { target, meta } = a {
+                markers.push((target.clone(), meta.clone()));
+            }
+        }
+        if markers.is_empty() {
+            return;
+        }
+
+        // Build: [AttributeMarker.I18n (6), <name>, <messageConstIdx>, ...]
+        // Each (name, msgIdx) pair follows the marker so the runtime knows
+        // which attribute receives which translated message.
+        let mut parts: Vec<String> = vec!["6".to_string()];
+        for (target, meta) in &markers {
+            let value = el
+                .attributes
+                .iter()
+                .find_map(|a| match a {
+                    TemplateAttribute::Static { name, value } if name == target => {
+                        Some(value.clone().unwrap_or_default())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let msg = crate::i18n::compile_attribute_message(&value, meta);
+            let msg_idx = self.register_i18n_const(&msg.localize_expr);
+            parts.push(format!("'{}'", escape_js_string(target)));
+            parts.push(msg_idx.to_string());
+        }
+        let marker_const = format!("[{}]", parts.join(", "));
+        let marker_idx = self.consts.len();
+        self.consts.push(marker_const);
+
+        self.ivy_imports
+            .insert("\u{0275}\u{0275}i18nAttributes".to_string());
+        self.creation.push(format!(
+            "\u{0275}\u{0275}i18nAttributes({slot}, {marker_idx});"
+        ));
     }
 
     /// Reserve a slot for each template reference on the current element and
@@ -4112,5 +4292,103 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn test_i18n_element_emits_localize_and_i18n_instruction() {
+        let output = compile_template("<h1 i18n>Hello</h1>");
+        let dc = &output.static_fields[0];
+        assert!(
+            output.ivy_imports.contains("\u{0275}\u{0275}i18n"),
+            "ɵɵi18n should be imported"
+        );
+        assert!(
+            dc.contains("$localize`Hello`"),
+            "consts should contain $localize`Hello`: {dc}"
+        );
+        assert!(
+            dc.contains("\u{0275}\u{0275}i18n(1, 0);"),
+            "ɵɵi18n(1, 0) should reference consts[0]: {dc}"
+        );
+        assert!(
+            dc.contains("\u{0275}\u{0275}elementStart(0, 'h1');"),
+            "elementStart for h1: {dc}"
+        );
+    }
+
+    #[test]
+    fn test_i18n_element_with_meta_emits_prefix() {
+        let output = compile_template(r#"<h1 i18n="greeting|welcome@@intro">Hi</h1>"#);
+        let dc = &output.static_fields[0];
+        assert!(
+            dc.contains("$localize`:greeting|welcome@@intro:Hi`"),
+            "meta prefix should be emitted in the localize literal: {dc}"
+        );
+    }
+
+    #[test]
+    fn test_i18n_element_interpolation_emits_i18n_exp_apply() {
+        let output = compile_template("<p i18n>Hello, {{ name }}!</p>");
+        let dc = &output.static_fields[0];
+        assert!(
+            output.ivy_imports.contains("\u{0275}\u{0275}i18nExp"),
+            "ɵɵi18nExp should be imported"
+        );
+        assert!(
+            output.ivy_imports.contains("\u{0275}\u{0275}i18nApply"),
+            "ɵɵi18nApply should be imported"
+        );
+        assert!(
+            dc.contains("\u{0275}\u{0275}i18nExp(ctx.name);"),
+            "update block should emit ɵɵi18nExp(ctx.name): {dc}"
+        );
+        assert!(
+            dc.contains("\u{0275}\u{0275}i18nApply(1);"),
+            "update block should emit ɵɵi18nApply(slot): {dc}"
+        );
+        assert!(
+            dc.contains(":INTERPOLATION:"),
+            "placeholder marker should be in the message: {dc}"
+        );
+    }
+
+    #[test]
+    fn test_i18n_attr_emits_i18n_attributes_instruction() {
+        let output = compile_template(r#"<img alt="Hello" i18n-alt="@@alt-id" />"#);
+        let dc = &output.static_fields[0];
+        assert!(
+            output
+                .ivy_imports
+                .contains("\u{0275}\u{0275}i18nAttributes"),
+            "ɵɵi18nAttributes should be imported"
+        );
+        assert!(
+            dc.contains("\u{0275}\u{0275}i18nAttributes(0,"),
+            "ɵɵi18nAttributes should target element slot 0: {dc}"
+        );
+        assert!(
+            dc.contains("$localize`:@@alt-id:Hello`"),
+            "consts should carry the attribute's localize message: {dc}"
+        );
+        assert!(
+            dc.contains("[6, 'alt', "),
+            "AttributeMarker.I18n (6) entry should list the attr name: {dc}"
+        );
+    }
+
+    #[test]
+    fn test_icu_plural_inside_i18n_is_inlined() {
+        let output = compile_template(
+            "<span i18n>{ count, plural, =0 {none} =1 {one} other {many} }</span>",
+        );
+        let dc = &output.static_fields[0];
+        assert!(
+            dc.contains("{count, plural, "),
+            "ICU body should be inlined into the localize message: {dc}"
+        );
+        assert!(
+            dc.contains("=0 {none}") && dc.contains("other {many}"),
+            "ICU case bodies should be preserved: {dc}"
+        );
     }
 }

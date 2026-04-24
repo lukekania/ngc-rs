@@ -187,6 +187,14 @@ pub enum NgcError {
         /// Description of what went wrong.
         message: String,
     },
+
+    /// A user-facing configuration error not tied to a specific file
+    /// (e.g. a CLI flag that requires a corresponding `angular.json` block).
+    #[error("configuration error: {message}")]
+    ConfigError {
+        /// Description of the misconfiguration.
+        message: String,
+    },
 }
 
 /// A type alias for Results using NgcError.

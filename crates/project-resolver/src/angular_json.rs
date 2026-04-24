@@ -31,6 +31,61 @@ pub struct RawProject {
     pub source_root: Option<String>,
     /// Architect targets (build, serve, etc.).
     pub architect: Option<RawArchitect>,
+    /// Per-project i18n configuration: source locale + map of target locales
+    /// to translation files.
+    pub i18n: Option<RawI18nConfig>,
+}
+
+/// Raw i18n block from `angular.json`:
+/// ```jsonc
+/// {
+///   "sourceLocale": "en-US",
+///   "locales": {
+///     "de": "src/locale/messages.de.xlf",
+///     "fr": { "translation": "src/locale/messages.fr.xlf", "baseHref": "/fr/" }
+///   }
+/// }
+/// ```
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RawI18nConfig {
+    /// Source language code (e.g. `"en-US"`); defaults to `en-US` when absent.
+    pub source_locale: Option<RawSourceLocale>,
+    /// Map of target locale code → translation file (or object form).
+    pub locales: Option<HashMap<String, RawLocaleEntry>>,
+}
+
+/// `sourceLocale` accepts either a bare string or an object with `code`/`baseHref`.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum RawSourceLocale {
+    /// Simple `"en-US"` form.
+    Code(String),
+    /// Object form `{ "code": "en-US", "baseHref": "/" }`.
+    Object {
+        /// Locale code.
+        code: String,
+        /// Base-href applied to the source-locale build.
+        #[serde(rename = "baseHref")]
+        base_href: Option<String>,
+    },
+}
+
+/// `locales[code]` accepts either a translation-file path or an object form
+/// with `translation` and optional `baseHref`.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum RawLocaleEntry {
+    /// Simple `"src/locale/messages.de.xlf"` form.
+    Simple(String),
+    /// Object form `{ "translation": "...", "baseHref": "/de/" }`.
+    Object {
+        /// Path to the translation file.
+        translation: Option<String>,
+        /// Base-href applied to this locale's build.
+        #[serde(rename = "baseHref")]
+        base_href: Option<String>,
+    },
 }
 
 /// Architect section containing build targets.
@@ -274,6 +329,34 @@ pub struct ResolvedAngularProject {
     pub subresource_integrity: bool,
     /// Language for inline component `styles: [\`...\`]` literals.
     pub inline_style_language: InlineStyleLanguage,
+    /// Resolved i18n configuration. `None` when the project does not declare
+    /// an `i18n` block.
+    pub i18n: Option<I18nConfig>,
+}
+
+/// Resolved i18n configuration with absolute paths.
+#[derive(Debug, Clone)]
+pub struct I18nConfig {
+    /// Source locale code (e.g. `"en-US"`).
+    pub source_locale: String,
+    /// `baseHref` applied to the source-locale build (overrides global).
+    pub source_base_href: Option<String>,
+    /// Map of locale code → resolved entry. Sorted to keep iteration
+    /// deterministic across runs.
+    pub locales: std::collections::BTreeMap<String, LocaleEntry>,
+}
+
+/// A single resolved target locale.
+#[derive(Debug, Clone)]
+pub struct LocaleEntry {
+    /// Locale code (e.g. `"de"`).
+    pub locale: String,
+    /// Absolute path to the translation file (`.xlf`, `.json`, `.arb`).
+    /// `None` when the locale is declared without translations (the source
+    /// locale acts as the fallback).
+    pub translation_path: Option<PathBuf>,
+    /// `baseHref` applied to this locale's build.
+    pub base_href: Option<String>,
 }
 
 /// Language applied to inline component `styles: [\`...\`]` literals when no
@@ -452,6 +535,10 @@ pub fn resolve_angular_project(
         .unwrap_or(false);
     let inline_style_language =
         InlineStyleLanguage::parse(options.and_then(|o| o.inline_style_language.as_deref()));
+    let i18n = project
+        .i18n
+        .as_ref()
+        .map(|raw| resolve_i18n(raw, &base_dir));
 
     debug!(
         project = %name,
@@ -478,7 +565,43 @@ pub fn resolve_angular_project(
         cross_origin,
         subresource_integrity,
         inline_style_language,
+        i18n,
     })
+}
+
+/// Resolve a `RawI18nConfig` from `angular.json` into absolute paths.
+fn resolve_i18n(raw: &RawI18nConfig, base_dir: &Path) -> I18nConfig {
+    let (source_locale, source_base_href) = match &raw.source_locale {
+        Some(RawSourceLocale::Code(c)) => (c.clone(), None),
+        Some(RawSourceLocale::Object { code, base_href }) => (code.clone(), base_href.clone()),
+        None => ("en-US".to_string(), None),
+    };
+    let mut locales = std::collections::BTreeMap::new();
+    if let Some(map) = &raw.locales {
+        for (code, entry) in map {
+            let resolved = match entry {
+                RawLocaleEntry::Simple(path) => LocaleEntry {
+                    locale: code.clone(),
+                    translation_path: Some(base_dir.join(path)),
+                    base_href: None,
+                },
+                RawLocaleEntry::Object {
+                    translation,
+                    base_href,
+                } => LocaleEntry {
+                    locale: code.clone(),
+                    translation_path: translation.as_ref().map(|t| base_dir.join(t)),
+                    base_href: base_href.clone(),
+                },
+            };
+            locales.insert(code.clone(), resolved);
+        }
+    }
+    I18nConfig {
+        source_locale,
+        source_base_href,
+        locales,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -963,5 +1086,77 @@ mod tests {
         let f = write_temp_json(json);
         let result = resolve_angular_project(f.path(), None, None).unwrap();
         assert_eq!(result.polyfills, vec!["zone.js", "zone.js/testing"]);
+    }
+
+    #[test]
+    fn test_parse_i18n_block_simple_form() {
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "i18n": {
+                        "sourceLocale": "en-US",
+                        "locales": {
+                            "de": "src/locale/messages.de.xlf",
+                            "fr": { "translation": "src/locale/messages.fr.xlf", "baseHref": "/fr/" }
+                        }
+                    },
+                    "architect": { "build": { "options": {
+                        "outputPath": "dist", "tsConfig": "tsconfig.json"
+                    } } }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let result = resolve_angular_project(f.path(), None, None).unwrap();
+        let i18n = result.i18n.expect("i18n block should be parsed");
+        assert_eq!(i18n.source_locale, "en-US");
+        let de = i18n.locales.get("de").expect("de locale present");
+        assert!(de
+            .translation_path
+            .as_ref()
+            .unwrap()
+            .ends_with("src/locale/messages.de.xlf"));
+        assert!(de.base_href.is_none());
+        let fr = i18n.locales.get("fr").expect("fr locale present");
+        assert_eq!(fr.base_href.as_deref(), Some("/fr/"));
+    }
+
+    #[test]
+    fn test_parse_i18n_block_source_locale_object_form() {
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "i18n": {
+                        "sourceLocale": { "code": "en-US", "baseHref": "/en/" },
+                        "locales": {}
+                    },
+                    "architect": { "build": { "options": {
+                        "outputPath": "dist", "tsConfig": "tsconfig.json"
+                    } } }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let result = resolve_angular_project(f.path(), None, None).unwrap();
+        let i18n = result.i18n.expect("i18n block should be parsed");
+        assert_eq!(i18n.source_locale, "en-US");
+        assert_eq!(i18n.source_base_href.as_deref(), Some("/en/"));
+        assert!(i18n.locales.is_empty());
+    }
+
+    #[test]
+    fn test_no_i18n_block_resolves_to_none() {
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "architect": { "build": { "options": {
+                        "outputPath": "dist", "tsConfig": "tsconfig.json"
+                    } } }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let result = resolve_angular_project(f.path(), None, None).unwrap();
+        assert!(result.i18n.is_none());
     }
 }

@@ -10,6 +10,7 @@ mod codegen;
 mod directive_codegen;
 mod extract;
 mod factory_codegen;
+pub mod i18n;
 mod injectable_codegen;
 mod ng_module_codegen;
 mod parser;
@@ -17,6 +18,8 @@ mod pipe_codegen;
 pub mod preprocessor;
 mod rewrite;
 mod selector;
+
+pub use parser::parse_template;
 
 use std::path::{Path, PathBuf};
 
@@ -428,6 +431,39 @@ pub fn compile_component(source: &str, file_path: &Path) -> NgcResult<CompiledFi
     compile_component_with_styles(source, file_path, &StyleContext::default())
 }
 
+/// Extract translatable i18n messages from a single component file.
+///
+/// Parses the component's inline `template:` (or external `templateUrl`),
+/// walks the template AST, and returns one `ExtractedI18nMessage` per
+/// `i18n` element / `i18n-<attr>` marker found. Files that contain no
+/// `@Component` decorator return an empty list.
+pub fn extract_i18n_from_file(file_path: &Path) -> NgcResult<Vec<i18n::ExtractedI18nMessage>> {
+    let source = std::fs::read_to_string(file_path).map_err(|e| NgcError::Io {
+        path: file_path.to_path_buf(),
+        source: e,
+    })?;
+    let extracted = match extract::extract_component(&source, file_path)? {
+        Some(ext) => ext,
+        None => return Ok(Vec::new()),
+    };
+    let resolved_template;
+    let template_source = if let Some(ref t) = extracted.template {
+        t.as_str()
+    } else if let Some(ref url) = extracted.template_url {
+        let base_dir = file_path.parent().unwrap_or(Path::new("."));
+        let html_path = base_dir.join(url);
+        resolved_template = std::fs::read_to_string(&html_path).map_err(|e| NgcError::Io {
+            path: html_path,
+            source: e,
+        })?;
+        &resolved_template
+    } else {
+        return Ok(Vec::new());
+    };
+    let nodes = parser::parse_template(template_source, file_path)?;
+    Ok(i18n::extract_messages(&nodes))
+}
+
 /// Variant of [`compile_component`] that preprocesses SCSS / Less / Stylus
 /// component styles into CSS before codegen emits the `styles:` array.
 pub fn compile_component_with_styles(
@@ -509,6 +545,31 @@ pub fn compile_component_with_styles(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_extract_i18n_from_file_collects_messages() {
+        use std::io::Write;
+        let source = r#"import { Component } from '@angular/core';
+
+@Component({
+  selector: 'app-x',
+  standalone: true,
+  template: '<h1 i18n="@@intro">Hello</h1><img alt="Hi" i18n-alt="@@alt" />',
+})
+export class XComponent {}
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("x.component.ts");
+        let mut f = std::fs::File::create(&path).expect("create");
+        f.write_all(source.as_bytes()).expect("write");
+        drop(f);
+
+        let messages = extract_i18n_from_file(&path).expect("extract");
+        assert_eq!(messages.len(), 2);
+        let ids: Vec<&str> = messages.iter().filter_map(|m| m.id.as_deref()).collect();
+        assert!(ids.contains(&"intro"));
+        assert!(ids.contains(&"alt"));
+    }
 
     #[test]
     fn test_compile_and_transform_roundtrip() {
