@@ -282,4 +282,139 @@ mod tests {
         let result = resolve_relative_import("../shared.mjs", &from).unwrap();
         assert!(result.ends_with("shared.mjs"));
     }
+
+    // --- subpath imports (`#`-prefixed) ---
+
+    #[test]
+    fn test_subpath_import_literal_from_project_root() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r##"{ "imports": { "#internal/helper": "./src/internal/helper.js" } }"##,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("src/internal")).unwrap();
+        fs::write(
+            dir.path().join("src/internal/helper.js"),
+            "export const helper = 1;",
+        )
+        .unwrap();
+
+        let result = resolve_subpath_import("#internal/helper", None, dir.path(), DEV).unwrap();
+        assert!(result.ends_with("src/internal/helper.js"));
+    }
+
+    #[test]
+    fn test_subpath_import_wildcard_substitution() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r##"{ "imports": { "#internal/*": "./src/internal/*.js" } }"##,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("src/internal")).unwrap();
+        fs::write(
+            dir.path().join("src/internal/foo.js"),
+            "export const f = 1;",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/internal/bar.js"),
+            "export const b = 2;",
+        )
+        .unwrap();
+
+        let foo = resolve_subpath_import("#internal/foo", None, dir.path(), DEV).unwrap();
+        let bar = resolve_subpath_import("#internal/bar", None, dir.path(), DEV).unwrap();
+        assert!(foo.ends_with("src/internal/foo.js"));
+        assert!(bar.ends_with("src/internal/bar.js"));
+    }
+
+    #[test]
+    fn test_subpath_import_conditional_picks_browser() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r##"{
+              "imports": {
+                "#dep": {
+                  "node": "./node/dep.js",
+                  "browser": "./browser/dep.mjs",
+                  "default": "./default/dep.js"
+                }
+              }
+            }"##,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("browser")).unwrap();
+        fs::write(dir.path().join("browser/dep.mjs"), "export const d = 'b';").unwrap();
+
+        let result = resolve_subpath_import("#dep", None, dir.path(), DEV).unwrap();
+        assert!(result.ends_with("browser/dep.mjs"));
+    }
+
+    #[test]
+    fn test_subpath_import_scopes_to_nearest_ancestor() {
+        // Nested package.json at node_modules/dep owns any `#` specifier used
+        // inside dep/dist/file.js — not the project-root package.json.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r##"{ "imports": { "#alias": "./project/alias.js" } }"##,
+        )
+        .unwrap();
+
+        let dep_dir = dir.path().join("node_modules/dep");
+        fs::create_dir_all(dep_dir.join("dist")).unwrap();
+        fs::write(
+            dep_dir.join("package.json"),
+            r##"{ "imports": { "#alias": "./lib/alias.js" } }"##,
+        )
+        .unwrap();
+        fs::create_dir_all(dep_dir.join("lib")).unwrap();
+        fs::write(dep_dir.join("lib/alias.js"), "export const a = 'dep';").unwrap();
+
+        let from = dep_dir.join("dist/main.js");
+        let result = resolve_subpath_import("#alias", Some(&from), dir.path(), DEV).unwrap();
+        assert!(
+            result.ends_with("node_modules/dep/lib/alias.js"),
+            "{}",
+            result.display()
+        );
+    }
+
+    #[test]
+    fn test_subpath_import_bare_specifier_target() {
+        // A `#` alias can point at a bare specifier, which must round-trip
+        // through the node_modules resolver.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r##"{ "imports": { "#clone": "clone-pkg" } }"##,
+        )
+        .unwrap();
+        let clone_dir = dir.path().join("node_modules/clone-pkg");
+        fs::create_dir_all(&clone_dir).unwrap();
+        fs::write(
+            clone_dir.join("package.json"),
+            r#"{ "module": "./index.mjs" }"#,
+        )
+        .unwrap();
+        fs::write(clone_dir.join("index.mjs"), "export default 1;").unwrap();
+
+        let result = resolve_subpath_import("#clone", None, dir.path(), DEV).unwrap();
+        assert!(result.ends_with("node_modules/clone-pkg/index.mjs"));
+    }
+
+    #[test]
+    fn test_subpath_import_no_match_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r##"{ "imports": { "#a": "./a.js" } }"##,
+        )
+        .unwrap();
+        let err = resolve_subpath_import("#missing", None, dir.path(), DEV);
+        assert!(err.is_err());
+    }
 }

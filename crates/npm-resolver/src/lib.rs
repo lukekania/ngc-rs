@@ -342,6 +342,90 @@ mod tests {
         assert!(result.modules.is_empty());
     }
 
+    /// A project file imports `#internal/helper`, which the root package.json
+    /// maps via a wildcard to a project-relative file. The crawler must pull
+    /// in both the importing file and the target.
+    #[test]
+    fn test_crawl_resolves_subpath_import() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Project root with an imports map and the target file.
+        fs::write(
+            dir.path().join("package.json"),
+            r##"{ "imports": { "#internal/*": "./src/internal/*.js" } }"##,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("src/internal")).unwrap();
+        fs::write(
+            dir.path().join("src/internal/helper.js"),
+            "export const helper = 42;\n",
+        )
+        .unwrap();
+
+        // A no-op node_modules so the crawler doesn't early-return.
+        fs::create_dir_all(dir.path().join("node_modules")).unwrap();
+
+        let result = resolve_npm_dependencies(&["#internal/helper".to_string()], dir.path(), DEV)
+            .expect("should resolve");
+
+        assert!(
+            result.resolved_specifiers.contains("#internal/helper"),
+            "specifier should be recorded"
+        );
+        assert!(
+            result
+                .modules
+                .keys()
+                .any(|p| p.ends_with("src/internal/helper.js")),
+            "helper.js should be crawled, got {:?}",
+            result.modules.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// A file inside an npm dep uses `#`-prefixed imports scoped to that dep's
+    /// own package.json, not the project's. Verifies the crawler follows
+    /// transitive subpath imports and picks the right ancestor.
+    #[test]
+    fn test_crawl_subpath_import_scoped_to_dep_package_json() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("node_modules")).unwrap();
+
+        let dep = dir.path().join("node_modules/dep-a");
+        fs::create_dir_all(dep.join("src/internal")).unwrap();
+        fs::create_dir_all(dep.join("dist")).unwrap();
+        fs::write(
+            dep.join("package.json"),
+            r##"{ "module": "./dist/index.mjs", "imports": { "#priv/*": "./src/internal/*.mjs" } }"##,
+        )
+        .unwrap();
+        fs::write(
+            dep.join("dist/index.mjs"),
+            "import { secret } from '#priv/secret';\nexport const v = secret;\n",
+        )
+        .unwrap();
+        fs::write(
+            dep.join("src/internal/secret.mjs"),
+            "export const secret = 99;\n",
+        )
+        .unwrap();
+
+        let result = resolve_npm_dependencies(&["dep-a".to_string()], dir.path(), DEV)
+            .expect("should resolve");
+
+        assert!(
+            result
+                .modules
+                .keys()
+                .any(|p| p.ends_with("src/internal/secret.mjs")),
+            "dep's `#priv/secret` target should be pulled in, got {:?}",
+            result.modules.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            result.resolved_specifiers.contains("#priv/secret"),
+            "transitive subpath specifier should be recorded"
+        );
+    }
+
     /// Integration test covering the end-to-end dev vs prod split: a package
     /// exposes different entry files for the `development` and `production`
     /// conditions, and each build mode pulls in its own transitive graph.
