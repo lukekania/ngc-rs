@@ -6,6 +6,7 @@
 use std::path::Path;
 
 use ngc_diagnostics::NgcResult;
+use ngc_template_compiler::host_codegen;
 use oxc_ast::ast::{Expression, ObjectExpression, ObjectPropertyKind, PropertyKey};
 use oxc_span::GetSpan;
 
@@ -321,56 +322,10 @@ pub fn build_host_bindings(
             if let ObjectPropertyKind::ObjectProperty(p) = prop {
                 let key = prop_key_text(&p.key, source);
                 if let Expression::StringLiteral(s) = &p.value {
-                    let expr = compile_host_expression(&s.value);
-                    if let Some(style_prop) = key.strip_prefix("style.") {
-                        // style.X → ɵɵstyleProp (2 vars per style binding)
-                        let fn_name = if ng_import.is_empty() {
-                            "\u{0275}\u{0275}styleProp".to_string()
-                        } else {
-                            format!("{ng_import}.\u{0275}\u{0275}styleProp")
-                        };
-                        binding_stmts.push(format!("{fn_name}(\"{style_prop}\", {expr})"));
-                        host_vars += 2;
-                    } else if let Some(class_name) = key.strip_prefix("class.") {
-                        // class.X → ɵɵclassProp (2 vars per class binding)
-                        let fn_name = if ng_import.is_empty() {
-                            "\u{0275}\u{0275}classProp".to_string()
-                        } else {
-                            format!("{ng_import}.\u{0275}\u{0275}classProp")
-                        };
-                        binding_stmts.push(format!("{fn_name}(\"{class_name}\", {expr})"));
-                        host_vars += 2;
-                    } else if key == "class" {
-                        // class → ɵɵclassMap
-                        let fn_name = if ng_import.is_empty() {
-                            "\u{0275}\u{0275}classMap".to_string()
-                        } else {
-                            format!("{ng_import}.\u{0275}\u{0275}classMap")
-                        };
-                        binding_stmts.push(format!("{fn_name}({expr})"));
-                        host_vars += 2;
-                    } else if let Some(attr_name) = key.strip_prefix("attr.") {
-                        // attr.X → ɵɵattribute (1 var). Without this branch,
-                        // RouterLink's `[attr.href]` falls through to
-                        // ɵɵproperty, which sets a JS property named
-                        // "attr.href" instead of the HTML attribute.
-                        let fn_name = if ng_import.is_empty() {
-                            "\u{0275}\u{0275}attribute".to_string()
-                        } else {
-                            format!("{ng_import}.\u{0275}\u{0275}attribute")
-                        };
-                        binding_stmts.push(format!("{fn_name}(\"{attr_name}\", {expr})"));
-                        host_vars += 1;
-                    } else {
-                        // Regular property → ɵɵproperty (1 var)
-                        let fn_name = if ng_import.is_empty() {
-                            "\u{0275}\u{0275}property".to_string()
-                        } else {
-                            format!("{ng_import}.\u{0275}\u{0275}property")
-                        };
-                        binding_stmts.push(format!("{fn_name}(\"{key}\", {expr})"));
-                        host_vars += 1;
-                    }
+                    let (stmt, vars) =
+                        host_codegen::dispatch_property_binding(&key, &s.value, ng_import);
+                    binding_stmts.push(stmt);
+                    host_vars += vars;
                 }
             }
         }
@@ -382,15 +337,7 @@ pub fn build_host_bindings(
             if let ObjectPropertyKind::ObjectProperty(p) = prop {
                 let key = prop_key_text(&p.key, source);
                 if let Expression::StringLiteral(s) = &p.value {
-                    let listener_fn = if ng_import.is_empty() {
-                        "\u{0275}\u{0275}listener".to_string()
-                    } else {
-                        format!("{ng_import}.\u{0275}\u{0275}listener")
-                    };
-                    let expr = compile_host_expression(&s.value);
-                    listener_stmts.push(format!(
-                        "{listener_fn}(\"{key}\", function($event) {{ return {expr}; }})"
-                    ));
+                    listener_stmts.push(host_codegen::dispatch_listener(&key, &s.value, ng_import));
                 }
             }
         }
@@ -402,28 +349,7 @@ pub fn build_host_bindings(
         Some(format!("[{}]", attrs.join(", ")))
     };
 
-    let host_bindings = if binding_stmts.is_empty() && listener_stmts.is_empty() {
-        None
-    } else {
-        let mut body = String::new();
-        if !listener_stmts.is_empty() {
-            body.push_str("if (rf & 1) { ");
-            for stmt in &listener_stmts {
-                body.push_str(stmt);
-                body.push_str("; ");
-            }
-            body.push_str("} ");
-        }
-        if !binding_stmts.is_empty() {
-            body.push_str("if (rf & 2) { ");
-            for stmt in &binding_stmts {
-                body.push_str(stmt);
-                body.push_str("; ");
-            }
-            body.push('}');
-        }
-        Some(format!("function(rf, ctx) {{ {body} }}"))
-    };
+    let host_bindings = host_codegen::build_host_bindings_function(&binding_stmts, &listener_stmts);
 
     (host_attrs, host_bindings, host_vars)
 }
@@ -436,234 +362,6 @@ fn prop_key_text(key: &PropertyKey<'_>, source: &str) -> String {
         _ => {
             let span = key.span();
             source[span.start as usize..span.end as usize].to_string()
-        }
-    }
-}
-
-/// Compile a host binding expression by prefixing component property references with `ctx.`
-/// and stripping TypeScript-specific syntax (like `!` non-null assertion).
-///
-/// Parses the expression as TypeScript, walks the AST to find standalone identifiers
-/// (not member expression properties or built-in values), and prefixes them with `ctx.`.
-///
-/// Examples:
-/// - `"checked"` → `ctx.checked`
-/// - `"!!checked"` → `!!ctx.checked`
-/// - `"disabled || null"` → `ctx.disabled || null`
-/// - `"_getMinDate() ? _dateAdapter.toIso8601(_getMinDate()!) : null"`
-///   → `ctx._getMinDate() ? ctx._dateAdapter.toIso8601(ctx._getMinDate()) : null`
-fn compile_host_expression(expr: &str) -> String {
-    let wrapper = format!("var __expr = {expr};");
-    let alloc = oxc_allocator::Allocator::default();
-    let parsed = oxc_parser::Parser::new(&alloc, &wrapper, oxc_span::SourceType::tsx()).parse();
-
-    if !parsed.errors.is_empty() {
-        // If parsing fails, return the expression as-is (better than crashing)
-        tracing::warn!("failed to parse host expression: {expr}");
-        return expr.to_string();
-    }
-
-    // Extract the expression from `var __expr = <expr>;`
-    let init_expr = match &parsed.program.body.first() {
-        Some(oxc_ast::ast::Statement::VariableDeclaration(decl)) => {
-            decl.declarations.first().and_then(|d| d.init.as_ref())
-        }
-        _ => None,
-    };
-
-    let init_expr = match init_expr {
-        Some(e) => e,
-        None => return expr.to_string(),
-    };
-
-    // Collect byte offsets of identifiers that need `ctx.` prefix
-    // and byte ranges of `!` non-null assertions to remove
-    let mut ctx_inserts: Vec<u32> = Vec::new();
-    let mut remove_ranges: Vec<(u32, u32)> = Vec::new();
-
-    collect_ctx_rewrites(init_expr, &mut ctx_inserts, &mut remove_ranges, false);
-
-    // Apply modifications to the original expression string
-    // First, map wrapper offsets back to expression offsets
-    let expr_offset = "var __expr = ".len() as u32;
-
-    let mut result = expr.to_string();
-
-    ctx_inserts.sort_unstable();
-    ctx_inserts.dedup();
-
-    // Merge inserts and removes into a single edit list, then apply from
-    // rightmost to leftmost so each edit only touches characters to the right
-    // of earlier (already-processed) edits — their positions in the mutated
-    // string still match the original offsets.
-    enum Edit {
-        Insert(u32),
-        Remove(u32, u32),
-    }
-    let mut edits: Vec<Edit> = Vec::with_capacity(ctx_inserts.len() + remove_ranges.len());
-    for off in &ctx_inserts {
-        edits.push(Edit::Insert(off - expr_offset));
-    }
-    for (s, e) in &remove_ranges {
-        edits.push(Edit::Remove(s - expr_offset, e - expr_offset));
-    }
-    edits.sort_by_key(|e| {
-        std::cmp::Reverse(match e {
-            Edit::Insert(p) => *p,
-            Edit::Remove(s, _) => *s,
-        })
-    });
-
-    for edit in edits {
-        match edit {
-            Edit::Insert(off) => {
-                let off = off as usize;
-                if off <= result.len() {
-                    result.insert_str(off, "ctx.");
-                }
-            }
-            Edit::Remove(s, e) => {
-                let (s, e) = (s as usize, e as usize);
-                if s <= result.len() && e <= result.len() {
-                    result.replace_range(s..e, "");
-                }
-            }
-        }
-    }
-
-    result
-}
-
-/// Recursively collect identifier positions that need `ctx.` prefix and
-/// TypeScript non-null assertion `!` positions to remove.
-fn collect_ctx_rewrites(
-    expr: &Expression<'_>,
-    ctx_inserts: &mut Vec<u32>,
-    remove_ranges: &mut Vec<(u32, u32)>,
-    is_member_property: bool,
-) {
-    use oxc_ast::ast::*;
-    use oxc_span::GetSpan;
-
-    /// Set of identifiers that should NOT get `ctx.` prefix.
-    fn is_builtin(name: &str) -> bool {
-        matches!(
-            name,
-            "null"
-                | "undefined"
-                | "true"
-                | "false"
-                | "NaN"
-                | "Infinity"
-                | "this"
-                | "Math"
-                | "Date"
-                | "JSON"
-                | "console"
-                | "window"
-                | "document"
-                | "Array"
-                | "Object"
-                | "String"
-                | "Number"
-                | "Boolean"
-                | "Error"
-                | "RegExp"
-                | "Symbol"
-                | "Promise"
-                | "Map"
-                | "Set"
-                | "$event"
-                | "ctx"
-        )
-    }
-
-    match expr {
-        Expression::Identifier(id) if !is_member_property && !is_builtin(&id.name) => {
-            ctx_inserts.push(id.span.start);
-        }
-        Expression::CallExpression(call) => {
-            // `$any(x)` is a template-DSL type assertion; compile it as identity
-            // (emit `x` unchanged) rather than a call to a nonexistent ctx.$any.
-            if let Expression::Identifier(id) = &call.callee {
-                if id.name == "$any" && call.arguments.len() == 1 {
-                    if let Some(arg) = call.arguments.first() {
-                        if !matches!(arg, Argument::SpreadElement(_)) {
-                            let inner = arg.to_expression();
-                            remove_ranges.push((call.span.start, inner.span().start));
-                            remove_ranges.push((inner.span().end, call.span.end));
-                            collect_ctx_rewrites(
-                                inner,
-                                ctx_inserts,
-                                remove_ranges,
-                                is_member_property,
-                            );
-                            return;
-                        }
-                    }
-                }
-            }
-            collect_ctx_rewrites(&call.callee, ctx_inserts, remove_ranges, false);
-            for arg in &call.arguments {
-                if let Argument::SpreadElement(spread) = arg {
-                    collect_ctx_rewrites(&spread.argument, ctx_inserts, remove_ranges, false);
-                } else {
-                    collect_ctx_rewrites(arg.to_expression(), ctx_inserts, remove_ranges, false);
-                }
-            }
-        }
-        Expression::StaticMemberExpression(member) => {
-            // Object gets ctx. prefix, property does not
-            collect_ctx_rewrites(&member.object, ctx_inserts, remove_ranges, false);
-            // property is just an IdentifierName, no rewrite needed
-        }
-        Expression::ComputedMemberExpression(member) => {
-            collect_ctx_rewrites(&member.object, ctx_inserts, remove_ranges, false);
-            collect_ctx_rewrites(&member.expression, ctx_inserts, remove_ranges, false);
-        }
-        Expression::UnaryExpression(unary) => {
-            collect_ctx_rewrites(&unary.argument, ctx_inserts, remove_ranges, false);
-        }
-        Expression::BinaryExpression(binary) => {
-            collect_ctx_rewrites(&binary.left, ctx_inserts, remove_ranges, false);
-            collect_ctx_rewrites(&binary.right, ctx_inserts, remove_ranges, false);
-        }
-        Expression::LogicalExpression(logical) => {
-            collect_ctx_rewrites(&logical.left, ctx_inserts, remove_ranges, false);
-            collect_ctx_rewrites(&logical.right, ctx_inserts, remove_ranges, false);
-        }
-        Expression::ConditionalExpression(cond) => {
-            collect_ctx_rewrites(&cond.test, ctx_inserts, remove_ranges, false);
-            collect_ctx_rewrites(&cond.consequent, ctx_inserts, remove_ranges, false);
-            collect_ctx_rewrites(&cond.alternate, ctx_inserts, remove_ranges, false);
-        }
-        Expression::ParenthesizedExpression(paren) => {
-            collect_ctx_rewrites(&paren.expression, ctx_inserts, remove_ranges, false);
-        }
-        Expression::TSNonNullExpression(non_null) => {
-            // Process the inner expression, then mark the `!` for removal
-            collect_ctx_rewrites(
-                &non_null.expression,
-                ctx_inserts,
-                remove_ranges,
-                is_member_property,
-            );
-            // The `!` is at the end of the expression span, just before the closing
-            let inner_end = non_null.expression.span().end;
-            let outer_end = non_null.span.end;
-            if outer_end > inner_end {
-                remove_ranges.push((inner_end, outer_end));
-            }
-        }
-        Expression::TemplateLiteral(_)
-        | Expression::StringLiteral(_)
-        | Expression::NumericLiteral(_)
-        | Expression::BooleanLiteral(_)
-        | Expression::NullLiteral(_) => {
-            // Literals don't need rewriting
-        }
-        _ => {
-            // For other expression types, leave as-is
         }
     }
 }
@@ -977,81 +675,5 @@ mod tests {
             result.contains("hostVars: 4"),
             "expected hostVars: 4, got: {result}"
         );
-    }
-
-    #[test]
-    fn test_compile_host_expression_simple() {
-        assert_eq!(compile_host_expression("checked"), "ctx.checked");
-    }
-
-    #[test]
-    fn test_compile_host_expression_negation() {
-        assert_eq!(compile_host_expression("!!checked"), "!!ctx.checked");
-    }
-
-    #[test]
-    fn test_compile_host_expression_logical() {
-        assert_eq!(
-            compile_host_expression("disabled || null"),
-            "ctx.disabled || null"
-        );
-    }
-
-    #[test]
-    fn test_compile_host_expression_method_call() {
-        assert_eq!(
-            compile_host_expression("toastClasses()"),
-            "ctx.toastClasses()"
-        );
-    }
-
-    #[test]
-    fn test_compile_host_expression_member_chain() {
-        assert_eq!(
-            compile_host_expression("_rangeInput.rangePicker ? \"dialog\" : null"),
-            "ctx._rangeInput.rangePicker ? \"dialog\" : null"
-        );
-    }
-
-    #[test]
-    fn test_compile_host_expression_ts_non_null() {
-        assert_eq!(
-            compile_host_expression("_getMinDate()!"),
-            "ctx._getMinDate()"
-        );
-    }
-
-    #[test]
-    fn test_compile_host_expression_any_in_listener() {
-        // `$any($event.target).checked` — the CheckboxControlValueAccessor pattern
-        // that regressed in issue #68.
-        assert_eq!(
-            compile_host_expression("onChange($any($event.target).checked)"),
-            "ctx.onChange($event.target.checked)"
-        );
-    }
-
-    #[test]
-    fn test_compile_host_expression_any_over_ctx() {
-        assert_eq!(
-            compile_host_expression("$any(ctx).foo.bar()"),
-            "ctx.foo.bar()"
-        );
-    }
-
-    #[test]
-    fn test_compile_host_expression_any_bare_identifier() {
-        // Just the argument — no member access, no call on the result.
-        assert_eq!(compile_host_expression("$any(value)"), "ctx.value");
-    }
-
-    #[test]
-    fn test_compile_host_expression_complex_ternary() {
-        let result = compile_host_expression(
-            "_getMinDate() ? _dateAdapter.toIso8601(_getMinDate()!) : null",
-        );
-        assert!(result.contains("ctx._getMinDate()"));
-        assert!(result.contains("ctx._dateAdapter.toIso8601"));
-        assert!(!result.contains("!)")); // non-null stripped
     }
 }
