@@ -122,6 +122,8 @@ pub fn generate_template_fn(
         inline_styles: Vec::new(),
         style_urls: Vec::new(),
         input_properties: Vec::new(),
+        host_listeners: Vec::new(),
+        host_bindings: Vec::new(),
         animations_source: None,
     };
 
