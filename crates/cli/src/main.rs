@@ -423,17 +423,29 @@ fn run_build(
 
     // Add edges from project files to npm entry files
     for (specifier, import_sites) in &file_graph.npm_import_sites {
-        if let Some(entry_path) = npm_resolution
-            .resolved_specifiers
-            .contains(specifier)
-            .then(|| {
+        let resolve_entry = || -> Option<PathBuf> {
+            if specifier.starts_with('#') {
+                let from_file = import_sites.first().map(|(p, _)| p.as_path());
+                ngc_npm_resolver::resolve::resolve_subpath_import(
+                    specifier,
+                    from_file,
+                    &config_dir,
+                    export_conditions,
+                )
+                .ok()
+            } else {
                 ngc_npm_resolver::resolve::resolve_bare_specifier(
                     specifier,
                     &config_dir,
                     export_conditions,
                 )
                 .ok()
-            })
+            }
+        };
+        if let Some(entry_path) = npm_resolution
+            .resolved_specifiers
+            .contains(specifier)
+            .then(resolve_entry)
             .flatten()
         {
             if let Some(&to_idx) = path_index.get(&entry_path) {

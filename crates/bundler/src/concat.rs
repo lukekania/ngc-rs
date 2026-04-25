@@ -758,6 +758,41 @@ fn classify_lazy_externals(
 
     let mut out: Vec<ExternalImport> = Vec::with_capacity(externals.len());
     for ext in externals {
+        // Subpath imports (`#foo`) point at a file under the importing
+        // package's `imports` map — typically a project file, occasionally
+        // a bare specifier. Resolve to the actual target so chunk-membership
+        // is checked against the real path, not the alias string. Without
+        // this, every `#`-aliased project file would be misclassified as an
+        // npm cross-chunk import (since the alias is in `bundled_specifiers`)
+        // and emit a stale `import { X } from './main.js'` even when X is
+        // already declared in the lazy chunk itself.
+        if ext.source.starts_with('#') {
+            let resolved = ngc_npm_resolver::resolve::resolve_subpath_import(
+                &ext.source,
+                Some(module_path),
+                p.root_dir,
+                p.export_conditions,
+            )
+            .ok()
+            .and_then(|target| cached_canonicalize(p.canon_cache, &target));
+            match resolved {
+                Some(ref resolved_path) => {
+                    if p.chunk_module_set.contains(resolved_path) {
+                        continue; // same chunk — discard
+                    }
+                    if p.main_chunk_module_set.contains(resolved_path) {
+                        out.push(ext); // verified in main
+                    }
+                    // else: another lazy/shared chunk — discard
+                    continue;
+                }
+                None => {
+                    // Couldn't resolve — fall through to the bundled-specifier
+                    // path so we still emit a cross-chunk import rather than
+                    // dropping the reference.
+                }
+            }
+        }
         if p.bundled_specifiers.contains(&ext.source) {
             // npm bare specifier → cross-chunk from main
             out.push(ext);

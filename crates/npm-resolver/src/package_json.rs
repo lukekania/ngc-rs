@@ -228,8 +228,53 @@ fn resolve_target(
     }
 }
 
+/// Resolve a `#`-prefixed subpath import against a package.json `imports` object.
+///
+/// Semantics mirror `exports` subpath resolution, minus the sugar forms:
+/// - Direct key match wins first (`"#alias": "./target.js"`).
+/// - Otherwise, pattern trailers (`"#foo/*"`) compete on longest-prefix.
+/// - Values can be strings, condition objects, arrays, or `null` (blocked).
+/// - Wildcard `*` in the target substitutes the matched suffix.
+///
+/// The returned string is the raw target — it may be a relative path
+/// (`"./src/x.js"`) or a bare specifier (`"lodash/cloneDeep"`). The caller
+/// decides how to resolve each form.
+pub fn match_imports_field(
+    imports: &serde_json::Value,
+    specifier: &str,
+    conditions: &[&str],
+) -> Option<String> {
+    let serde_json::Value::Object(map) = imports else {
+        return None;
+    };
+
+    if let Some(entry) = map.get(specifier) {
+        return resolve_target(entry, None, conditions);
+    }
+
+    let mut best: Option<(&str, &serde_json::Value)> = None;
+    for (pattern, value) in map {
+        let Some(prefix) = pattern.strip_suffix('*') else {
+            continue;
+        };
+        if !specifier.starts_with(prefix) {
+            continue;
+        }
+        match best {
+            Some((cur, _)) if cur.len() >= prefix.len() => {}
+            _ => best = Some((prefix, value)),
+        }
+    }
+    if let Some((prefix, value)) = best {
+        let rest = &specifier[prefix.len()..];
+        return resolve_target(value, Some(rest), conditions);
+    }
+
+    None
+}
+
 /// Try common ESM/JS extensions for a path.
-fn try_extensions(base: &Path) -> Option<PathBuf> {
+pub(crate) fn try_extensions(base: &Path) -> Option<PathBuf> {
     for ext in &["mjs", "js", "cjs"] {
         let candidate = base.with_extension(ext);
         if candidate.is_file() {
@@ -702,6 +747,67 @@ mod tests {
         let dev = resolve_package_entry(&pkg_dir, ".", DEV).unwrap();
         assert!(prod.ends_with("reactish.production.mjs"));
         assert!(dev.ends_with("reactish.development.mjs"));
+    }
+
+    // --- subpath imports (`#`-prefixed) ---
+
+    #[test]
+    fn test_imports_literal_match() {
+        let imports: serde_json::Value =
+            serde_json::from_str(r##"{ "#internal": "./src/internal/index.js" }"##).unwrap();
+        let target = match_imports_field(&imports, "#internal", DEV);
+        assert_eq!(target.as_deref(), Some("./src/internal/index.js"));
+    }
+
+    #[test]
+    fn test_imports_wildcard_substitution() {
+        let imports: serde_json::Value =
+            serde_json::from_str(r##"{ "#internal/*": "./src/internal/*.js" }"##).unwrap();
+        let target = match_imports_field(&imports, "#internal/helper", DEV);
+        assert_eq!(target.as_deref(), Some("./src/internal/helper.js"));
+    }
+
+    #[test]
+    fn test_imports_conditional_picks_import_branch() {
+        let imports: serde_json::Value = serde_json::from_str(
+            r##"{ "#dep": { "node": "./node-dep.js", "import": "./esm-dep.mjs", "default": "./dep.js" } }"##,
+        )
+        .unwrap();
+        let target = match_imports_field(&imports, "#dep", DEV);
+        assert_eq!(target.as_deref(), Some("./esm-dep.mjs"));
+    }
+
+    #[test]
+    fn test_imports_longest_prefix_wins() {
+        let imports: serde_json::Value =
+            serde_json::from_str(r##"{ "#x/*": "./short/*.js", "#x/deep/*": "./deep/*.js" }"##)
+                .unwrap();
+        let target = match_imports_field(&imports, "#x/deep/foo", DEV);
+        assert_eq!(target.as_deref(), Some("./deep/foo.js"));
+    }
+
+    #[test]
+    fn test_imports_null_target_blocked() {
+        let imports: serde_json::Value =
+            serde_json::from_str(r##"{ "#a": { "browser": null, "default": "./a.js" } }"##)
+                .unwrap();
+        let target = match_imports_field(&imports, "#a", DEV);
+        assert_eq!(target.as_deref(), Some("./a.js"));
+    }
+
+    #[test]
+    fn test_imports_bare_specifier_target() {
+        let imports: serde_json::Value =
+            serde_json::from_str(r##"{ "#clone": "lodash/cloneDeep" }"##).unwrap();
+        let target = match_imports_field(&imports, "#clone", DEV);
+        assert_eq!(target.as_deref(), Some("lodash/cloneDeep"));
+    }
+
+    #[test]
+    fn test_imports_no_match_returns_none() {
+        let imports: serde_json::Value =
+            serde_json::from_str(r##"{ "#foo": "./foo.js" }"##).unwrap();
+        assert!(match_imports_field(&imports, "#bar", DEV).is_none());
     }
 
     #[test]
