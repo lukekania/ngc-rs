@@ -676,4 +676,190 @@ mod tests {
             "expected hostVars: 4, got: {result}"
         );
     }
+
+    /// `style.X.unit` must split off the unit so the runtime gets a
+    /// 3-arg `ɵɵstyleProp(propName, expr, suffix)` — emitting
+    /// `ɵɵstyleProp("X.unit", expr)` would set `width.px` as the property
+    /// name and the unit suffix would never reach the renderer.
+    #[test]
+    fn test_host_binding_style_with_unit() {
+        let result = parse_and_transform(
+            "{ type: MyDir, selector: '[myDir]', host: { properties: { 'style.width.px': 'width' } } }",
+        );
+        assert!(
+            result.contains("i0.\u{0275}\u{0275}styleProp(\"width\", ctx.width, \"px\")"),
+            "expected style.X.unit to split off the unit; got: {result}"
+        );
+        assert!(result.contains("hostVars: 2"));
+    }
+
+    // ---- AOT ↔ linker parity for `@HostListener` / `@HostBinding` (issue #58) ----
+    //
+    // Compiles a directive with each decorator target form via the AOT path
+    // and asserts the same Ivy instructions appear in the linker's output for
+    // an equivalent `host: { listeners, properties }` partial declaration.
+
+    use ngc_template_compiler::compile_all_decorators;
+    use std::io::Write;
+
+    /// Compile a `@Directive` source through the AOT pipeline. We have to
+    /// hand the source to `compile_all_decorators` via a tempfile because
+    /// the per-string entry point only knows how to recognise `@Component`.
+    fn aot_compile(source: &str) -> String {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("host.directive.ts");
+        let mut f = std::fs::File::create(&path).expect("create");
+        f.write_all(source.as_bytes()).expect("write");
+        drop(f);
+        let mut out = compile_all_decorators(&[path]).expect("compile");
+        let compiled = out.pop().expect("one file");
+        assert!(compiled.compiled, "expected AOT to compile the directive");
+        compiled.source
+    }
+
+    #[test]
+    fn parity_host_listener_event_only() {
+        let aot = aot_compile(
+            "import { Directive, HostListener } from '@angular/core';\n\
+             @Directive({ selector: '[appHost]', standalone: true })\n\
+             export class HostDir { @HostListener('click') onClick() {} }\n",
+        );
+        let linker =
+            parse_and_transform("{ type: HostDir, selector: '[appHost]', isStandalone: true, host: { listeners: { 'click': 'onClick()' } } }");
+
+        assert!(aot.contains(
+            "\u{0275}\u{0275}listener(\"click\", function($event) { return ctx.onClick(); })"
+        ));
+        assert!(linker.contains(
+            "i0.\u{0275}\u{0275}listener(\"click\", function($event) { return ctx.onClick(); })"
+        ));
+        assert!(aot.contains("if (rf & 1)"));
+        assert!(linker.contains("if (rf & 1)"));
+    }
+
+    #[test]
+    fn parity_host_binding_bare() {
+        let aot = aot_compile(
+            "import { Directive, HostBinding } from '@angular/core';\n\
+             @Directive({ selector: '[appHost]', standalone: true })\n\
+             export class HostDir { @HostBinding('disabled') isDisabled = false; }\n",
+        );
+        let linker = parse_and_transform(
+            "{ type: HostDir, selector: '[appHost]', isStandalone: true, host: { properties: { 'disabled': 'isDisabled' } } }",
+        );
+
+        assert!(aot.contains("\u{0275}\u{0275}property(\"disabled\", ctx.isDisabled)"));
+        assert!(linker.contains("i0.\u{0275}\u{0275}property(\"disabled\", ctx.isDisabled)"));
+        assert!(aot.contains("hostVars: 1"));
+        assert!(linker.contains("hostVars: 1"));
+    }
+
+    #[test]
+    fn parity_host_binding_attr() {
+        let aot = aot_compile(
+            "import { Directive, HostBinding } from '@angular/core';\n\
+             @Directive({ selector: '[appHost]', standalone: true })\n\
+             export class HostDir { @HostBinding('attr.aria-label') label = 'host'; }\n",
+        );
+        let linker = parse_and_transform(
+            "{ type: HostDir, selector: '[appHost]', isStandalone: true, host: { properties: { 'attr.aria-label': 'label' } } }",
+        );
+
+        assert!(aot.contains("\u{0275}\u{0275}attribute(\"aria-label\", ctx.label)"));
+        assert!(linker.contains("i0.\u{0275}\u{0275}attribute(\"aria-label\", ctx.label)"));
+        assert!(aot.contains("hostVars: 1"));
+        assert!(linker.contains("hostVars: 1"));
+    }
+
+    #[test]
+    fn parity_host_binding_class() {
+        let aot = aot_compile(
+            "import { Directive, HostBinding } from '@angular/core';\n\
+             @Directive({ selector: '[appHost]', standalone: true })\n\
+             export class HostDir { @HostBinding('class.active') isActive = true; }\n",
+        );
+        let linker = parse_and_transform(
+            "{ type: HostDir, selector: '[appHost]', isStandalone: true, host: { properties: { 'class.active': 'isActive' } } }",
+        );
+
+        assert!(aot.contains("\u{0275}\u{0275}classProp(\"active\", ctx.isActive)"));
+        assert!(linker.contains("i0.\u{0275}\u{0275}classProp(\"active\", ctx.isActive)"));
+        assert!(aot.contains("hostVars: 2"));
+        assert!(linker.contains("hostVars: 2"));
+    }
+
+    #[test]
+    fn parity_host_binding_style_simple() {
+        let aot = aot_compile(
+            "import { Directive, HostBinding } from '@angular/core';\n\
+             @Directive({ selector: '[appHost]', standalone: true })\n\
+             export class HostDir { @HostBinding('style.color') color = 'red'; }\n",
+        );
+        let linker = parse_and_transform(
+            "{ type: HostDir, selector: '[appHost]', isStandalone: true, host: { properties: { 'style.color': 'color' } } }",
+        );
+
+        assert!(aot.contains("\u{0275}\u{0275}styleProp(\"color\", ctx.color)"));
+        assert!(linker.contains("i0.\u{0275}\u{0275}styleProp(\"color\", ctx.color)"));
+        assert!(aot.contains("hostVars: 2"));
+        assert!(linker.contains("hostVars: 2"));
+    }
+
+    #[test]
+    fn parity_host_binding_style_with_unit() {
+        let aot = aot_compile(
+            "import { Directive, HostBinding } from '@angular/core';\n\
+             @Directive({ selector: '[appHost]', standalone: true })\n\
+             export class HostDir { @HostBinding('style.width.px') width = 100; }\n",
+        );
+        let linker = parse_and_transform(
+            "{ type: HostDir, selector: '[appHost]', isStandalone: true, host: { properties: { 'style.width.px': 'width' } } }",
+        );
+
+        assert!(aot.contains("\u{0275}\u{0275}styleProp(\"width\", ctx.width, \"px\")"));
+        assert!(linker.contains("i0.\u{0275}\u{0275}styleProp(\"width\", ctx.width, \"px\")"));
+        assert!(aot.contains("hostVars: 2"));
+        assert!(linker.contains("hostVars: 2"));
+    }
+
+    #[test]
+    fn parity_host_mixed_listener_and_bindings() {
+        let aot = aot_compile(
+            "import { Directive, HostListener, HostBinding } from '@angular/core';\n\
+             @Directive({ selector: '[appHost]', standalone: true })\n\
+             export class HostDir {\n\
+               @HostBinding('attr.aria-label') label = 'host';\n\
+               @HostBinding('class.active') isActive = true;\n\
+               @HostBinding('disabled') isDisabled = false;\n\
+               @HostListener('click', ['$event']) onClick($event: Event) {}\n\
+             }\n",
+        );
+        let linker = parse_and_transform(
+            "{ type: HostDir, selector: '[appHost]', isStandalone: true, \
+             host: { properties: { 'attr.aria-label': 'label', 'class.active': 'isActive', 'disabled': 'isDisabled' }, \
+                     listeners: { 'click': 'onClick($event)' } } }",
+        );
+
+        // attr (1) + class (2) + property (1) = 4 — listeners contribute 0.
+        assert!(aot.contains("hostVars: 4"));
+        assert!(linker.contains("hostVars: 4"));
+
+        for must_contain in [
+            "if (rf & 1)",
+            "if (rf & 2)",
+            "\u{0275}\u{0275}listener(\"click\"",
+            "\u{0275}\u{0275}attribute(\"aria-label\"",
+            "\u{0275}\u{0275}classProp(\"active\"",
+            "\u{0275}\u{0275}property(\"disabled\"",
+        ] {
+            assert!(
+                aot.contains(must_contain),
+                "AOT missing {must_contain:?}; got:\n{aot}"
+            );
+            assert!(
+                linker.contains(must_contain),
+                "linker missing {must_contain:?}; got:\n{linker}"
+            );
+        }
+    }
 }

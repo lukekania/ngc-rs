@@ -837,6 +837,113 @@ export class DataService {
     }
 
     #[test]
+    fn test_directive_with_host_listener_and_binding_roundtrip() {
+        // Directive uses @HostListener for an event and @HostBinding for each
+        // target form documented in issue #58 — bare property, attr.X,
+        // class.Y, style.Z, style.Z.unit. The AOT output must emit the
+        // matching ɵɵ instructions inside `hostBindings`, with hostVars
+        // accumulated only across binding-update calls (listeners contribute 0).
+        let source = r#"import { Directive, HostListener, HostBinding } from '@angular/core';
+
+@Directive({ selector: '[appHost]', standalone: true })
+export class HostDirective {
+  @HostBinding('disabled') isDisabled = false;
+  @HostBinding('attr.aria-label') label = 'host';
+  @HostBinding('class.active') isActive = true;
+  @HostBinding('style.color') color = 'red';
+  @HostBinding('style.width.px') width = 100;
+
+  @HostListener('click', ['$event']) onClick($event: Event) {}
+}
+"#;
+        let path = PathBuf::from("host.directive.ts");
+        let result = compile_file(source, &path, &StyleContext::default()).expect("should compile");
+        assert!(result.compiled, "should be compiled");
+        let out = &result.source;
+
+        // Listener
+        assert!(
+            out.contains(
+                "\u{0275}\u{0275}listener(\"click\", function($event) { return ctx.onClick($event); })"
+            ),
+            "expected ɵɵlistener for click; got:\n{out}"
+        );
+        // Bare property → ɵɵproperty (1 var)
+        assert!(out.contains("\u{0275}\u{0275}property(\"disabled\", ctx.isDisabled)"));
+        // attr.X → ɵɵattribute (1 var)
+        assert!(out.contains("\u{0275}\u{0275}attribute(\"aria-label\", ctx.label)"));
+        // class.X → ɵɵclassProp (2 vars)
+        assert!(out.contains("\u{0275}\u{0275}classProp(\"active\", ctx.isActive)"));
+        // style.Y → ɵɵstyleProp without unit (2 vars)
+        assert!(out.contains("\u{0275}\u{0275}styleProp(\"color\", ctx.color)"));
+        // style.Y.px → ɵɵstyleProp with unit suffix (2 vars)
+        assert!(
+            out.contains("\u{0275}\u{0275}styleProp(\"width\", ctx.width, \"px\")"),
+            "expected style.X.unit to split off the unit; got:\n{out}"
+        );
+        // 1 + 1 + 2 + 2 + 2 = 8
+        assert!(
+            out.contains("hostVars: 8"),
+            "expected hostVars: 8 (no listener contribution); got:\n{out}"
+        );
+        assert!(out.contains("if (rf & 1)"));
+        assert!(out.contains("if (rf & 2)"));
+
+        // Imports must be expanded so the rewritten file pulls each Ivy symbol.
+        for sym in [
+            "\u{0275}\u{0275}listener",
+            "\u{0275}\u{0275}property",
+            "\u{0275}\u{0275}attribute",
+            "\u{0275}\u{0275}classProp",
+            "\u{0275}\u{0275}styleProp",
+        ] {
+            assert!(
+                out.contains(sym),
+                "expected import/use of {sym} in rewritten source; got:\n{out}"
+            );
+        }
+
+        // Rewritten source must still parse.
+        let js = ngc_ts_transform::transform_source(&result.source, "host.directive.ts")
+            .expect("oxc should parse compiled source");
+        assert!(js.contains("\u{0275}dir"));
+    }
+
+    #[test]
+    fn test_component_with_host_listener_roundtrip() {
+        // Issue #58 mentions treasr-frontend's portfolio.component.ts uses
+        // @HostListener for window resize. AOT output for a component must
+        // emit the listener inside hostBindings just like directives do.
+        let source = r#"import { Component, HostListener } from '@angular/core';
+
+@Component({ selector: 'app-portfolio', standalone: true, template: '' })
+export class PortfolioComponent {
+  @HostListener('window:resize') onResize() {}
+}
+"#;
+        let path = PathBuf::from("portfolio.component.ts");
+        let result = compile_file(source, &path, &StyleContext::default()).expect("should compile");
+        assert!(result.compiled);
+        let out = &result.source;
+        assert!(
+            out.contains(
+                "\u{0275}\u{0275}listener(\"window:resize\", function($event) { return ctx.onResize(); })"
+            ),
+            "expected window:resize listener; got:\n{out}"
+        );
+        assert!(out.contains("if (rf & 1)"));
+        assert!(out.contains("hostBindings:"));
+        // Listener-only: no hostVars emitted.
+        assert!(
+            !out.contains("hostVars"),
+            "listener-only component should not emit hostVars; got:\n{out}"
+        );
+        let js = ngc_ts_transform::transform_source(&result.source, "portfolio.component.ts")
+            .expect("oxc should parse");
+        assert!(js.contains("\u{0275}cmp"));
+    }
+
+    #[test]
     fn test_directive_roundtrip() {
         let source = r#"import { Directive, ElementRef } from '@angular/core';
 

@@ -625,6 +625,7 @@ dependencies = [
  "oxc_parser",
  "oxc_span",
  "rayon",
+ "tempfile",
  "tracing",
 ]
 
