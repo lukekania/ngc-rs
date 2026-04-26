@@ -566,27 +566,38 @@ fn worker_chunk_filename_from_path(path: &Path, root_dir: &Path) -> String {
 
 /// Derive a chunk filename from a split point's file path.
 ///
-/// Example: `/root/src/app/admin/admin.component.ts` → `"chunk-admin-component.js"`
-fn chunk_filename_from_path(path: &Path, root_dir: &Path) -> String {
-    let relative = path.strip_prefix(root_dir).unwrap_or(path);
-    let stem = relative.with_extension("");
-    let stem_str = stem.to_string_lossy();
-
-    // Take only the filename part (last component), sanitize it
-    let name = stem_str
-        .replace(['/', '\\'], "-")
-        .replace('.', "-")
-        .to_lowercase();
-
-    // Take the last two path segments for a more readable name
-    let parts: Vec<&str> = name.split('-').filter(|s| !s.is_empty()).collect();
-    let short_name = if parts.len() > 2 {
-        parts[parts.len() - 2..].join("-")
-    } else {
-        parts.join("-")
+/// Uses the file's basename stem (the filename without its trailing `.ts`/
+/// `.js` extension), replacing inner `.` separators with `-`. Parent
+/// directories are deliberately dropped — Angular convention puts each
+/// component in a directory matching its filename, so including the parent
+/// dir produces redundant `admin-admin-component`-style names.
+///
+/// Examples:
+/// - `/root/src/admin/admin.component.ts` → `"chunk-admin-component.js"`
+/// - `/root/src/dashboard/dashboard.routes.ts` → `"chunk-dashboard-routes.js"`
+/// - `/root/src/service-worker/service-worker.component.ts`
+///   → `"chunk-service-worker-component.js"`
+/// - `/root/src/lazy.ts` → `"chunk-lazy.js"`
+fn chunk_filename_from_path(path: &Path, _root_dir: &Path) -> String {
+    let basename = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    // Strip the final extension only (e.g. `admin.component.ts` →
+    // `admin.component`). Then turn the remaining `.` separators into `-`
+    // so the basename `admin.component` becomes `admin-component` while
+    // `service-worker.component` becomes `service-worker-component`
+    // (instead of being truncated to a non-disambiguating `worker-component`).
+    let stem = match basename.rsplit_once('.') {
+        Some((stem, _ext)) => stem,
+        None => basename,
     };
-
-    format!("chunk-{short_name}.js")
+    let name = stem.replace('.', "-").to_lowercase();
+    if name.is_empty() {
+        "chunk.js".to_string()
+    } else {
+        format!("chunk-{name}.js")
+    }
 }
 
 #[cfg(test)]
@@ -745,6 +756,28 @@ mod tests {
             chunk_filename_from_path(Path::new("/root/src/lazy.ts"), root),
             "chunk-lazy.js"
         );
+    }
+
+    /// Regression: hyphenated basenames must not collapse to the same chunk
+    /// name. `service-worker.component.ts` and `web-worker.component.ts` are
+    /// both real routes in the test bed; the previous "last two dash-segments"
+    /// rule reduced both to `chunk-worker-component.js` and one silently
+    /// overwrote the other, leaving the route's `loadComponent` import
+    /// resolving to `undefined`.
+    #[test]
+    fn test_chunk_filename_disambiguates_hyphenated_basenames() {
+        let root = Path::new("/root/src");
+        let sw = chunk_filename_from_path(
+            Path::new("/root/src/service-worker/service-worker.component.ts"),
+            root,
+        );
+        let ww = chunk_filename_from_path(
+            Path::new("/root/src/web-worker/web-worker.component.ts"),
+            root,
+        );
+        assert_eq!(sw, "chunk-service-worker-component.js");
+        assert_eq!(ww, "chunk-web-worker-component.js");
+        assert_ne!(sw, ww);
     }
 
     #[test]

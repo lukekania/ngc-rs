@@ -13,6 +13,7 @@ use ngc_project_resolver::angular_json::{
 use ngc_template_compiler::{StyleContext, StyleLanguage};
 
 mod localize;
+mod ngsw;
 
 /// Result of the bundled build pipeline.
 #[derive(serde::Serialize)]
@@ -616,6 +617,22 @@ fn run_build(
         output_files.push(lp);
     }
 
+    // Step 12.5: Service worker manifest (`ngsw.json`) when the project opts
+    // in via `architect.build.options.serviceWorker`. Hashing runs *after*
+    // every other writer so it sees the final filenames + contents.
+    if let Some(ref ap) = angular_project {
+        if ap.service_worker {
+            if localize {
+                tracing::warn!(
+                    "serviceWorker is enabled but --localize was passed; skipping ngsw.json (per-locale manifests are not yet supported)"
+                );
+            } else {
+                let ngsw_paths = generate_service_worker(ap, &out_dir, &config_dir)?;
+                output_files.extend(ngsw_paths);
+            }
+        }
+    }
+
     // Step 13: --localize → fan the source-locale build out to
     // `<out_dir>/<sourceLocale>/` and produce a translated copy under
     // `<out_dir>/<locale>/` for each entry in `i18n.locales`.
@@ -905,6 +922,7 @@ fn build_options(configuration: Option<&str>) -> BundleOptions {
             minify: true,
             content_hash: true,
             tree_shake: true,
+            inject_dev_mode_globals: true,
         },
         _ => BundleOptions::default(),
     }
@@ -1452,6 +1470,30 @@ fn compute_sri_hash(path: &Path) -> NgcResult<String> {
 
 /// Scan the bundle's external imports, find LICENSE files in node_modules,
 /// and concatenate them into 3rdpartylicenses.txt.
+/// Build the `ngsw.json` manifest and copy the worker scripts into
+/// `out_dir`. Reads `architect.build.options.ngswConfigPath` (default
+/// `ngsw-config.json`), hashes every emitted file, and writes the manifest
+/// alongside the bundle. Returns the list of files written so they can be
+/// reported in the build summary.
+fn generate_service_worker(
+    project: &ResolvedAngularProject,
+    out_dir: &Path,
+    project_root: &Path,
+) -> NgcResult<Vec<PathBuf>> {
+    let span = tracing::info_span!("ngsw").entered();
+    let config = ngsw::load_config(&project.ngsw_config_path)?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let mut paths = Vec::new();
+    paths.push(ngsw::generate_manifest(out_dir, &config, timestamp)?);
+    paths.extend(ngsw::copy_worker_scripts(out_dir, project_root)?);
+    drop(span);
+    Ok(paths)
+}
+
 fn generate_third_party_licenses(
     bundle_code: &str,
     project_root: &Path,
@@ -2152,6 +2194,7 @@ mod tests {
         assert!(opts.minify);
         assert!(opts.content_hash);
         assert!(opts.tree_shake);
+        assert!(opts.inject_dev_mode_globals);
     }
 
     #[test]
@@ -2161,6 +2204,7 @@ mod tests {
         assert!(!opts.minify);
         assert!(!opts.content_hash);
         assert!(!opts.tree_shake);
+        assert!(!opts.inject_dev_mode_globals);
     }
 
     #[test]
@@ -2170,6 +2214,7 @@ mod tests {
         assert!(!opts.minify);
         assert!(!opts.content_hash);
         assert!(!opts.tree_shake);
+        assert!(!opts.inject_dev_mode_globals);
     }
 
     #[test]
@@ -2260,5 +2305,166 @@ mod tests {
 
         let files = collect_relative_files(&out);
         insta::assert_snapshot!("public_folder_glob_output_subdir", files.join("\n"));
+    }
+
+    /// End-to-end fixture: angular.json with `serviceWorker: true` plus a
+    /// minimal `ngsw-config.json` and a fake dist tree must produce a valid
+    /// `dist/ngsw.json` with hashes matching the actual served bytes.
+    #[test]
+    fn test_service_worker_pipeline_pwa_fixture() {
+        use ngc_project_resolver::angular_json::resolve_angular_project;
+        use sha1::{Digest, Sha1};
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path();
+
+        // Minimal angular.json that opts into the service-worker pipeline.
+        std::fs::write(
+            root.join("angular.json"),
+            r#"{
+                "projects": {
+                    "pwa": {
+                        "root": "",
+                        "sourceRoot": "src",
+                        "architect": {
+                            "build": {
+                                "options": {
+                                    "outputPath": "dist/pwa",
+                                    "tsConfig": "tsconfig.json",
+                                    "serviceWorker": true,
+                                    "ngswConfigPath": "ngsw-config.json"
+                                }
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        // Minimal ngsw-config.json: an "app" prefetch group pulling the
+        // shell + JS, plus a "media" lazy group for assets.
+        std::fs::write(
+            root.join("ngsw-config.json"),
+            r#"{
+                "$schema": "./node_modules/@angular/service-worker/config/schema.json",
+                "index": "/index.html",
+                "assetGroups": [
+                    {
+                        "name": "app",
+                        "installMode": "prefetch",
+                        "resources": {
+                            "files": ["/index.html", "/*.js", "/*.css"]
+                        }
+                    },
+                    {
+                        "name": "media",
+                        "installMode": "lazy",
+                        "updateMode": "prefetch",
+                        "resources": {
+                            "files": ["/assets/**"]
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        // Pre-populate the dist tree as if the bundler had already run.
+        let dist = root.join("dist").join("pwa");
+        std::fs::create_dir_all(dist.join("assets")).unwrap();
+        let index_bytes = b"<!doctype html><title>pwa</title>";
+        let main_bytes = b"console.log('main')";
+        let style_bytes = b"body { color: red; }";
+        let logo_bytes = b"<svg/>";
+        std::fs::write(dist.join("index.html"), index_bytes).unwrap();
+        std::fs::write(dist.join("main-ABCDE.js"), main_bytes).unwrap();
+        std::fs::write(dist.join("styles-FGHIJ.css"), style_bytes).unwrap();
+        std::fs::write(dist.join("assets").join("logo.svg"), logo_bytes).unwrap();
+
+        // Resolve angular.json: confirms the parser picked up serviceWorker.
+        let project = resolve_angular_project(&root.join("angular.json"), Some("pwa"), None)
+            .expect("resolve angular project");
+        assert!(project.service_worker);
+
+        // Run the full SW pipeline (load config + walk dist + emit manifest).
+        let ngsw_paths =
+            generate_service_worker(&project, &dist, root).expect("generate_service_worker");
+        assert!(!ngsw_paths.is_empty(), "should write at least ngsw.json");
+
+        let manifest_path = dist.join("ngsw.json");
+        assert!(manifest_path.is_file(), "ngsw.json must exist");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap())
+                .expect("ngsw.json parses as JSON");
+
+        // Required Angular SW protocol fields.
+        assert_eq!(manifest["configVersion"], 1);
+        assert_eq!(manifest["index"], "/index.html");
+        assert!(manifest["timestamp"].as_u64().is_some());
+        assert_eq!(manifest["navigationRequestStrategy"], "performance");
+        assert!(manifest["navigationUrls"].is_array());
+        assert!(!manifest["navigationUrls"].as_array().unwrap().is_empty());
+
+        // assetGroups is shaped as Angular expects.
+        let groups = manifest["assetGroups"].as_array().expect("assetGroups");
+        assert_eq!(groups.len(), 2);
+        let app = &groups[0];
+        assert_eq!(app["name"], "app");
+        assert_eq!(app["installMode"], "prefetch");
+        assert_eq!(app["updateMode"], "prefetch");
+        let app_urls: Vec<&str> = app["urls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(app_urls.contains(&"/index.html"));
+        assert!(app_urls.contains(&"/main-ABCDE.js"));
+        assert!(app_urls.contains(&"/styles-FGHIJ.css"));
+
+        let media = &groups[1];
+        assert_eq!(media["name"], "media");
+        assert_eq!(media["installMode"], "lazy");
+        assert_eq!(media["updateMode"], "prefetch");
+        let media_urls: Vec<&str> = media["urls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(media_urls, vec!["/assets/logo.svg"]);
+
+        // hashTable hashes must equal the SHA-1 of the actual served bytes.
+        let table = manifest["hashTable"].as_object().expect("hashTable");
+        let expect_sha1 = |bytes: &[u8]| -> String {
+            let mut h = Sha1::new();
+            h.update(bytes);
+            let digest = h.finalize();
+            digest.iter().fold(String::new(), |mut acc, b| {
+                acc.push_str(&format!("{b:02x}"));
+                acc
+            })
+        };
+        assert_eq!(
+            table["/index.html"].as_str().unwrap(),
+            expect_sha1(index_bytes)
+        );
+        assert_eq!(
+            table["/main-ABCDE.js"].as_str().unwrap(),
+            expect_sha1(main_bytes)
+        );
+        assert_eq!(
+            table["/styles-FGHIJ.css"].as_str().unwrap(),
+            expect_sha1(style_bytes)
+        );
+        assert_eq!(
+            table["/assets/logo.svg"].as_str().unwrap(),
+            expect_sha1(logo_bytes)
+        );
+        // Every URL in any group must have a hashTable entry.
+        for url in app_urls.iter().chain(media_urls.iter()) {
+            assert!(table.contains_key(*url), "missing hash for {url}");
+        }
     }
 }
