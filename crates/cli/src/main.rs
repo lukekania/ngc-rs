@@ -2302,4 +2302,165 @@ mod tests {
         let files = collect_relative_files(&out);
         insta::assert_snapshot!("public_folder_glob_output_subdir", files.join("\n"));
     }
+
+    /// End-to-end fixture: angular.json with `serviceWorker: true` plus a
+    /// minimal `ngsw-config.json` and a fake dist tree must produce a valid
+    /// `dist/ngsw.json` with hashes matching the actual served bytes.
+    #[test]
+    fn test_service_worker_pipeline_pwa_fixture() {
+        use ngc_project_resolver::angular_json::resolve_angular_project;
+        use sha1::{Digest, Sha1};
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path();
+
+        // Minimal angular.json that opts into the service-worker pipeline.
+        std::fs::write(
+            root.join("angular.json"),
+            r#"{
+                "projects": {
+                    "pwa": {
+                        "root": "",
+                        "sourceRoot": "src",
+                        "architect": {
+                            "build": {
+                                "options": {
+                                    "outputPath": "dist/pwa",
+                                    "tsConfig": "tsconfig.json",
+                                    "serviceWorker": true,
+                                    "ngswConfigPath": "ngsw-config.json"
+                                }
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        // Minimal ngsw-config.json: an "app" prefetch group pulling the
+        // shell + JS, plus a "media" lazy group for assets.
+        std::fs::write(
+            root.join("ngsw-config.json"),
+            r#"{
+                "$schema": "./node_modules/@angular/service-worker/config/schema.json",
+                "index": "/index.html",
+                "assetGroups": [
+                    {
+                        "name": "app",
+                        "installMode": "prefetch",
+                        "resources": {
+                            "files": ["/index.html", "/*.js", "/*.css"]
+                        }
+                    },
+                    {
+                        "name": "media",
+                        "installMode": "lazy",
+                        "updateMode": "prefetch",
+                        "resources": {
+                            "files": ["/assets/**"]
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        // Pre-populate the dist tree as if the bundler had already run.
+        let dist = root.join("dist").join("pwa");
+        std::fs::create_dir_all(dist.join("assets")).unwrap();
+        let index_bytes = b"<!doctype html><title>pwa</title>";
+        let main_bytes = b"console.log('main')";
+        let style_bytes = b"body { color: red; }";
+        let logo_bytes = b"<svg/>";
+        std::fs::write(dist.join("index.html"), index_bytes).unwrap();
+        std::fs::write(dist.join("main-ABCDE.js"), main_bytes).unwrap();
+        std::fs::write(dist.join("styles-FGHIJ.css"), style_bytes).unwrap();
+        std::fs::write(dist.join("assets").join("logo.svg"), logo_bytes).unwrap();
+
+        // Resolve angular.json: confirms the parser picked up serviceWorker.
+        let project = resolve_angular_project(&root.join("angular.json"), Some("pwa"), None)
+            .expect("resolve angular project");
+        assert!(project.service_worker);
+
+        // Run the full SW pipeline (load config + walk dist + emit manifest).
+        let ngsw_paths =
+            generate_service_worker(&project, &dist, root).expect("generate_service_worker");
+        assert!(!ngsw_paths.is_empty(), "should write at least ngsw.json");
+
+        let manifest_path = dist.join("ngsw.json");
+        assert!(manifest_path.is_file(), "ngsw.json must exist");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap())
+                .expect("ngsw.json parses as JSON");
+
+        // Required Angular SW protocol fields.
+        assert_eq!(manifest["configVersion"], 1);
+        assert_eq!(manifest["index"], "/index.html");
+        assert!(manifest["timestamp"].as_u64().is_some());
+        assert_eq!(manifest["navigationRequestStrategy"], "performance");
+        assert!(manifest["navigationUrls"].is_array());
+        assert!(!manifest["navigationUrls"].as_array().unwrap().is_empty());
+
+        // assetGroups is shaped as Angular expects.
+        let groups = manifest["assetGroups"].as_array().expect("assetGroups");
+        assert_eq!(groups.len(), 2);
+        let app = &groups[0];
+        assert_eq!(app["name"], "app");
+        assert_eq!(app["installMode"], "prefetch");
+        assert_eq!(app["updateMode"], "prefetch");
+        let app_urls: Vec<&str> = app["urls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(app_urls.contains(&"/index.html"));
+        assert!(app_urls.contains(&"/main-ABCDE.js"));
+        assert!(app_urls.contains(&"/styles-FGHIJ.css"));
+
+        let media = &groups[1];
+        assert_eq!(media["name"], "media");
+        assert_eq!(media["installMode"], "lazy");
+        assert_eq!(media["updateMode"], "prefetch");
+        let media_urls: Vec<&str> = media["urls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(media_urls, vec!["/assets/logo.svg"]);
+
+        // hashTable hashes must equal the SHA-1 of the actual served bytes.
+        let table = manifest["hashTable"].as_object().expect("hashTable");
+        let expect_sha1 = |bytes: &[u8]| -> String {
+            let mut h = Sha1::new();
+            h.update(bytes);
+            let digest = h.finalize();
+            digest.iter().fold(String::new(), |mut acc, b| {
+                acc.push_str(&format!("{b:02x}"));
+                acc
+            })
+        };
+        assert_eq!(
+            table["/index.html"].as_str().unwrap(),
+            expect_sha1(index_bytes)
+        );
+        assert_eq!(
+            table["/main-ABCDE.js"].as_str().unwrap(),
+            expect_sha1(main_bytes)
+        );
+        assert_eq!(
+            table["/styles-FGHIJ.css"].as_str().unwrap(),
+            expect_sha1(style_bytes)
+        );
+        assert_eq!(
+            table["/assets/logo.svg"].as_str().unwrap(),
+            expect_sha1(logo_bytes)
+        );
+        // Every URL in any group must have a hashTable entry.
+        for url in app_urls.iter().chain(media_urls.iter()) {
+            assert!(table.contains_key(*url), "missing hash for {url}");
+        }
+    }
 }
