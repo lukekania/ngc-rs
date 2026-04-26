@@ -80,6 +80,16 @@ pub fn generate_directive_ivy(extracted: &ExtractedDirective) -> NgcResult<IvyOu
         props.push("standalone: true".to_string());
     }
 
+    // hostDirectives composition (Angular 15+). Wrap the source array in a
+    // `ɵɵHostDirectivesFeature(...)` call inside `features` so the runtime
+    // instantiates the composed directives on the host element.
+    if let Some(ref host_dirs_src) = extracted.host_directives_source {
+        ivy_imports.insert("\u{0275}\u{0275}HostDirectivesFeature".to_string());
+        props.push(format!(
+            "features: [\u{0275}\u{0275}HostDirectivesFeature({host_dirs_src})]"
+        ));
+    }
+
     let define_code = format!(
         "static \u{0275}dir = \u{0275}\u{0275}defineDirective({{ {} }})",
         props.join(", ")
@@ -183,6 +193,7 @@ mod tests {
             constructor_params: Vec::new(),
             host_listeners: Vec::new(),
             host_bindings: Vec::new(),
+            host_directives_source: None,
             common: DecoratorCommon {
                 decorator_span: (0, 0),
                 class_body_start: 0,

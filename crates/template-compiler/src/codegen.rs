@@ -190,6 +190,16 @@ pub fn generate_ivy(
     if let Some(ref host_bindings) = host_props.host_bindings_prop {
         dc.push_str(&format!("    {host_bindings},\n"));
     }
+    // hostDirectives composition (Angular 15+). Wrap the array in
+    // `ɵɵHostDirectivesFeature(...)` and emit as a `features` entry so the
+    // runtime instantiates the composed directives on the host element.
+    if let Some(ref host_dirs_src) = component.host_directives_source {
+        gen.ivy_imports
+            .insert("\u{0275}\u{0275}HostDirectivesFeature".to_string());
+        dc.push_str(&format!(
+            "    features: [\u{0275}\u{0275}HostDirectivesFeature({host_dirs_src})],\n"
+        ));
+    }
     if !gen.consts.is_empty() {
         dc.push_str(&format!("    consts: [{}],\n", gen.consts.join(", ")));
     }
@@ -3614,6 +3624,7 @@ mod tests {
             host_listeners: Vec::new(),
             host_bindings: Vec::new(),
             animations_source: None,
+            host_directives_source: None,
         }
     }
 

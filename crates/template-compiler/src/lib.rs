@@ -125,6 +125,7 @@ pub fn generate_template_fn(
         host_listeners: Vec::new(),
         host_bindings: Vec::new(),
         animations_source: None,
+        host_directives_source: None,
     };
 
     let ivy_output = codegen::generate_ivy(&extracted, &template_ast)?;
