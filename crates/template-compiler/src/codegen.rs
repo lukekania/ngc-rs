@@ -192,12 +192,17 @@ pub fn generate_ivy(
     }
     // hostDirectives composition (Angular 15+). Wrap the array in
     // `ɵɵHostDirectivesFeature(...)` and emit as a `features` entry so the
-    // runtime instantiates the composed directives on the host element.
+    // runtime instantiates the composed directives on the host element. The
+    // array is normalised first: decorator-form `inputs`/`outputs` use
+    // `'public: private'` colon syntax, but the runtime expects flat-pair
+    // arrays (`bindings[i]`, `bindings[i+1]`).
     if let Some(ref host_dirs_src) = component.host_directives_source {
         gen.ivy_imports
             .insert("\u{0275}\u{0275}HostDirectivesFeature".to_string());
+        let normalised = crate::host_codegen::transform_host_directives_array(host_dirs_src)
+            .unwrap_or_else(|| host_dirs_src.clone());
         dc.push_str(&format!(
-            "    features: [\u{0275}\u{0275}HostDirectivesFeature({host_dirs_src})],\n"
+            "    features: [\u{0275}\u{0275}HostDirectivesFeature({normalised})],\n"
         ));
     }
     if !gen.consts.is_empty() {

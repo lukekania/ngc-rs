@@ -82,11 +82,15 @@ pub fn generate_directive_ivy(extracted: &ExtractedDirective) -> NgcResult<IvyOu
 
     // hostDirectives composition (Angular 15+). Wrap the source array in a
     // `ɵɵHostDirectivesFeature(...)` call inside `features` so the runtime
-    // instantiates the composed directives on the host element.
+    // instantiates the composed directives on the host element. The array is
+    // normalised first: decorator-form `inputs`/`outputs` use `'public: private'`
+    // colon syntax, but the runtime expects flat-pair arrays.
     if let Some(ref host_dirs_src) = extracted.host_directives_source {
         ivy_imports.insert("\u{0275}\u{0275}HostDirectivesFeature".to_string());
+        let normalised = host_codegen::transform_host_directives_array(host_dirs_src)
+            .unwrap_or_else(|| host_dirs_src.clone());
         props.push(format!(
-            "features: [\u{0275}\u{0275}HostDirectivesFeature({host_dirs_src})]"
+            "features: [\u{0275}\u{0275}HostDirectivesFeature({normalised})]"
         ));
     }
 
@@ -356,8 +360,9 @@ mod tests {
     fn directive_host_directives_object_form_emits_feature() {
         // AOT path: a `@Directive` with `hostDirectives: [{ directive, inputs, outputs }]`
         // must wrap the array in `ɵɵHostDirectivesFeature(...)` inside the
-        // emitted `features` array, and add the symbol to ivy_imports so the
-        // rewrite step pulls it from `@angular/core`.
+        // emitted `features` array, normalise the decorator's colon-syntax
+        // `inputs`/`outputs` into the runtime's flat-pair form, and add the
+        // feature symbol to ivy_imports so the rewrite step pulls it in.
         let mut extracted = make_directive("HostDir", Some("[appHost]"), true);
         extracted.host_directives_source = Some(
             "[{ directive: ChildDir, inputs: ['childInput', 'aliased: localName'], outputs: ['childOutput'] }]"
@@ -370,7 +375,18 @@ mod tests {
             "expected ɵɵHostDirectivesFeature in features array, got: {def}"
         );
         assert!(def.contains("directive: ChildDir"));
-        assert!(def.contains("'aliased: localName'"));
+        assert!(
+            def.contains("inputs: ['childInput', 'childInput', 'aliased', 'localName']"),
+            "expected flat-pair inputs after colon-split: {def}"
+        );
+        assert!(
+            def.contains("outputs: ['childOutput', 'childOutput']"),
+            "expected bare output expanded to identity pair: {def}"
+        );
+        assert!(
+            !def.contains("'aliased: localName'"),
+            "raw colon-syntax string must not survive to the runtime: {def}"
+        );
         assert!(output
             .ivy_imports
             .contains("\u{0275}\u{0275}HostDirectivesFeature"));

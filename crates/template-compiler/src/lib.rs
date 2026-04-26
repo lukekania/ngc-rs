@@ -979,9 +979,15 @@ export class HostComponent {}
             out.contains("directive: ChildDirective"),
             "composed directive class reference must be preserved verbatim:\n{out}"
         );
+        // Decorator-form colon syntax must be normalised into flat pairs so
+        // Angular's runtime `bindingArrayToMap` reads them correctly.
         assert!(
-            out.contains("'aliased: localName'"),
-            "input remapping string must be passed through:\n{out}"
+            out.contains("inputs: ['childInput', 'childInput', 'aliased', 'localName']"),
+            "input remapping must be flattened from 'a: b' to ['a', 'b'] pairs:\n{out}"
+        );
+        assert!(
+            !out.contains("'aliased: localName'"),
+            "raw colon-syntax string must not survive to runtime:\n{out}"
         );
         // Symbol must end up in the @angular/core import so tree-shaking can
         // reach it and so the runtime resolves at module load.

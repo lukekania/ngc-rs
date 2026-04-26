@@ -428,9 +428,10 @@ mod tests {
     #[test]
     fn component_host_directives_object_form_emits_feature() {
         // Components must honor `hostDirectives` partial declarations the
-        // same way directives do — wrap the array in
-        // `ɵɵHostDirectivesFeature(...)` so composed directives instantiate
-        // on the host element with their input/output remappings applied.
+        // same way directives do — colon-syntax remapping strings get split
+        // into flat pairs so Angular's runtime `bindingArrayToMap` reads each
+        // pair correctly. Without this the host's bindings never reach the
+        // composed directive's private fields.
         let result = parse_and_transform(
             "{ type: HostComp, selector: 'host-comp', isStandalone: true, hostDirectives: [{ directive: ChildDir, inputs: ['x', 'y: z'], outputs: ['evt'] }], template: '<div></div>' }",
         );
@@ -439,7 +440,19 @@ mod tests {
             "expected ɵɵHostDirectivesFeature wrapper in component, got: {result}"
         );
         assert!(result.contains("directive: ChildDir"));
-        assert!(result.contains("'y: z'"));
+        // Mixed bare + colon entries → identity pair + split pair.
+        assert!(
+            result.contains("inputs: ['x', 'x', 'y', 'z']"),
+            "expected flat-pair inputs (bare→identity, colon→split): {result}"
+        );
+        assert!(
+            result.contains("outputs: ['evt', 'evt']"),
+            "expected bare output expanded to identity pair: {result}"
+        );
+        assert!(
+            !result.contains("'y: z'"),
+            "raw colon-syntax string must not survive to the runtime: {result}"
+        );
         assert!(result.contains("features: ["));
     }
 

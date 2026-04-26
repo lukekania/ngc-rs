@@ -82,16 +82,22 @@ fn host_directives_composition_emits_feature_call() {
         "expected composed directive class reference preserved:\n{out}"
     );
 
-    // Input/output remapping strings must pass through verbatim — Angular's
-    // runtime parses these at instantiation time to build the binding maps
-    // (`'publicName: privateName'` syntax).
+    // Input/output remapping strings must reach the runtime as flat pairs.
+    // Angular's `bindingArrayToMap` reads `bindings[i]` (publicName) and
+    // `bindings[i+1]` (privateName) — leaving the decorator's colon syntax
+    // intact would make it read a single key with `undefined` value, silently
+    // dropping the remapping at runtime.
     assert!(
-        out.contains("'active: highlighted'"),
-        "input remapping must reach the runtime as 'public: private':\n{out}"
+        out.contains("'active', 'highlighted'"),
+        "input remapping must reach the runtime as a flat pair:\n{out}"
     );
     assert!(
-        out.contains("'activated: hostActivated'"),
-        "output remapping must reach the runtime as 'public: private':\n{out}"
+        out.contains("'activated', 'hostActivated'"),
+        "output remapping must reach the runtime as a flat pair:\n{out}"
+    );
+    assert!(
+        !out.contains("'active: highlighted'"),
+        "raw colon-syntax string must not survive to the runtime:\n{out}"
     );
 
     // Symbol must be imported so the bundler can resolve it and the runtime

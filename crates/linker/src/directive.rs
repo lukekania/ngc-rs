@@ -367,9 +367,13 @@ pub fn build_host_bindings(
 /// in the partial declaration.
 ///
 /// The runtime accepts either bare class references or
-/// `{ directive, inputs?, outputs? }` objects (with `inputs` / `outputs` as
-/// arrays of `'publicName: privateName'` strings). The partial form always
-/// emits the object form, so we pass the array source text through verbatim.
+/// `{ directive, inputs?, outputs? }` objects. `inputs` / `outputs` must be
+/// flat-pair arrays (`[publicName1, privateName1, publicName2, privateName2]`)
+/// — the partial-declaration form encodes pairs as `'public: private'` colon
+/// strings, so we run the array through `transform_host_directives_array` to
+/// split colon strings into the runtime's flat-pair shape. Without this the
+/// `bindingArrayToMap` consumer reads the colon strings as a single key with
+/// an `undefined` value and the input/output remapping silently drops.
 pub(crate) fn build_host_directives_feature(
     obj: &ObjectExpression<'_>,
     source: &str,
@@ -381,7 +385,9 @@ pub(crate) fn build_host_directives_feature(
     } else {
         format!("{ng_import}.\u{0275}\u{0275}HostDirectivesFeature")
     };
-    Some(format!("{feature}({arr_text})"))
+    let normalised = host_codegen::transform_host_directives_array(arr_text)
+        .unwrap_or_else(|| arr_text.to_string());
+    Some(format!("{feature}({normalised})"))
 }
 
 /// Extract the text of a property key.
@@ -854,11 +860,14 @@ mod tests {
 
     #[test]
     fn host_directives_object_form_emits_feature() {
-        // Partial declarations always emit the object form with `inputs` /
-        // `outputs` as `'publicName: privateName'` string arrays. Linker must
-        // wrap the array in `ɵɵHostDirectivesFeature(...)` and add it to
-        // `features`, so the runtime instantiates the composed directive on
-        // the host and applies the input remappings.
+        // Partial declarations encode `inputs` / `outputs` as `'public: private'`
+        // colon strings (and bare names as identity). The runtime's
+        // `bindingArrayToMap` reads the array as flat pairs, so the linker must
+        // split each colon string into a `'public', 'private'` pair (and emit
+        // `'name', 'name'` for bare entries) before wrapping the whole thing in
+        // `ɵɵHostDirectivesFeature(...)`. Without this conversion the runtime
+        // sees a single key with `undefined` value and silently drops the
+        // remapping.
         let result = parse_and_transform(
             "{ type: HostDir, selector: '[appHost]', isStandalone: true, hostDirectives: [{ directive: ChildDir, inputs: ['childInput', 'aliased: localName'], outputs: ['childOutput'] }] }",
         );
@@ -870,9 +879,25 @@ mod tests {
             result.contains("directive: ChildDir"),
             "composed directive class reference must be preserved verbatim: {result}"
         );
+        // Bare name → identity pair.
         assert!(
-            result.contains("'aliased: localName'"),
-            "input remapping must be passed through: {result}"
+            result.contains("inputs: ['childInput', 'childInput'"),
+            "bare input name must become identity pair: {result}"
+        );
+        // Colon syntax → flat pair (left, right).
+        assert!(
+            result.contains("'aliased', 'localName'"),
+            "colon-syntax remapping must be split into a flat pair: {result}"
+        );
+        // Outputs follow the same shape — bare name → identity pair.
+        assert!(
+            result.contains("outputs: ['childOutput', 'childOutput']"),
+            "bare output name must become identity pair: {result}"
+        );
+        // The colon-string form must NOT survive into the runtime call.
+        assert!(
+            !result.contains("'aliased: localName'"),
+            "raw colon-syntax string must not reach the runtime: {result}"
         );
         assert!(result.contains("features: ["));
     }

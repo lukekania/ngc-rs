@@ -321,6 +321,111 @@ fn collect_ctx_rewrites(
     }
 }
 
+/// Transform a `hostDirectives` array source-text into the runtime form.
+///
+/// The source-level / partial-declaration form uses `'public: private'` colon
+/// syntax for `inputs` / `outputs` remapping. Angular's runtime
+/// `bindingArrayToMap` reads the array as flat pairs (`bindings[i]`,
+/// `bindings[i+1]`), so the colon strings must be split into pair entries
+/// before they reach `ɵɵHostDirectivesFeature(...)`.
+///
+/// Bare class refs (`[Foo]`) and any unrecognised entry shape pass through
+/// verbatim. A bare name `'x'` (no colon) becomes the identity pair `'x', 'x'`.
+///
+/// Returns `None` if the input fails to parse as an array literal — callers
+/// should fall back to passing the source through unchanged so codegen still
+/// produces something compilable.
+pub fn transform_host_directives_array(source_text: &str) -> Option<String> {
+    use oxc_ast::ast::{
+        ArrayExpressionElement, Expression, ObjectExpression, ObjectPropertyKind, PropertyKey,
+        Statement,
+    };
+
+    let alloc = Allocator::default();
+    let wrapped = format!("var __x = {source_text};");
+    let parsed = Parser::new(&alloc, &wrapped, SourceType::mjs()).parse();
+    if !parsed.errors.is_empty() {
+        return None;
+    }
+
+    let arr = match parsed.program.body.first() {
+        Some(Statement::VariableDeclaration(decl)) => match decl.declarations.first() {
+            Some(d) => match &d.init {
+                Some(Expression::ArrayExpression(a)) => a,
+                _ => return None,
+            },
+            None => return None,
+        },
+        _ => return None,
+    };
+
+    fn span_text<'a, T: GetSpan>(node: &T, src: &'a str) -> &'a str {
+        let sp = node.span();
+        &src[sp.start as usize..sp.end as usize]
+    }
+
+    fn flatten_binding_pair_strings(arr: &oxc_ast::ast::ArrayExpression<'_>) -> Vec<String> {
+        let mut out = Vec::with_capacity(arr.elements.len() * 2);
+        for el in &arr.elements {
+            if let ArrayExpressionElement::StringLiteral(s) = el {
+                let raw = s.value.as_str();
+                if let Some(idx) = raw.find(':') {
+                    let pub_name = raw[..idx].trim();
+                    let priv_name = raw[idx + 1..].trim();
+                    out.push(format!("'{pub_name}'"));
+                    out.push(format!("'{priv_name}'"));
+                } else {
+                    let n = raw.trim();
+                    out.push(format!("'{n}'"));
+                    out.push(format!("'{n}'"));
+                }
+            }
+        }
+        out
+    }
+
+    fn rewrite_object(obj: &ObjectExpression<'_>, src: &str) -> String {
+        let mut props = Vec::with_capacity(obj.properties.len());
+        for prop in &obj.properties {
+            let ObjectPropertyKind::ObjectProperty(p) = prop else {
+                continue;
+            };
+            let key = match &p.key {
+                PropertyKey::StaticIdentifier(id) => id.name.as_str(),
+                PropertyKey::StringLiteral(s) => s.value.as_str(),
+                _ => continue,
+            };
+            match key {
+                "inputs" | "outputs" => {
+                    if let Expression::ArrayExpression(arr) = &p.value {
+                        let pairs = flatten_binding_pair_strings(arr);
+                        props.push(format!("{key}: [{}]", pairs.join(", ")));
+                    } else {
+                        props.push(format!("{key}: {}", span_text(&p.value, src)));
+                    }
+                }
+                _ => {
+                    props.push(format!("{key}: {}", span_text(&p.value, src)));
+                }
+            }
+        }
+        format!("{{ {} }}", props.join(", "))
+    }
+
+    let mut entries = Vec::with_capacity(arr.elements.len());
+    for el in &arr.elements {
+        match el {
+            ArrayExpressionElement::ObjectExpression(obj) => {
+                entries.push(rewrite_object(obj, &wrapped));
+            }
+            other => {
+                entries.push(span_text(other, &wrapped).to_string());
+            }
+        }
+    }
+    Some(format!("[{}]", entries.join(", ")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,6 +593,67 @@ mod tests {
     #[test]
     fn host_expression_any_bare_identifier() {
         assert_eq!(compile_host_expression("$any(value)"), "ctx.value");
+    }
+
+    #[test]
+    fn transform_host_directives_bare_only() {
+        // Bare class refs pass through verbatim — `ɵɵHostDirectivesFeature`
+        // accepts them directly and the runtime treats them as identity-mapped
+        // composed directives with no input/output remapping.
+        let out = transform_host_directives_array("[Foo, Bar]").unwrap();
+        assert_eq!(out, "[Foo, Bar]");
+    }
+
+    #[test]
+    fn transform_host_directives_bare_input_to_identity_pair() {
+        // A bare `'name'` input/output entry must expand to the identity pair
+        // `'name', 'name'` so the runtime's `bindingArrayToMap` reads it as a
+        // pair (key = name, value = name).
+        let out = transform_host_directives_array(
+            "[{ directive: Foo, inputs: ['x'], outputs: ['evt'] }]",
+        )
+        .unwrap();
+        assert!(
+            out.contains("inputs: ['x', 'x']"),
+            "bare input must expand to identity pair: {out}"
+        );
+        assert!(
+            out.contains("outputs: ['evt', 'evt']"),
+            "bare output must expand to identity pair: {out}"
+        );
+    }
+
+    #[test]
+    fn transform_host_directives_colon_to_flat_pair() {
+        // The decorator/partial-form `'public: private'` colon syntax must be
+        // split into a flat pair (`'public', 'private'`). Trim spaces around
+        // the colon so `'a: b'` and `'a:b'` are equivalent.
+        let out = transform_host_directives_array(
+            "[{ directive: Foo, inputs: ['a: b', 'c:d'], outputs: ['evt: hostEvt'] }]",
+        )
+        .unwrap();
+        assert!(
+            out.contains("inputs: ['a', 'b', 'c', 'd']"),
+            "colon-syntax inputs must be split into flat pairs: {out}"
+        );
+        assert!(
+            out.contains("outputs: ['evt', 'hostEvt']"),
+            "colon-syntax outputs must be split into flat pairs: {out}"
+        );
+    }
+
+    #[test]
+    fn transform_host_directives_mixed_entries() {
+        // A mix of bare class ref and remapped object form must round-trip
+        // correctly — bare ref untouched, object's inputs flattened.
+        let out =
+            transform_host_directives_array("[Foo, { directive: Bar, inputs: ['propA: aliasA'] }]")
+                .unwrap();
+        assert!(out.starts_with("[Foo,"), "bare ref must stay first: {out}");
+        assert!(
+            out.contains("inputs: ['propA', 'aliasA']"),
+            "object's inputs must be flattened: {out}"
+        );
     }
 
     #[test]
