@@ -157,6 +157,7 @@ mod tests {
             host_listeners: Vec::new(),
             host_bindings: Vec::new(),
             animations_source: None,
+            host_directives_source: None,
         }
     }
 

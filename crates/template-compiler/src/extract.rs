@@ -67,6 +67,11 @@ pub struct ExtractedComponent {
     /// Passed through to the `defineComponent({ data: { animation: [...] } })`
     /// field so Angular's runtime can register triggers with the animation renderer.
     pub animations_source: Option<String>,
+    /// Raw source text of the `hostDirectives` array (Angular 15+ composition).
+    /// Passed through to a `ɵɵHostDirectivesFeature(...)` call in the
+    /// `features` array. Accepts both bare class refs (e.g. `[Foo]`) and the
+    /// object form (`[{directive: Foo, inputs: ['x'], outputs: [...]}]`).
+    pub host_directives_source: Option<String>,
 }
 
 /// A method-level `@HostListener(event, [args])` extraction.
@@ -234,6 +239,7 @@ pub fn extract_component(source: &str, file_path: &Path) -> NgcResult<Option<Ext
             host_listeners,
             host_bindings,
             animations_source: metadata.animations_source,
+            host_directives_source: metadata.host_directives_source,
         }));
     }
 
@@ -332,6 +338,8 @@ pub struct ExtractedDirective {
     pub host_listeners: Vec<HostListenerSpec>,
     /// Field/property-level `@HostBinding` extractions.
     pub host_bindings: Vec<HostBindingSpec>,
+    /// Raw source text of the `hostDirectives` array (Angular 15+ composition).
+    pub host_directives_source: Option<String>,
     /// Common decorator fields for rewriting.
     pub common: DecoratorCommon,
 }
@@ -516,6 +524,7 @@ pub fn extract_directive(source: &str, file_path: &Path) -> NgcResult<Option<Ext
         let mut inputs_source = None;
         let mut outputs_source = None;
         let mut export_as = None;
+        let mut host_directives_source = None;
 
         if let Expression::CallExpression(call) = &decorator.expression {
             if let Some(Argument::ObjectExpression(obj)) = call.arguments.first() {
@@ -543,6 +552,9 @@ pub fn extract_directive(source: &str, file_path: &Path) -> NgcResult<Option<Ext
                                     export_as = Some(s.value.to_string());
                                 }
                             }
+                            "hostDirectives" => {
+                                host_directives_source = source_text_of(source, &prop.value);
+                            }
                             _ => {}
                         }
                     }
@@ -563,6 +575,7 @@ pub fn extract_directive(source: &str, file_path: &Path) -> NgcResult<Option<Ext
             constructor_params,
             host_listeners,
             host_bindings,
+            host_directives_source,
             common: DecoratorCommon {
                 decorator_span: (decorator.span.start, decorator.span.end),
                 class_body_start,
@@ -1030,6 +1043,7 @@ struct DecoratorMetadata {
     inline_styles: Vec<String>,
     style_urls: Vec<String>,
     animations_source: Option<String>,
+    host_directives_source: Option<String>,
 }
 
 /// Extract metadata from the `@Component({...})` decorator argument.
@@ -1048,6 +1062,7 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
                 inline_styles: Vec::new(),
                 style_urls: Vec::new(),
                 animations_source: None,
+                host_directives_source: None,
             });
         }
     };
@@ -1066,6 +1081,7 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
                 inline_styles: Vec::new(),
                 style_urls: Vec::new(),
                 animations_source: None,
+                host_directives_source: None,
             });
         }
     };
@@ -1080,6 +1096,7 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
     let mut inline_styles: Vec<String> = Vec::new();
     let mut style_urls: Vec<String> = Vec::new();
     let mut animations_source = None;
+    let mut host_directives_source = None;
 
     for prop in &arg.properties {
         if let ObjectPropertyKind::ObjectProperty(prop) = prop {
@@ -1197,6 +1214,13 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
                         animations_source = Some(source[start..end].to_string());
                     }
                 }
+                "hostDirectives" => {
+                    let start = prop.value.span().start as usize;
+                    let end = prop.value.span().end as usize;
+                    if start < source.len() && end <= source.len() {
+                        host_directives_source = Some(source[start..end].to_string());
+                    }
+                }
                 _ => {}
             }
         }
@@ -1213,6 +1237,7 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
         inline_styles,
         style_urls,
         animations_source,
+        host_directives_source,
     })
 }
 
