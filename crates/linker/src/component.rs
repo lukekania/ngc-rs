@@ -424,4 +424,33 @@ mod tests {
         assert!(result.contains("decls: 0"));
         assert!(result.contains("vars: 0"));
     }
+
+    #[test]
+    fn component_host_directives_object_form_emits_feature() {
+        // Components must honor `hostDirectives` partial declarations the
+        // same way directives do — wrap the array in
+        // `ɵɵHostDirectivesFeature(...)` so composed directives instantiate
+        // on the host element with their input/output remappings applied.
+        let result = parse_and_transform(
+            "{ type: HostComp, selector: 'host-comp', isStandalone: true, hostDirectives: [{ directive: ChildDir, inputs: ['x', 'y: z'], outputs: ['evt'] }], template: '<div></div>' }",
+        );
+        assert!(
+            result.contains("i0.\u{0275}\u{0275}HostDirectivesFeature(["),
+            "expected ɵɵHostDirectivesFeature wrapper in component, got: {result}"
+        );
+        assert!(result.contains("directive: ChildDir"));
+        assert!(result.contains("'y: z'"));
+        assert!(result.contains("features: ["));
+    }
+
+    #[test]
+    fn component_host_directives_bare_form_emits_feature() {
+        let result = parse_and_transform(
+            "{ type: HostComp, selector: 'host-comp', isStandalone: true, hostDirectives: [BareDir], template: '<div></div>' }",
+        );
+        assert!(
+            result.contains("i0.\u{0275}\u{0275}HostDirectivesFeature([BareDir])"),
+            "expected bare class form, got: {result}"
+        );
+    }
 }

@@ -945,6 +945,86 @@ export class PortfolioComponent {
     }
 
     #[test]
+    fn test_component_host_directives_roundtrip() {
+        // AOT path: a `@Component` with `hostDirectives` must compile to a
+        // `defineComponent({ ..., features: [ɵɵHostDirectivesFeature([...])] })`
+        // call, with the runtime symbol pulled in via the rewritten
+        // `@angular/core` import. This is what Angular needs to instantiate
+        // the composed directive on the host element with input/output
+        // remappings honored.
+        let source = r#"import { Component, Directive } from '@angular/core';
+
+@Directive({ selector: '[appChild]', standalone: true })
+export class ChildDirective {}
+
+@Component({
+  selector: 'app-host',
+  standalone: true,
+  hostDirectives: [
+    { directive: ChildDirective, inputs: ['childInput', 'aliased: localName'], outputs: ['childOutput'] }
+  ],
+  template: '<div>host</div>',
+})
+export class HostComponent {}
+"#;
+        let path = PathBuf::from("host.component.ts");
+        let result = compile_file(source, &path, &StyleContext::default()).expect("should compile");
+        assert!(result.compiled);
+        let out = &result.source;
+        assert!(
+            out.contains("\u{0275}\u{0275}HostDirectivesFeature(["),
+            "expected ɵɵHostDirectivesFeature in compiled component, got:\n{out}"
+        );
+        assert!(
+            out.contains("directive: ChildDirective"),
+            "composed directive class reference must be preserved verbatim:\n{out}"
+        );
+        assert!(
+            out.contains("'aliased: localName'"),
+            "input remapping string must be passed through:\n{out}"
+        );
+        // Symbol must end up in the @angular/core import so tree-shaking can
+        // reach it and so the runtime resolves at module load.
+        assert!(
+            out.contains("\u{0275}\u{0275}HostDirectivesFeature"),
+            "feature symbol must be imported:\n{out}"
+        );
+
+        let js = ngc_ts_transform::transform_source(&result.source, "host.component.ts");
+        assert!(
+            js.is_ok(),
+            "oxc should parse compiled source: {:?}\n\n{}",
+            js.err(),
+            result.source
+        );
+    }
+
+    #[test]
+    fn test_directive_host_directives_bare_form_roundtrip() {
+        // The bare-class form (no inputs/outputs remapping) must compile too.
+        // `compile_file` extracts the first `@Directive` it finds; put `HostDir`
+        // at the top so we exercise the host-directives path.
+        let source = r#"import { Directive } from '@angular/core';
+import { ChildDir } from './child.directive';
+
+@Directive({
+  selector: '[appHost]',
+  standalone: true,
+  hostDirectives: [ChildDir],
+})
+export class HostDir {}
+"#;
+        let path = PathBuf::from("host.directive.ts");
+        let result = compile_file(source, &path, &StyleContext::default()).expect("should compile");
+        assert!(result.compiled);
+        let out = &result.source;
+        assert!(
+            out.contains("\u{0275}\u{0275}HostDirectivesFeature([ChildDir])"),
+            "expected bare class ref inside feature, got:\n{out}"
+        );
+    }
+
+    #[test]
     fn test_directive_roundtrip() {
         let source = r#"import { Directive, ElementRef } from '@angular/core';
 

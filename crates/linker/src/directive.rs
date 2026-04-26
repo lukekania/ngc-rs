@@ -853,6 +853,58 @@ mod tests {
     }
 
     #[test]
+    fn host_directives_object_form_emits_feature() {
+        // Partial declarations always emit the object form with `inputs` /
+        // `outputs` as `'publicName: privateName'` string arrays. Linker must
+        // wrap the array in `ɵɵHostDirectivesFeature(...)` and add it to
+        // `features`, so the runtime instantiates the composed directive on
+        // the host and applies the input remappings.
+        let result = parse_and_transform(
+            "{ type: HostDir, selector: '[appHost]', isStandalone: true, hostDirectives: [{ directive: ChildDir, inputs: ['childInput', 'aliased: localName'], outputs: ['childOutput'] }] }",
+        );
+        assert!(
+            result.contains("i0.\u{0275}\u{0275}HostDirectivesFeature(["),
+            "expected ɵɵHostDirectivesFeature wrapper, got: {result}"
+        );
+        assert!(
+            result.contains("directive: ChildDir"),
+            "composed directive class reference must be preserved verbatim: {result}"
+        );
+        assert!(
+            result.contains("'aliased: localName'"),
+            "input remapping must be passed through: {result}"
+        );
+        assert!(result.contains("features: ["));
+    }
+
+    #[test]
+    fn host_directives_bare_form_emits_feature() {
+        // Even though partial declarations always emit the object form, the
+        // runtime accepts bare class references too. Linker should pass the
+        // array source through verbatim — `ɵɵHostDirectivesFeature` handles
+        // both shapes.
+        let result = parse_and_transform(
+            "{ type: HostDir, selector: '[appHost]', isStandalone: true, hostDirectives: [BareChildDir] }",
+        );
+        assert!(
+            result.contains("i0.\u{0275}\u{0275}HostDirectivesFeature([BareChildDir])"),
+            "expected bare class reference inside feature call, got: {result}"
+        );
+    }
+
+    #[test]
+    fn host_directives_combines_with_providers_feature() {
+        // When both `providers` and `hostDirectives` are present, both feature
+        // calls must appear in the same `features` array. Order doesn't matter
+        // for runtime correctness, but both must be present.
+        let result = parse_and_transform(
+            "{ type: HostDir, selector: '[appHost]', isStandalone: true, providers: [SomeService], hostDirectives: [ChildDir] }",
+        );
+        assert!(result.contains("i0.\u{0275}\u{0275}ProvidersFeature"));
+        assert!(result.contains("i0.\u{0275}\u{0275}HostDirectivesFeature"));
+    }
+
+    #[test]
     fn parity_host_mixed_listener_and_bindings() {
         let aot = aot_compile(
             "import { Directive, HostListener, HostBinding } from '@angular/core';\n\

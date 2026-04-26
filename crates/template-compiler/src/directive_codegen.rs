@@ -353,6 +353,42 @@ mod tests {
     }
 
     #[test]
+    fn directive_host_directives_object_form_emits_feature() {
+        // AOT path: a `@Directive` with `hostDirectives: [{ directive, inputs, outputs }]`
+        // must wrap the array in `ɵɵHostDirectivesFeature(...)` inside the
+        // emitted `features` array, and add the symbol to ivy_imports so the
+        // rewrite step pulls it from `@angular/core`.
+        let mut extracted = make_directive("HostDir", Some("[appHost]"), true);
+        extracted.host_directives_source = Some(
+            "[{ directive: ChildDir, inputs: ['childInput', 'aliased: localName'], outputs: ['childOutput'] }]"
+                .to_string(),
+        );
+        let output = generate_directive_ivy(&extracted).unwrap();
+        let def = &output.static_fields[0];
+        assert!(
+            def.contains("features: [\u{0275}\u{0275}HostDirectivesFeature(["),
+            "expected ɵɵHostDirectivesFeature in features array, got: {def}"
+        );
+        assert!(def.contains("directive: ChildDir"));
+        assert!(def.contains("'aliased: localName'"));
+        assert!(output
+            .ivy_imports
+            .contains("\u{0275}\u{0275}HostDirectivesFeature"));
+    }
+
+    #[test]
+    fn directive_host_directives_bare_form_emits_feature() {
+        let mut extracted = make_directive("HostDir", Some("[appHost]"), true);
+        extracted.host_directives_source = Some("[BareChild]".to_string());
+        let output = generate_directive_ivy(&extracted).unwrap();
+        let def = &output.static_fields[0];
+        assert!(
+            def.contains("\u{0275}\u{0275}HostDirectivesFeature([BareChild])"),
+            "expected bare class ref in feature call, got: {def}"
+        );
+    }
+
+    #[test]
     fn test_directive_host_mixed_listener_and_bindings() {
         let mut extracted = make_directive("MyDir", Some("[myDir]"), true);
         extracted.host_listeners = vec![HostListenerSpec {
