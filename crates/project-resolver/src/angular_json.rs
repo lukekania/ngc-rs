@@ -140,13 +140,26 @@ pub struct RawBuildOptions {
     /// `less`, or `stylus`. Used when a component uses a `styles: [...]`
     /// literal rather than `styleUrl`/`styleUrls`.
     pub inline_style_language: Option<String>,
-    /// Enables Angular's service-worker pipeline. When `true`, ngc-rs reads
-    /// `ngsw-config.json` after the bundle is otherwise complete and emits
-    /// `ngsw.json` plus the worker scripts into the output directory.
-    pub service_worker: Option<bool>,
+    /// Enables Angular's service-worker pipeline. Accepts either a boolean
+    /// (`true`/`false`) or a string path to `ngsw-config.json` (legacy
+    /// Angular `<` v15 form, where the field served double-duty as both the
+    /// enable flag and the config path).
+    pub service_worker: Option<RawServiceWorker>,
     /// Path to the service-worker configuration file. Defaults to
     /// `ngsw-config.json` at the workspace root when omitted.
     pub ngsw_config_path: Option<String>,
+}
+
+/// `serviceWorker` accepts either a bool (Angular 15+) or a string path
+/// to the config file (legacy Angular `<` v15).
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum RawServiceWorker {
+    /// Boolean form: `"serviceWorker": true`.
+    Enabled(bool),
+    /// Legacy string form: `"serviceWorker": "ngsw-config.json"`. The string
+    /// is the path to the config file (treated as enabled when present).
+    ConfigPath(String),
 }
 
 /// Output path can be a simple string or an object for SSR setups.
@@ -549,9 +562,18 @@ pub fn resolve_angular_project(
         .unwrap_or(false);
     let inline_style_language =
         InlineStyleLanguage::parse(options.and_then(|o| o.inline_style_language.as_deref()));
-    let service_worker = options.and_then(|o| o.service_worker).unwrap_or(false);
+    // serviceWorker accepts bool (modern) or string-path (legacy). When the
+    // string form is used, it doubles as the ngsw config path unless an
+    // explicit `ngswConfigPath` overrides it.
+    let (service_worker, sw_inline_path) = match options.and_then(|o| o.service_worker.as_ref()) {
+        Some(RawServiceWorker::Enabled(b)) => (*b, None),
+        Some(RawServiceWorker::ConfigPath(p)) => (true, Some(p.clone())),
+        None => (false, None),
+    };
     let ngsw_config_path = options
         .and_then(|o| o.ngsw_config_path.as_deref())
+        .map(String::from)
+        .or(sw_inline_path)
         .map(|p| base_dir.join(p))
         .unwrap_or_else(|| base_dir.join("ngsw-config.json"));
     let i18n = project
@@ -1187,6 +1209,55 @@ mod tests {
         let result = resolve_angular_project(f.path(), None, None).unwrap();
         assert!(result.service_worker);
         assert!(result.ngsw_config_path.ends_with("ngsw-config.json"));
+    }
+
+    #[test]
+    fn test_parse_service_worker_legacy_string_path() {
+        // Pre-v15 Angular used `"serviceWorker": "ngsw-config.json"` where
+        // the string both enabled the SW and named the config file.
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "architect": {
+                        "build": {
+                            "options": {
+                                "outputPath": "dist",
+                                "tsConfig": "tsconfig.json",
+                                "serviceWorker": "ngsw-config.json"
+                            }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let result = resolve_angular_project(f.path(), None, None).unwrap();
+        assert!(result.service_worker);
+        assert!(result.ngsw_config_path.ends_with("ngsw-config.json"));
+    }
+
+    #[test]
+    fn test_explicit_ngsw_config_path_overrides_legacy_string() {
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "architect": {
+                        "build": {
+                            "options": {
+                                "outputPath": "dist",
+                                "tsConfig": "tsconfig.json",
+                                "serviceWorker": "legacy.json",
+                                "ngswConfigPath": "explicit/ngsw.json"
+                            }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let result = resolve_angular_project(f.path(), None, None).unwrap();
+        assert!(result.service_worker);
+        assert!(result.ngsw_config_path.ends_with("explicit/ngsw.json"));
     }
 
     #[test]
