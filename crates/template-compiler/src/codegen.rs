@@ -177,6 +177,19 @@ pub fn generate_ivy(
             .collect();
         dc.push_str(&format!("    inputs: {{ {} }},\n", inputs.join(", ")));
     }
+    let host_props = crate::directive_codegen::build_host_props(
+        &component.host_listeners,
+        &component.host_bindings,
+    );
+    for imp in &host_props.ivy_imports {
+        gen.ivy_imports.insert(imp.clone());
+    }
+    if let Some(ref host_vars) = host_props.host_vars_prop {
+        dc.push_str(&format!("    {host_vars},\n"));
+    }
+    if let Some(ref host_bindings) = host_props.host_bindings_prop {
+        dc.push_str(&format!("    {host_bindings},\n"));
+    }
     if !gen.consts.is_empty() {
         dc.push_str(&format!("    consts: [{}],\n", gen.consts.join(", ")));
     }
@@ -3598,6 +3611,8 @@ mod tests {
             inline_styles: Vec::new(),
             style_urls: Vec::new(),
             input_properties: Vec::new(),
+            host_listeners: Vec::new(),
+            host_bindings: Vec::new(),
             animations_source: None,
         }
     }

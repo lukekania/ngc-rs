@@ -3,8 +3,9 @@ use std::path::Path;
 use ngc_diagnostics::{NgcError, NgcResult};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Argument, Class, Decorator, Expression, FormalParameter, FormalParameters,
-    MethodDefinitionKind, ObjectPropertyKind, PropertyKey, Statement, TSTypeAnnotation,
+    Argument, ArrayExpressionElement, Class, ClassElement, Decorator, Expression, FormalParameter,
+    FormalParameters, MethodDefinitionKind, ObjectPropertyKind, PropertyKey, Statement,
+    TSTypeAnnotation,
 };
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
@@ -58,10 +59,37 @@ pub struct ExtractedComponent {
     pub style_urls: Vec<String>,
     /// Property names decorated with `@Input()`.
     pub input_properties: Vec<String>,
+    /// Method-level `@HostListener` extractions (e.g. `('click', ['$event'])`).
+    pub host_listeners: Vec<HostListenerSpec>,
+    /// Field/property-level `@HostBinding` extractions (e.g. `('class.active')`).
+    pub host_bindings: Vec<HostBindingSpec>,
     /// Raw source text of the `animations` array (e.g. `[trigger('fade', [...])]`).
     /// Passed through to the `defineComponent({ data: { animation: [...] } })`
     /// field so Angular's runtime can register triggers with the animation renderer.
     pub animations_source: Option<String>,
+}
+
+/// A method-level `@HostListener(event, [args])` extraction.
+#[derive(Debug, Clone)]
+pub struct HostListenerSpec {
+    /// Event name passed to the decorator (e.g. `"click"`, `"window:resize"`).
+    pub event: String,
+    /// The JS expression invoked by `ɵɵlistener` — already shaped as
+    /// `methodName(...args)`. Component members get `ctx.` prefixed downstream
+    /// by `host_codegen::compile_host_expression`.
+    pub handler_expression: String,
+}
+
+/// A field/property-level `@HostBinding(target?)` extraction.
+#[derive(Debug, Clone)]
+pub struct HostBindingSpec {
+    /// Decorator argument: bare property name, `attr.X`, `class.Y`, `style.Z`,
+    /// or `style.Z.unit`. Falls back to the property name when the decorator
+    /// is called with no arguments.
+    pub target: String,
+    /// The class field/getter that supplies the value. Compiled to `ctx.<name>`
+    /// at codegen time.
+    pub property_name: String,
 }
 
 impl ExtractedComponent {
@@ -182,6 +210,9 @@ pub fn extract_component(source: &str, file_path: &Path) -> NgcResult<Option<Ext
             }
         }
 
+        let host_listeners = extract_host_listeners(&class.body);
+        let host_bindings = extract_host_bindings(&class.body);
+
         return Ok(Some(ExtractedComponent {
             class_name,
             selector: metadata.selector,
@@ -200,6 +231,8 @@ pub fn extract_component(source: &str, file_path: &Path) -> NgcResult<Option<Ext
             inline_styles: metadata.inline_styles,
             style_urls: metadata.style_urls,
             input_properties,
+            host_listeners,
+            host_bindings,
             animations_source: metadata.animations_source,
         }));
     }
@@ -295,6 +328,10 @@ pub struct ExtractedDirective {
     pub export_as: Option<String>,
     /// Constructor parameters for DI-aware factory generation.
     pub constructor_params: Vec<ConstructorParam>,
+    /// Method-level `@HostListener` extractions.
+    pub host_listeners: Vec<HostListenerSpec>,
+    /// Field/property-level `@HostBinding` extractions.
+    pub host_bindings: Vec<HostBindingSpec>,
     /// Common decorator fields for rewriting.
     pub common: DecoratorCommon,
 }
@@ -513,6 +550,9 @@ pub fn extract_directive(source: &str, file_path: &Path) -> NgcResult<Option<Ext
             }
         }
 
+        let host_listeners = extract_host_listeners(&class.body);
+        let host_bindings = extract_host_bindings(&class.body);
+
         return Ok(Some(ExtractedDirective {
             class_name,
             selector,
@@ -521,6 +561,8 @@ pub fn extract_directive(source: &str, file_path: &Path) -> NgcResult<Option<Ext
             outputs_source,
             export_as,
             constructor_params,
+            host_listeners,
+            host_bindings,
             common: DecoratorCommon {
                 decorator_span: (decorator.span.start, decorator.span.end),
                 class_body_start,
@@ -777,6 +819,116 @@ fn source_text_of(source: &str, expr: &Expression<'_>) -> Option<String> {
     let end = expr.span().end as usize;
     if start < source.len() && end <= source.len() {
         Some(source[start..end].to_string())
+    } else {
+        None
+    }
+}
+
+/// Walk a class body and collect every method-level `@HostListener(event[, args])`.
+///
+/// `@HostListener('click', ['$event'])` on `onClick($event)` produces a spec
+/// with `event = "click"` and `handler_expression = "onClick($event)"`. The
+/// handler expression is fed to `host_codegen::compile_host_expression` at
+/// codegen time, which prefixes `onClick` with `ctx.`.
+fn extract_host_listeners(class_body: &oxc_ast::ast::ClassBody<'_>) -> Vec<HostListenerSpec> {
+    let mut listeners = Vec::new();
+    for element in &class_body.body {
+        let ClassElement::MethodDefinition(method) = element else {
+            continue;
+        };
+        if method.kind == MethodDefinitionKind::Constructor {
+            continue;
+        }
+        let method_name = match &method.key {
+            PropertyKey::StaticIdentifier(id) => id.name.to_string(),
+            PropertyKey::StringLiteral(s) => s.value.to_string(),
+            _ => continue,
+        };
+        for decorator in &method.decorators {
+            let Some(call) = decorator_call(decorator, "HostListener") else {
+                continue;
+            };
+            let event = match call.arguments.first() {
+                Some(Argument::StringLiteral(s)) => s.value.to_string(),
+                _ => continue,
+            };
+            let args_text = match call.arguments.get(1) {
+                Some(Argument::ArrayExpression(arr)) => arr
+                    .elements
+                    .iter()
+                    .filter_map(|el| match el {
+                        ArrayExpressionElement::StringLiteral(s) => Some(s.value.to_string()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                _ => String::new(),
+            };
+            let handler_expression = format!("{method_name}({args_text})");
+            listeners.push(HostListenerSpec {
+                event,
+                handler_expression,
+            });
+        }
+    }
+    listeners
+}
+
+/// Walk a class body and collect every field-level `@HostBinding(target?)`.
+///
+/// `@HostBinding('class.active') isActive = true;` produces a spec with
+/// `target = "class.active"` and `property_name = "isActive"`. When the
+/// decorator argument is omitted, Angular defaults to the property name as
+/// the target (matching `@HostBinding() class = '...'`).
+fn extract_host_bindings(class_body: &oxc_ast::ast::ClassBody<'_>) -> Vec<HostBindingSpec> {
+    let mut bindings = Vec::new();
+    for element in &class_body.body {
+        let (decorators, key) = match element {
+            ClassElement::PropertyDefinition(prop) => (&prop.decorators, &prop.key),
+            ClassElement::MethodDefinition(method)
+                if method.kind == MethodDefinitionKind::Get
+                    || method.kind == MethodDefinitionKind::Set =>
+            {
+                (&method.decorators, &method.key)
+            }
+            _ => continue,
+        };
+        let property_name = match key {
+            PropertyKey::StaticIdentifier(id) => id.name.to_string(),
+            PropertyKey::StringLiteral(s) => s.value.to_string(),
+            _ => continue,
+        };
+        for decorator in decorators {
+            let Some(call) = decorator_call(decorator, "HostBinding") else {
+                continue;
+            };
+            let target = match call.arguments.first() {
+                Some(Argument::StringLiteral(s)) => s.value.to_string(),
+                None => property_name.clone(),
+                _ => continue,
+            };
+            bindings.push(HostBindingSpec {
+                target,
+                property_name: property_name.clone(),
+            });
+        }
+    }
+    bindings
+}
+
+/// If `decorator` is `@Name(...)`, return the call expression — otherwise `None`.
+fn decorator_call<'a>(
+    decorator: &'a Decorator<'a>,
+    name: &str,
+) -> Option<&'a oxc_ast::ast::CallExpression<'a>> {
+    let Expression::CallExpression(call) = &decorator.expression else {
+        return None;
+    };
+    let Expression::Identifier(ident) = &call.callee else {
+        return None;
+    };
+    if ident.name.as_str() == name {
+        Some(call)
     } else {
         None
     }
@@ -1325,5 +1477,141 @@ export class AppModule {}
         let source = "export class PlainClass { x = 1; }\n";
         let result = extract_injectable(source, &test_path()).expect("should not error");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_host_listener_event_only() {
+        let source = r#"import { Directive, HostListener } from '@angular/core';
+
+@Directive({ selector: '[appResize]' })
+export class ResizeDirective {
+  @HostListener('window:resize')
+  onResize() {}
+}
+"#;
+        let result = extract_directive(source, &test_path())
+            .expect("should extract")
+            .expect("should find directive");
+        assert_eq!(result.host_listeners.len(), 1);
+        assert_eq!(result.host_listeners[0].event, "window:resize");
+        assert_eq!(result.host_listeners[0].handler_expression, "onResize()");
+    }
+
+    #[test]
+    fn test_extract_host_listener_with_args() {
+        let source = r#"import { Directive, HostListener } from '@angular/core';
+
+@Directive({ selector: '[appClick]' })
+export class ClickDirective {
+  @HostListener('click', ['$event'])
+  onClick($event: MouseEvent) {}
+}
+"#;
+        let result = extract_directive(source, &test_path())
+            .expect("should extract")
+            .expect("should find directive");
+        assert_eq!(result.host_listeners.len(), 1);
+        assert_eq!(result.host_listeners[0].event, "click");
+        assert_eq!(
+            result.host_listeners[0].handler_expression,
+            "onClick($event)"
+        );
+    }
+
+    #[test]
+    fn test_extract_host_binding_bare() {
+        let source = r#"import { Directive, HostBinding } from '@angular/core';
+
+@Directive({ selector: '[appX]' })
+export class XDirective {
+  @HostBinding('disabled') isDisabled = false;
+}
+"#;
+        let result = extract_directive(source, &test_path())
+            .expect("should extract")
+            .expect("should find directive");
+        assert_eq!(result.host_bindings.len(), 1);
+        assert_eq!(result.host_bindings[0].target, "disabled");
+        assert_eq!(result.host_bindings[0].property_name, "isDisabled");
+    }
+
+    #[test]
+    fn test_extract_host_binding_class_attr_style() {
+        let source = r#"import { Directive, HostBinding } from '@angular/core';
+
+@Directive({ selector: '[appX]' })
+export class XDirective {
+  @HostBinding('class.active') isActive = true;
+  @HostBinding('attr.aria-label') label = 'x';
+  @HostBinding('style.width.px') width = 100;
+}
+"#;
+        let result = extract_directive(source, &test_path())
+            .expect("should extract")
+            .expect("should find directive");
+        assert_eq!(result.host_bindings.len(), 3);
+        let targets: Vec<&str> = result
+            .host_bindings
+            .iter()
+            .map(|b| b.target.as_str())
+            .collect();
+        assert!(targets.contains(&"class.active"));
+        assert!(targets.contains(&"attr.aria-label"));
+        assert!(targets.contains(&"style.width.px"));
+    }
+
+    #[test]
+    fn test_extract_host_binding_no_arg_uses_property_name() {
+        let source = r#"import { Directive, HostBinding } from '@angular/core';
+
+@Directive({ selector: '[appX]' })
+export class XDirective {
+  @HostBinding() id = 'host';
+}
+"#;
+        let result = extract_directive(source, &test_path())
+            .expect("should extract")
+            .expect("should find directive");
+        assert_eq!(result.host_bindings.len(), 1);
+        assert_eq!(result.host_bindings[0].target, "id");
+        assert_eq!(result.host_bindings[0].property_name, "id");
+    }
+
+    #[test]
+    fn test_extract_host_binding_on_getter() {
+        // Angular accepts @HostBinding on a getter — the value is a computed
+        // expression rather than a plain field.
+        let source = r#"import { Directive, HostBinding } from '@angular/core';
+
+@Directive({ selector: '[appX]' })
+export class XDirective {
+  @HostBinding('attr.title') get title() { return 'tip'; }
+}
+"#;
+        let result = extract_directive(source, &test_path())
+            .expect("should extract")
+            .expect("should find directive");
+        assert_eq!(result.host_bindings.len(), 1);
+        assert_eq!(result.host_bindings[0].target, "attr.title");
+        assert_eq!(result.host_bindings[0].property_name, "title");
+    }
+
+    #[test]
+    fn test_component_extracts_host_decorators() {
+        let source = r#"import { Component, HostListener, HostBinding } from '@angular/core';
+
+@Component({ selector: 'app-x', standalone: true, template: '' })
+export class XComponent {
+  @HostBinding('class.dark') isDark = false;
+  @HostListener('window:resize') onResize() {}
+}
+"#;
+        let result = extract_component(source, &test_path())
+            .expect("should extract")
+            .expect("should find component");
+        assert_eq!(result.host_listeners.len(), 1);
+        assert_eq!(result.host_bindings.len(), 1);
+        assert_eq!(result.host_listeners[0].event, "window:resize");
+        assert_eq!(result.host_bindings[0].target, "class.dark");
     }
 }
