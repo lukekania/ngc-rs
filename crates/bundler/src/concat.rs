@@ -43,6 +43,12 @@ pub struct BundleOptions {
     pub content_hash: bool,
     /// Perform tree shaking (unused export elimination).
     pub tree_shake: bool,
+    /// Inject Angular's build-time global flags (`ngDevMode`,
+    /// `ngI18nClosureMode`, `ngJitMode`) as `globalThis` assignments at the
+    /// top of `main.js`. Required so `@angular/core`'s `isDevMode()` returns
+    /// `false` in production bundles. (Does **not** dead-code-eliminate
+    /// dev-only branches — that's a separate define-substitution pass.)
+    pub inject_dev_mode_globals: bool,
 }
 
 /// Input to the bundler.
@@ -284,6 +290,20 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
         }
     }
 
+    // Prepend Angular's build-time global flags to main.js so `isDevMode()`
+    // returns `false` at runtime. Done after minification so the minifier
+    // can't accidentally drop or rewrite the assignments; done before
+    // content-hashing so the hash reflects the final served bytes.
+    if input.options.inject_dev_mode_globals {
+        if let Some(main_code) = output_chunks.get_mut("main.js") {
+            let prologue = dev_mode_globals_prologue();
+            *main_code = format!("{prologue}{main_code}");
+            if let Some(map) = chunk_source_maps.get_mut("main.js") {
+                *map = shift_source_map_lines(map, 1);
+            }
+        }
+    }
+
     // Content-hash filenames
     let main_filename = if input.options.content_hash {
         apply_content_hashes(&mut output_chunks, &mut chunk_source_maps)?
@@ -296,6 +316,48 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
         main_filename,
         chunk_source_maps,
     })
+}
+
+/// Synthetic single-line statement set to `false` for Angular's three
+/// well-known build-time flags. Prepended to `main.js` in production builds
+/// so `@angular/core`'s `isDevMode()` returns `false` at runtime, which in
+/// turn lets `provideServiceWorker(..., { enabled: !isDevMode() })` enable
+/// SW registration. This does not eliminate the dev-only branches from the
+/// bundle — that requires define-substitution + DCE (tracked separately).
+fn dev_mode_globals_prologue() -> String {
+    "globalThis.ngDevMode=false;globalThis.ngI18nClosureMode=false;globalThis.ngJitMode=false;\n"
+        .to_string()
+}
+
+/// Shift every token's `dst_line` down by `lines` so a source map stays
+/// aligned after a multi-line prologue is prepended to its chunk.
+fn shift_source_map_lines(map: &SourceMap, lines: u32) -> SourceMap {
+    let names: Vec<_> = map.get_names().cloned().collect();
+    let sources: Vec<_> = map.get_sources().cloned().collect();
+    let source_contents: Vec<Option<std::sync::Arc<str>>> =
+        map.get_source_contents().map(|opt| opt.cloned()).collect();
+    let tokens: Vec<oxc_sourcemap::Token> = map
+        .get_tokens()
+        .map(|t| {
+            oxc_sourcemap::Token::new(
+                t.get_dst_line() + lines,
+                t.get_dst_col(),
+                t.get_src_line(),
+                t.get_src_col(),
+                t.get_source_id(),
+                t.get_name_id(),
+            )
+        })
+        .collect();
+    SourceMap::new(
+        None,
+        names,
+        None,
+        sources,
+        source_contents,
+        tokens.into_boxed_slice(),
+        None,
+    )
 }
 
 /// Build a mapping from raw import specifiers (as they appear in source) to chunk filenames.
@@ -1114,6 +1176,78 @@ mod tests {
             .chunks
             .get(&output.main_filename)
             .expect("main chunk should exist")
+    }
+
+    #[test]
+    fn test_dev_mode_globals_prologue_in_production() {
+        let mut graph = DiGraph::new();
+        let entry = graph.add_node(make_path("/root/src/main.ts"));
+        let _ = entry;
+
+        let mut modules = HashMap::new();
+        modules.insert(
+            make_path("/root/src/main.ts"),
+            "console.log('hi');\n".to_string(),
+        );
+
+        let input = BundleInput {
+            modules,
+            graph,
+            entry: make_path("/root/src/main.ts"),
+            local_prefixes: vec![".".to_string()],
+            root_dir: make_path("/root/src"),
+            options: BundleOptions {
+                inject_dev_mode_globals: true,
+                ..BundleOptions::default()
+            },
+            per_module_maps: HashMap::new(),
+            bundled_specifiers: HashSet::new(),
+            export_conditions: Vec::new(),
+        };
+
+        let output = bundle(&input).expect("should bundle");
+        let main = main_chunk(&output);
+        // The synthetic prologue must be the first thing the JS engine
+        // executes so subsequent `typeof ngDevMode` reads see `false`
+        // (boolean), not `undefined`.
+        assert!(
+            main.starts_with("globalThis.ngDevMode=false;"),
+            "main.js should start with the dev-mode globals prologue, got: {:?}",
+            &main[..main.len().min(120)]
+        );
+        assert!(main.contains("globalThis.ngI18nClosureMode=false;"));
+        assert!(main.contains("globalThis.ngJitMode=false;"));
+    }
+
+    #[test]
+    fn test_dev_mode_globals_not_injected_when_disabled() {
+        let mut graph = DiGraph::new();
+        let _ = graph.add_node(make_path("/root/src/main.ts"));
+
+        let mut modules = HashMap::new();
+        modules.insert(
+            make_path("/root/src/main.ts"),
+            "console.log('hi');\n".to_string(),
+        );
+
+        let input = BundleInput {
+            modules,
+            graph,
+            entry: make_path("/root/src/main.ts"),
+            local_prefixes: vec![".".to_string()],
+            root_dir: make_path("/root/src"),
+            options: BundleOptions::default(),
+            per_module_maps: HashMap::new(),
+            bundled_specifiers: HashSet::new(),
+            export_conditions: Vec::new(),
+        };
+
+        let output = bundle(&input).expect("should bundle");
+        let main = main_chunk(&output);
+        assert!(
+            !main.contains("globalThis.ngDevMode"),
+            "dev builds must not inject the prologue"
+        );
     }
 
     #[test]
