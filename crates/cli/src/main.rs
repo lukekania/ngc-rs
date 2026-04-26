@@ -13,6 +13,7 @@ use ngc_project_resolver::angular_json::{
 use ngc_template_compiler::{StyleContext, StyleLanguage};
 
 mod localize;
+mod ngsw;
 
 /// Result of the bundled build pipeline.
 #[derive(serde::Serialize)]
@@ -614,6 +615,22 @@ fn run_build(
         .join("\n");
     if let Some(lp) = generate_third_party_licenses(&all_bundle_code, &config_dir, &out_dir)? {
         output_files.push(lp);
+    }
+
+    // Step 12.5: Service worker manifest (`ngsw.json`) when the project opts
+    // in via `architect.build.options.serviceWorker`. Hashing runs *after*
+    // every other writer so it sees the final filenames + contents.
+    if let Some(ref ap) = angular_project {
+        if ap.service_worker {
+            if localize {
+                tracing::warn!(
+                    "serviceWorker is enabled but --localize was passed; skipping ngsw.json (per-locale manifests are not yet supported)"
+                );
+            } else {
+                let ngsw_paths = generate_service_worker(ap, &out_dir, &config_dir)?;
+                output_files.extend(ngsw_paths);
+            }
+        }
     }
 
     // Step 13: --localize → fan the source-locale build out to
@@ -1452,6 +1469,30 @@ fn compute_sri_hash(path: &Path) -> NgcResult<String> {
 
 /// Scan the bundle's external imports, find LICENSE files in node_modules,
 /// and concatenate them into 3rdpartylicenses.txt.
+/// Build the `ngsw.json` manifest and copy the worker scripts into
+/// `out_dir`. Reads `architect.build.options.ngswConfigPath` (default
+/// `ngsw-config.json`), hashes every emitted file, and writes the manifest
+/// alongside the bundle. Returns the list of files written so they can be
+/// reported in the build summary.
+fn generate_service_worker(
+    project: &ResolvedAngularProject,
+    out_dir: &Path,
+    project_root: &Path,
+) -> NgcResult<Vec<PathBuf>> {
+    let span = tracing::info_span!("ngsw").entered();
+    let config = ngsw::load_config(&project.ngsw_config_path)?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let mut paths = Vec::new();
+    paths.push(ngsw::generate_manifest(out_dir, &config, timestamp)?);
+    paths.extend(ngsw::copy_worker_scripts(out_dir, project_root)?);
+    drop(span);
+    Ok(paths)
+}
+
 fn generate_third_party_licenses(
     bundle_code: &str,
     project_root: &Path,
