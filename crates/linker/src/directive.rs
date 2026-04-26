@@ -148,6 +148,15 @@ pub fn build_define_call(
         features.push(call);
     }
 
+    // hostDirectives composition (Angular 15+). The partial form stores an
+    // array of `{ directive, inputs?, outputs? }` objects; the runtime needs
+    // those wrapped in a `ɵɵHostDirectivesFeature(...)` feature call so the
+    // composed directives are instantiated on the host element and their
+    // input/output remappings are wired up.
+    if let Some(host_directives) = build_host_directives_feature(obj, source, ng_import) {
+        features.push(host_directives);
+    }
+
     if !features.is_empty() {
         props.push(format!("features: [{}]", features.join(", ")));
     }
@@ -352,6 +361,27 @@ pub fn build_host_bindings(
     let host_bindings = host_codegen::build_host_bindings_function(&binding_stmts, &listener_stmts);
 
     (host_attrs, host_bindings, host_vars)
+}
+
+/// Build the `ɵɵHostDirectivesFeature(...)` call from a `hostDirectives` array
+/// in the partial declaration.
+///
+/// The runtime accepts either bare class references or
+/// `{ directive, inputs?, outputs? }` objects (with `inputs` / `outputs` as
+/// arrays of `'publicName: privateName'` strings). The partial form always
+/// emits the object form, so we pass the array source text through verbatim.
+pub(crate) fn build_host_directives_feature(
+    obj: &ObjectExpression<'_>,
+    source: &str,
+    ng_import: &str,
+) -> Option<String> {
+    let arr_text = metadata::get_source_text(obj, "hostDirectives", source)?;
+    let feature = if ng_import.is_empty() {
+        "\u{0275}\u{0275}HostDirectivesFeature".to_string()
+    } else {
+        format!("{ng_import}.\u{0275}\u{0275}HostDirectivesFeature")
+    };
+    Some(format!("{feature}({arr_text})"))
 }
 
 /// Extract the text of a property key.

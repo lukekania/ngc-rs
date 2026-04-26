@@ -86,6 +86,11 @@ pub fn transform(
         };
         features.push(call);
     }
+    if let Some(host_directives) =
+        crate::directive::build_host_directives_feature(obj, source, ng_import)
+    {
+        features.push(host_directives);
+    }
     if !features.is_empty() {
         props.push(format!("features: [{}]", features.join(", ")));
     }
