@@ -72,6 +72,14 @@ pub struct ExtractedComponent {
     /// `features` array. Accepts both bare class refs (e.g. `[Foo]`) and the
     /// object form (`[{directive: Foo, inputs: ['x'], outputs: [...]}]`).
     pub host_directives_source: Option<String>,
+    /// Class fields initialised with `input(...)` / `input.required(...)`.
+    pub signal_inputs: Vec<SignalInputSpec>,
+    /// Class fields initialised with `output(...)`.
+    pub signal_outputs: Vec<SignalOutputSpec>,
+    /// Class fields initialised with `model(...)` / `model.required(...)`.
+    pub signal_models: Vec<SignalModelSpec>,
+    /// Class fields initialised with `viewChild`/`viewChildren`/`contentChild`/`contentChildren`.
+    pub signal_queries: Vec<SignalQuerySpec>,
 }
 
 /// A method-level `@HostListener(event, [args])` extraction.
@@ -95,6 +103,106 @@ pub struct HostBindingSpec {
     /// The class field/getter that supplies the value. Compiled to `ctx.<name>`
     /// at codegen time.
     pub property_name: String,
+}
+
+/// A class field initialised with `input(...)` or `input.required(...)`.
+///
+/// Captures everything `ɵɵdefineDirective` / `ɵɵdefineComponent` need to
+/// emit a runtime `inputs` entry with the `SignalBased` flag set: the
+/// optional alias (becomes `publicName`), whether it's required, and the
+/// raw source of the `transform` reference so it survives codegen as a
+/// callable expression rather than a stringified value.
+#[derive(Debug, Clone)]
+pub struct SignalInputSpec {
+    /// The class field name (e.g. `name` for `name = input(...)`).
+    pub property_name: String,
+    /// `alias` from the options object, if any. Defaults to `property_name`.
+    pub alias: Option<String>,
+    /// Whether the call site was `input.required(...)` (vs. `input(...)`).
+    pub is_required: bool,
+    /// Raw source text of the `transform` reference, if present (e.g.
+    /// `trimString` or `(v) => v.trim()`). `None` means no transform.
+    pub transform_source: Option<String>,
+}
+
+/// A class field initialised with `output(...)`.
+///
+/// Outputs only need a public name — the runtime treats them as plain
+/// strings in the `outputs` map. An alias makes `publicName` differ from
+/// `property_name`.
+#[derive(Debug, Clone)]
+pub struct SignalOutputSpec {
+    /// The class field name.
+    pub property_name: String,
+    /// `alias` from the options object, if any.
+    pub alias: Option<String>,
+}
+
+/// A class field initialised with `model(...)` or `model.required(...)`.
+///
+/// `model<T>()` desugars to a paired signal input + `<name>Change` output,
+/// so every model produces one entry in each runtime map. The alias (if
+/// any) is the public name of the input; the output is always
+/// `<alias>Change`.
+#[derive(Debug, Clone)]
+pub struct SignalModelSpec {
+    pub property_name: String,
+    pub alias: Option<String>,
+    pub is_required: bool,
+}
+
+/// A class field initialised with one of the four signal-query factories
+/// (`viewChild`, `viewChildren`, `contentChild`, `contentChildren`).
+///
+/// `kind` carries both the create-call dispatch (view vs. content) and
+/// whether the query is single-shot (`first: true`) or multi (`false`).
+/// `predicate_source` is preserved verbatim — the predicate may be a
+/// class reference, an `InjectionToken`, or a string literal, all of which
+/// the runtime accepts unchanged.
+#[derive(Debug, Clone)]
+pub struct SignalQuerySpec {
+    pub property_name: String,
+    pub kind: SignalQueryKind,
+    /// Raw source text of the predicate argument
+    /// (e.g. `MyChildComponent`, `'ref'`, `MY_TOKEN`).
+    pub predicate_source: String,
+    /// Raw source text of `read:` from the options object, if any.
+    pub read_source: Option<String>,
+    /// `static: true` from the options object — defaults to `false`.
+    pub is_static: bool,
+}
+
+/// Which signal-query factory created the field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalQueryKind {
+    /// `viewChild()` — single, descendants, dynamic.
+    ViewChild,
+    /// `viewChildren()` — multi, descendants, dynamic.
+    ViewChildren,
+    /// `contentChild()` — single, defaults to non-descendants.
+    ContentChild,
+    /// `contentChildren()` — multi, defaults to non-descendants.
+    ContentChildren,
+}
+
+impl SignalQueryKind {
+    /// `true` for `viewChild` / `contentChild` (single) variants.
+    pub fn is_first(self) -> bool {
+        matches!(self, Self::ViewChild | Self::ContentChild)
+    }
+
+    /// `true` for `viewChild` / `viewChildren` (i.e. emitted into
+    /// `viewQuery`, not `contentQueries`).
+    pub fn is_view(self) -> bool {
+        matches!(self, Self::ViewChild | Self::ViewChildren)
+    }
+
+    /// Default `descendants` flag for the kind. View queries always walk
+    /// descendants; content queries default to direct-children only
+    /// unless the user passes `descendants: true` in options.
+    pub fn default_descendants(self) -> bool {
+        self.is_view()
+    }
 }
 
 impl ExtractedComponent {
@@ -217,6 +325,12 @@ pub fn extract_component(source: &str, file_path: &Path) -> NgcResult<Option<Ext
 
         let host_listeners = extract_host_listeners(&class.body);
         let host_bindings = extract_host_bindings(&class.body);
+        let SignalMembers {
+            inputs: signal_inputs,
+            outputs: signal_outputs,
+            models: signal_models,
+            queries: signal_queries,
+        } = extract_signal_members(source, &class.body);
 
         return Ok(Some(ExtractedComponent {
             class_name,
@@ -240,6 +354,10 @@ pub fn extract_component(source: &str, file_path: &Path) -> NgcResult<Option<Ext
             host_bindings,
             animations_source: metadata.animations_source,
             host_directives_source: metadata.host_directives_source,
+            signal_inputs,
+            signal_outputs,
+            signal_models,
+            signal_queries,
         }));
     }
 
@@ -340,6 +458,14 @@ pub struct ExtractedDirective {
     pub host_bindings: Vec<HostBindingSpec>,
     /// Raw source text of the `hostDirectives` array (Angular 15+ composition).
     pub host_directives_source: Option<String>,
+    /// Class fields initialised with `input(...)` / `input.required(...)`.
+    pub signal_inputs: Vec<SignalInputSpec>,
+    /// Class fields initialised with `output(...)`.
+    pub signal_outputs: Vec<SignalOutputSpec>,
+    /// Class fields initialised with `model(...)` / `model.required(...)`.
+    pub signal_models: Vec<SignalModelSpec>,
+    /// Class fields initialised with `viewChild`/`viewChildren`/`contentChild`/`contentChildren`.
+    pub signal_queries: Vec<SignalQuerySpec>,
     /// Common decorator fields for rewriting.
     pub common: DecoratorCommon,
 }
@@ -564,6 +690,12 @@ pub fn extract_directive(source: &str, file_path: &Path) -> NgcResult<Option<Ext
 
         let host_listeners = extract_host_listeners(&class.body);
         let host_bindings = extract_host_bindings(&class.body);
+        let SignalMembers {
+            inputs: signal_inputs,
+            outputs: signal_outputs,
+            models: signal_models,
+            queries: signal_queries,
+        } = extract_signal_members(source, &class.body);
 
         return Ok(Some(ExtractedDirective {
             class_name,
@@ -576,6 +708,10 @@ pub fn extract_directive(source: &str, file_path: &Path) -> NgcResult<Option<Ext
             host_listeners,
             host_bindings,
             host_directives_source,
+            signal_inputs,
+            signal_outputs,
+            signal_models,
+            signal_queries,
             common: DecoratorCommon {
                 decorator_span: (decorator.span.start, decorator.span.end),
                 class_body_start,
@@ -945,6 +1081,223 @@ fn decorator_call<'a>(
     } else {
         None
     }
+}
+
+/// Bag of signal-API field initialisations found on a class body.
+///
+/// Returned together because all four kinds (input, output, model, query)
+/// are detected in the same single pass over class fields.
+#[derive(Debug, Default)]
+pub(crate) struct SignalMembers {
+    pub inputs: Vec<SignalInputSpec>,
+    pub outputs: Vec<SignalOutputSpec>,
+    pub models: Vec<SignalModelSpec>,
+    pub queries: Vec<SignalQuerySpec>,
+}
+
+/// Walk a class body and pull out every signal-API field initialiser:
+///   `foo = input(...)` / `input.required(...)`
+///   `foo = output(...)`
+///   `foo = model(...)` / `model.required(...)`
+///   `foo = viewChild|viewChildren|contentChild|contentChildren(...)`
+///
+/// The detection is purely call-shape based: callee identifier (or
+/// `<root>.required` member call) plus the field's right-hand side. We
+/// don't try to resolve imports or types — anything named `input` that's
+/// not the Angular factory will produce a benign signal-input emission
+/// at codegen time, but TypeScript already prevents that case at the
+/// authoring level.
+pub(crate) fn extract_signal_members(
+    source: &str,
+    class_body: &oxc_ast::ast::ClassBody<'_>,
+) -> SignalMembers {
+    let mut out = SignalMembers::default();
+
+    for element in &class_body.body {
+        let ClassElement::PropertyDefinition(prop) = element else {
+            continue;
+        };
+        let property_name = match &prop.key {
+            PropertyKey::StaticIdentifier(id) => id.name.to_string(),
+            PropertyKey::StringLiteral(s) => s.value.to_string(),
+            _ => continue,
+        };
+        let Some(init) = &prop.value else { continue };
+        let Expression::CallExpression(call) = init else {
+            continue;
+        };
+        let Some(factory) = classify_signal_callee(&call.callee) else {
+            continue;
+        };
+
+        match factory {
+            SignalFactory::Input { required } => {
+                let opts_idx = if required { 0 } else { 1 };
+                let (alias, transform_source, _read, _is_static) =
+                    parse_signal_options(source, call, opts_idx);
+                out.inputs.push(SignalInputSpec {
+                    property_name,
+                    alias,
+                    is_required: required,
+                    transform_source,
+                });
+            }
+            SignalFactory::Output => {
+                // `output()` / `output<T>()` only accepts an optional
+                // options object as its first arg (no positional default).
+                let (alias, _, _, _) = parse_signal_options(source, call, 0);
+                out.outputs.push(SignalOutputSpec {
+                    property_name,
+                    alias,
+                });
+            }
+            SignalFactory::Model { required } => {
+                let opts_idx = if required { 0 } else { 1 };
+                let (alias, _, _, _) = parse_signal_options(source, call, opts_idx);
+                out.models.push(SignalModelSpec {
+                    property_name,
+                    alias,
+                    is_required: required,
+                });
+            }
+            SignalFactory::Query { kind, .. } => {
+                let predicate_source = call
+                    .arguments
+                    .first()
+                    .map(|arg| {
+                        let span = arg.span();
+                        source[span.start as usize..span.end as usize].to_string()
+                    })
+                    .unwrap_or_else(|| "null".to_string());
+                let (_, _, read_source, is_static) = parse_signal_options(source, call, 1);
+                out.queries.push(SignalQuerySpec {
+                    property_name,
+                    kind,
+                    predicate_source,
+                    read_source,
+                    is_static,
+                });
+            }
+        }
+    }
+
+    out
+}
+
+/// What a signal-factory callee resolved to. `required` carries through
+/// for input/model so the codegen can emit a different shape later.
+enum SignalFactory {
+    Input { required: bool },
+    Output,
+    Model { required: bool },
+    Query { kind: SignalQueryKind },
+}
+
+/// Classify a class-field call's callee against the known signal-API
+/// factory names. Recognises bare identifiers (`input(...)`) and the
+/// `.required` member form (`input.required(...)` etc.).
+fn classify_signal_callee(callee: &Expression<'_>) -> Option<SignalFactory> {
+    match callee {
+        Expression::Identifier(id) => name_to_factory(id.name.as_str(), false),
+        Expression::StaticMemberExpression(member) => {
+            let Expression::Identifier(root) = &member.object else {
+                return None;
+            };
+            if member.property.name.as_str() != "required" {
+                return None;
+            }
+            name_to_factory(root.name.as_str(), true)
+        }
+        _ => None,
+    }
+}
+
+/// Map a factory identifier to its [`SignalFactory`] variant. `dotted` is
+/// `true` for the `.required` form — only valid on `input`, `model`,
+/// `viewChild`, `contentChild` (the plural-query variants don't have a
+/// `.required` API).
+fn name_to_factory(name: &str, dotted: bool) -> Option<SignalFactory> {
+    match (name, dotted) {
+        ("input", false) => Some(SignalFactory::Input { required: false }),
+        ("input", true) => Some(SignalFactory::Input { required: true }),
+        ("output", false) => Some(SignalFactory::Output),
+        ("model", false) => Some(SignalFactory::Model { required: false }),
+        ("model", true) => Some(SignalFactory::Model { required: true }),
+        ("viewChild", false) => Some(SignalFactory::Query {
+            kind: SignalQueryKind::ViewChild,
+        }),
+        ("viewChild", true) => Some(SignalFactory::Query {
+            kind: SignalQueryKind::ViewChild,
+        }),
+        ("viewChildren", false) => Some(SignalFactory::Query {
+            kind: SignalQueryKind::ViewChildren,
+        }),
+        ("contentChild", false) => Some(SignalFactory::Query {
+            kind: SignalQueryKind::ContentChild,
+        }),
+        ("contentChild", true) => Some(SignalFactory::Query {
+            kind: SignalQueryKind::ContentChild,
+        }),
+        ("contentChildren", false) => Some(SignalFactory::Query {
+            kind: SignalQueryKind::ContentChildren,
+        }),
+        _ => None,
+    }
+}
+
+/// Pull `alias`, `transform`, `read`, `static` out of an options object
+/// argument at the given positional index, if it's an object literal.
+/// Returns (alias, transform_source, read_source, is_static).
+fn parse_signal_options(
+    source: &str,
+    call: &oxc_ast::ast::CallExpression<'_>,
+    idx: usize,
+) -> (Option<String>, Option<String>, Option<String>, bool) {
+    let Some(arg) = call.arguments.get(idx) else {
+        return (None, None, None, false);
+    };
+    let Argument::ObjectExpression(opts) = arg else {
+        return (None, None, None, false);
+    };
+
+    let mut alias = None;
+    let mut transform = None;
+    let mut read = None;
+    let mut is_static = false;
+
+    for prop in &opts.properties {
+        let ObjectPropertyKind::ObjectProperty(prop) = prop else {
+            continue;
+        };
+        let key = match &prop.key {
+            PropertyKey::StaticIdentifier(id) => id.name.as_str(),
+            PropertyKey::StringLiteral(s) => s.value.as_str(),
+            _ => continue,
+        };
+        match key {
+            "alias" => {
+                if let Expression::StringLiteral(s) = &prop.value {
+                    alias = Some(s.value.to_string());
+                }
+            }
+            "transform" => {
+                let span = prop.value.span();
+                transform = Some(source[span.start as usize..span.end as usize].to_string());
+            }
+            "read" => {
+                let span = prop.value.span();
+                read = Some(source[span.start as usize..span.end as usize].to_string());
+            }
+            "static" => {
+                if let Expression::BooleanLiteral(b) = &prop.value {
+                    is_static = b.value;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    (alias, transform, read, is_static)
 }
 
 /// Extract constructor parameters from a class body for DI-aware factory generation.
@@ -1638,5 +1991,202 @@ export class XComponent {
         assert_eq!(result.host_bindings.len(), 1);
         assert_eq!(result.host_listeners[0].event, "window:resize");
         assert_eq!(result.host_bindings[0].target, "class.dark");
+    }
+
+    /// `name = input(...)` should land in `signal_inputs` with no alias
+    /// and `is_required = false`. We're verifying the call-shape match
+    /// (bare identifier `input`) more than the option parsing here —
+    /// the option-parsing path is exercised separately.
+    #[test]
+    fn test_extract_signal_input_basic() {
+        let source = r#"import { Component, input } from '@angular/core';
+
+@Component({ selector: 'app-x', standalone: true, template: '' })
+export class XComponent {
+  name = input('default');
+}
+"#;
+        let result = extract_component(source, &test_path())
+            .expect("extract")
+            .expect("found");
+        assert_eq!(result.signal_inputs.len(), 1);
+        assert_eq!(result.signal_inputs[0].property_name, "name");
+        assert!(result.signal_inputs[0].alias.is_none());
+        assert!(!result.signal_inputs[0].is_required);
+    }
+
+    /// `input.required()` flows through the member-call branch of
+    /// `classify_signal_callee` and must mark the spec as required so
+    /// the codegen can drop the default-value plumbing.
+    #[test]
+    fn test_extract_signal_input_required() {
+        let source = r#"import { Component, input } from '@angular/core';
+
+@Component({ selector: 'app-x', standalone: true, template: '' })
+export class XComponent {
+  name = input.required<string>();
+}
+"#;
+        let result = extract_component(source, &test_path())
+            .expect("extract")
+            .expect("found");
+        assert_eq!(result.signal_inputs.len(), 1);
+        assert!(result.signal_inputs[0].is_required);
+    }
+
+    /// `input(0, { alias: 'pub', transform: trimString })` must surface
+    /// both the alias (string literal) AND the transform reference
+    /// (preserved verbatim as raw source so the codegen emits a
+    /// callable expression, not a stringified value).
+    #[test]
+    fn test_extract_signal_input_with_alias_and_transform() {
+        let source = r#"import { Component, input } from '@angular/core';
+
+@Component({ selector: 'app-x', standalone: true, template: '' })
+export class XComponent {
+  name = input('def', { alias: 'pub', transform: trimString });
+}
+"#;
+        let result = extract_component(source, &test_path())
+            .expect("extract")
+            .expect("found");
+        assert_eq!(result.signal_inputs.len(), 1);
+        assert_eq!(result.signal_inputs[0].alias.as_deref(), Some("pub"));
+        assert_eq!(
+            result.signal_inputs[0].transform_source.as_deref(),
+            Some("trimString")
+        );
+    }
+
+    /// `output<T>()` lands in `signal_outputs`. No options — bare call.
+    #[test]
+    fn test_extract_signal_output() {
+        let source = r#"import { Component, output } from '@angular/core';
+
+@Component({ selector: 'app-x', standalone: true, template: '' })
+export class XComponent {
+  changed = output<string>();
+}
+"#;
+        let result = extract_component(source, &test_path())
+            .expect("extract")
+            .expect("found");
+        assert_eq!(result.signal_outputs.len(), 1);
+        assert_eq!(result.signal_outputs[0].property_name, "changed");
+        assert!(result.signal_outputs[0].alias.is_none());
+    }
+
+    /// `model<T>()` is a separate member kind — must NOT be conflated
+    /// with `input()` / `output()`. The codegen needs to know it's a
+    /// model so it can emit the paired `<name>Change` output.
+    #[test]
+    fn test_extract_signal_model() {
+        let source = r#"import { Component, model } from '@angular/core';
+
+@Component({ selector: 'app-x', standalone: true, template: '' })
+export class XComponent {
+  value = model<string>('');
+  required = model.required<number>();
+}
+"#;
+        let result = extract_component(source, &test_path())
+            .expect("extract")
+            .expect("found");
+        assert_eq!(result.signal_models.len(), 2);
+        assert_eq!(result.signal_models[0].property_name, "value");
+        assert!(!result.signal_models[0].is_required);
+        assert_eq!(result.signal_models[1].property_name, "required");
+        assert!(result.signal_models[1].is_required);
+        // Models must not double-count as inputs or outputs in the
+        // extracted lists — codegen merges them into the maps itself.
+        assert!(result.signal_inputs.is_empty());
+        assert!(result.signal_outputs.is_empty());
+    }
+
+    /// Each of the four query factories must classify into the right
+    /// `SignalQueryKind` so the codegen splits them into the correct
+    /// `viewQuery` / `contentQueries` function. The `.required` member
+    /// form on `viewChild` / `contentChild` should map to the same
+    /// kind as the bare form (required-ness only changes the
+    /// runtime-level signal default).
+    #[test]
+    fn test_extract_signal_queries_all_kinds() {
+        let source = r#"import { Component, viewChild, viewChildren, contentChild, contentChildren } from '@angular/core';
+
+@Component({ selector: 'app-x', standalone: true, template: '' })
+export class XComponent {
+  v = viewChild<string>('ref');
+  vs = viewChildren(SomeCmp);
+  c = contentChild.required<SomeDir>(SomeDir);
+  cs = contentChildren(SomeDir, { descendants: true, read: ElementRef });
+}
+"#;
+        let result = extract_component(source, &test_path())
+            .expect("extract")
+            .expect("found");
+        assert_eq!(result.signal_queries.len(), 4);
+
+        let by_name = |n: &str| -> &SignalQuerySpec {
+            result
+                .signal_queries
+                .iter()
+                .find(|q| q.property_name == n)
+                .expect("kind present")
+        };
+        assert!(matches!(by_name("v").kind, SignalQueryKind::ViewChild));
+        assert!(matches!(by_name("vs").kind, SignalQueryKind::ViewChildren));
+        assert!(matches!(by_name("c").kind, SignalQueryKind::ContentChild));
+        assert!(matches!(
+            by_name("cs").kind,
+            SignalQueryKind::ContentChildren
+        ));
+        assert_eq!(by_name("v").predicate_source, "'ref'");
+        assert_eq!(by_name("cs").read_source.as_deref(), Some("ElementRef"));
+    }
+
+    /// `@Directive` should pick up the same signal-API fields that
+    /// `@Component` does — the extraction logic is shared. Confirms
+    /// the directive extractor calls `extract_signal_members` too.
+    #[test]
+    fn test_extract_directive_signal_inputs() {
+        let source = r#"import { Directive, input, output } from '@angular/core';
+
+@Directive({ selector: '[appX]', standalone: true })
+export class XDirective {
+  value = input<string>('');
+  changed = output<string>();
+}
+"#;
+        let result = extract_directive(source, &test_path())
+            .expect("extract")
+            .expect("found");
+        assert_eq!(result.signal_inputs.len(), 1);
+        assert_eq!(result.signal_inputs[0].property_name, "value");
+        assert_eq!(result.signal_outputs.len(), 1);
+        assert_eq!(result.signal_outputs[0].property_name, "changed");
+    }
+
+    /// A class field initialised by an unrelated function call like
+    /// `someUtil(...)` must NOT be picked up as a signal member.
+    /// Regression guard: the classifier should stop at the bare
+    /// `input` / `output` / `model` / `view*` / `content*` identifiers
+    /// and ignore everything else.
+    #[test]
+    fn test_extract_signal_ignores_unrelated_calls() {
+        let source = r#"import { Component } from '@angular/core';
+
+@Component({ selector: 'app-x', standalone: true, template: '' })
+export class XComponent {
+  data = computeSomething();
+  count = 0;
+}
+"#;
+        let result = extract_component(source, &test_path())
+            .expect("extract")
+            .expect("found");
+        assert!(result.signal_inputs.is_empty());
+        assert!(result.signal_outputs.is_empty());
+        assert!(result.signal_models.is_empty());
+        assert!(result.signal_queries.is_empty());
     }
 }

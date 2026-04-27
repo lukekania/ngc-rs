@@ -19,6 +19,7 @@ mod pipe_codegen;
 pub mod preprocessor;
 mod rewrite;
 mod selector;
+mod signal_codegen;
 
 pub use parser::parse_template;
 
@@ -126,6 +127,10 @@ pub fn generate_template_fn(
         host_bindings: Vec::new(),
         animations_source: None,
         host_directives_source: None,
+        signal_inputs: Vec::new(),
+        signal_outputs: Vec::new(),
+        signal_models: Vec::new(),
+        signal_queries: Vec::new(),
     };
 
     let ivy_output = codegen::generate_ivy(&extracted, &template_ast)?;

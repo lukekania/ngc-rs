@@ -168,14 +168,32 @@ pub fn generate_ivy(
     if component.standalone {
         dc.push_str("    standalone: true,\n");
     }
-    // Generate inputs property from @Input() decorated properties
-    if !component.input_properties.is_empty() {
-        let inputs: Vec<String> = component
-            .input_properties
-            .iter()
-            .map(|p| format!("{p}: '{p}'"))
-            .collect();
-        dc.push_str(&format!("    inputs: {{ {} }},\n", inputs.join(", ")));
+    // Merge `@Input()` decorator-style fields and signal-API class-field
+    // initialisations (`input()`, `output()`, `model()`, view/content
+    // queries) into a single `inputs` / `outputs` map plus optional
+    // `viewQuery` / `contentQueries` functions. Signal-based inputs
+    // ride along with the `SignalBased` runtime flag so the directive
+    // runtime knows to write into the WritableSignal rather than a
+    // plain field.
+    let signal_members = crate::signal_codegen::compile_signal_members(
+        &component.input_properties,
+        &component.signal_inputs,
+        &component.signal_outputs,
+        &component.signal_models,
+        &component.signal_queries,
+    );
+    for sym in &signal_members.ivy_imports {
+        gen.ivy_imports.insert(sym.clone());
+    }
+    if let Some(inputs) =
+        crate::signal_codegen::format_map("inputs", &signal_members.inputs_entries)
+    {
+        dc.push_str(&format!("    {inputs},\n"));
+    }
+    if let Some(outputs) =
+        crate::signal_codegen::format_map("outputs", &signal_members.outputs_entries)
+    {
+        dc.push_str(&format!("    {outputs},\n"));
     }
     let host_props = crate::directive_codegen::build_host_props(
         &component.host_listeners,
@@ -216,6 +234,21 @@ pub fn generate_ivy(
     ));
     dc.push_str(&template_body);
     dc.push_str("    }");
+
+    // Signal-based queries are emitted as their own `viewQuery` /
+    // `contentQueries` functions on the define call (signal queries
+    // and decorator-style queries can't share a function — the signal
+    // variant uses `ɵɵqueryAdvance`, the decorator variant uses
+    // `ɵɵqueryRefresh`/`ɵɵloadQuery`). When this component eventually
+    // supports decorator-style `@ViewChild` queries on the AOT path
+    // too, those will need to be merged in here as additional
+    // statements within the same function body.
+    if let Some(ref vq) = signal_members.view_query_prop {
+        dc.push_str(&format!(",\n    {vq}"));
+    }
+    if let Some(ref cq) = signal_members.content_queries_prop {
+        dc.push_str(&format!(",\n    {cq}"));
+    }
 
     // Component dependencies. Emit the imports array verbatim here; the linker's
     // post-pass (crates/linker/src/module_registry.rs) walks every
@@ -3630,6 +3663,10 @@ mod tests {
             host_bindings: Vec::new(),
             animations_source: None,
             host_directives_source: None,
+            signal_inputs: Vec::new(),
+            signal_outputs: Vec::new(),
+            signal_models: Vec::new(),
+            signal_queries: Vec::new(),
         }
     }
 
