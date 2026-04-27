@@ -202,17 +202,49 @@ fn build_inputs(obj: &ObjectExpression<'_>, source: &str) -> Option<String> {
                     }
                 }
                 Expression::ObjectExpression(input_obj) => {
-                    // Complex input: { alias: '...', required: true, transform: ... }
-                    let alias = metadata::get_string_prop(input_obj, "alias")
+                    // Complex input descriptor. Two shapes flow through here:
+                    //
+                    //   * Modern (Angular 17+ partial declarations):
+                    //     { classPropertyName, publicName, isSignal, isRequired,
+                    //       transformFunction }
+                    //   * Legacy/synthesized: { alias, required, transform }
+                    //
+                    // Honour both spellings so signal-based authoring APIs
+                    // (`input()`, `input.required()`, `model()`) round-trip
+                    // correctly: `isSignal` sets the `SignalBased` runtime
+                    // flag (bit 0) and a non-null `transformFunction` sets
+                    // `HasDecoratorInputTransform` (bit 1). The transform
+                    // expression itself rides along as the array's 4th
+                    // element so the runtime can call it on each value.
+                    let alias = metadata::get_string_prop(input_obj, "publicName")
+                        .or_else(|| metadata::get_string_prop(input_obj, "alias"))
                         .unwrap_or_else(|| key.clone());
-                    let required = metadata::get_bool_prop(input_obj, "required") == Some(true);
-                    let has_transform =
-                        metadata::get_source_text(input_obj, "isSignal", source).is_some();
+                    let is_required = metadata::get_bool_prop(input_obj, "isRequired")
+                        == Some(true)
+                        || metadata::get_bool_prop(input_obj, "required") == Some(true);
+                    let is_signal = metadata::get_bool_prop(input_obj, "isSignal") == Some(true);
 
-                    let flags = if required { 1 } else { 0 };
+                    let transform_text = ["transformFunction", "transform"]
+                        .iter()
+                        .find_map(|name| metadata::get_source_text(input_obj, name, source))
+                        .filter(|s| s.trim() != "null");
+                    let has_transform = transform_text.is_some();
 
-                    if has_transform || required || alias != key {
-                        entries.push(format!("{key}: [{flags}, '{alias}', '{key}']"));
+                    let mut flags: u32 = 0;
+                    if is_signal {
+                        flags |= 1; // InputFlags.SignalBased
+                    }
+                    if has_transform {
+                        flags |= 2; // InputFlags.HasDecoratorInputTransform
+                    }
+
+                    if has_transform || is_signal || is_required || alias != key {
+                        let entry = if let Some(t) = transform_text {
+                            format!("{key}: [{flags}, '{alias}', '{key}', {t}]")
+                        } else {
+                            format!("{key}: [{flags}, '{alias}', '{key}']")
+                        };
+                        entries.push(entry);
                     } else {
                         entries.push(format!("{key}: '{key}'"));
                     }
@@ -404,8 +436,13 @@ fn prop_key_text(key: &PropertyKey<'_>, source: &str) -> String {
 
 /// Build a `contentQueries` function from the declare-format `queries` array.
 ///
-/// Transforms: `[{ propertyName: "links", predicate: RouterLink, descendants: true }]`
-/// Into: `function(rf, ctx, directiveIndex) { if (rf & 1) { ɵɵcontentQuery(directiveIndex, RouterLink, 5); } if (rf & 2) { let _t; ɵɵqueryRefresh(_t = ɵɵloadQuery()) && (ctx.links = _t); } }`
+/// Traditional queries (`@ContentChild`/`@ContentChildren`) compile to a
+/// `ɵɵcontentQuery` create call paired with a `ɵɵqueryRefresh` + `ɵɵloadQuery`
+/// update. Signal-based queries (`contentChild()`, `contentChildren()`) carry
+/// `isSignal: true` in their descriptor and compile to a single
+/// `ɵɵcontentQuerySignal(directiveIndex, ctx.prop, ...)` create call plus a
+/// `ɵɵqueryAdvance()` in the update block — the runtime writes the value
+/// straight into the signal so no manual refresh/load is needed.
 pub(crate) fn build_content_queries(
     queries_source: &str,
     ng_import: &str,
@@ -416,61 +453,15 @@ pub(crate) fn build_content_queries(
     if queries.is_empty() {
         return None;
     }
-
-    let (cq, refresh, load) = if ng_import.is_empty() {
-        (
-            "\u{0275}\u{0275}contentQuery".to_string(),
-            "\u{0275}\u{0275}queryRefresh".to_string(),
-            "\u{0275}\u{0275}loadQuery".to_string(),
-        )
-    } else {
-        (
-            format!("{ng_import}.\u{0275}\u{0275}contentQuery"),
-            format!("{ng_import}.\u{0275}\u{0275}queryRefresh"),
-            format!("{ng_import}.\u{0275}\u{0275}loadQuery"),
-        )
-    };
-
-    let mut create_stmts = Vec::new();
-    let mut update_stmts = Vec::new();
-
-    for q in &queries {
-        let flags = compute_query_flags(q);
-        let read_arg = if let Some(ref read) = q.read {
-            format!(", {read}")
-        } else {
-            String::new()
-        };
-        create_stmts.push(format!(
-            "{cq}(directiveIndex, {}, {flags}{read_arg});",
-            q.predicate
-        ));
-        let assign_expr = if q.first {
-            format!("ctx.{} = _t.first", q.property_name)
-        } else {
-            format!("ctx.{} = _t", q.property_name)
-        };
-        update_stmts.push(format!(
-            "let _t; {refresh}(_t = {load}()) && ({assign_expr});"
-        ));
-    }
-
-    let mut body = String::from("if (rf & 1) { ");
-    for s in &create_stmts {
-        body.push_str(s);
-        body.push(' ');
-    }
-    body.push_str("} if (rf & 2) { ");
-    for s in &update_stmts {
-        body.push_str(s);
-        body.push(' ');
-    }
-    body.push('}');
-
+    let body = build_query_body(&queries, ng_import, true);
     Some(format!("function(rf, ctx, directiveIndex) {{ {body} }}"))
 }
 
 /// Build a `viewQuery` function from the declare-format `viewQueries` array.
+///
+/// See [`build_content_queries`] for the signal-vs-traditional split — this
+/// is the view-query variant: signals dispatch to `ɵɵviewQuerySignal` and
+/// the function takes only `(rf, ctx)` (no `directiveIndex`).
 pub(crate) fn build_view_queries(
     queries_source: &str,
     ng_import: &str,
@@ -481,40 +472,90 @@ pub(crate) fn build_view_queries(
     if queries.is_empty() {
         return None;
     }
+    let body = build_query_body(&queries, ng_import, false);
+    Some(format!("function(rf, ctx) {{ {body} }}"))
+}
 
-    let (vq, refresh, load) = if ng_import.is_empty() {
-        (
-            "\u{0275}\u{0275}viewQuery".to_string(),
-            "\u{0275}\u{0275}queryRefresh".to_string(),
-            "\u{0275}\u{0275}loadQuery".to_string(),
-        )
-    } else {
-        (
-            format!("{ng_import}.\u{0275}\u{0275}viewQuery"),
-            format!("{ng_import}.\u{0275}\u{0275}queryRefresh"),
-            format!("{ng_import}.\u{0275}\u{0275}loadQuery"),
-        )
+/// Generate the `if (rf & 1) { ... } if (rf & 2) { ... }` body shared by
+/// content and view query functions. `is_content` toggles between the
+/// content (`directiveIndex` parameter, `ɵɵcontentQuery*` instructions) and
+/// view (`ɵɵviewQuery*`) variants.
+fn build_query_body(queries: &[QueryDescriptor], ng_import: &str, is_content: bool) -> String {
+    let prefix = |sym: &str| -> String {
+        if ng_import.is_empty() {
+            format!("\u{0275}\u{0275}{sym}")
+        } else {
+            format!("{ng_import}.\u{0275}\u{0275}{sym}")
+        }
     };
+    let q_traditional = prefix(if is_content {
+        "contentQuery"
+    } else {
+        "viewQuery"
+    });
+    let q_signal = prefix(if is_content {
+        "contentQuerySignal"
+    } else {
+        "viewQuerySignal"
+    });
+    let refresh = prefix("queryRefresh");
+    let load = prefix("loadQuery");
+    let advance = prefix("queryAdvance");
 
     let mut create_stmts = Vec::new();
     let mut update_stmts = Vec::new();
 
-    for q in &queries {
+    for q in queries {
         let flags = compute_query_flags(q);
         let read_arg = if let Some(ref read) = q.read {
             format!(", {read}")
         } else {
             String::new()
         };
-        create_stmts.push(format!("{vq}({}, {flags}{read_arg});", q.predicate));
-        let assign_expr = if q.first {
-            format!("ctx.{} = _t.first", q.property_name)
+
+        if q.is_signal {
+            // Signal-based query: the runtime writes the resolved value(s)
+            // straight into the WritableSignal stored on `ctx.<prop>`. No
+            // intermediate QueryList — the create call hands the runtime
+            // the signal target, and a single `ɵɵqueryAdvance()` per query
+            // bumps the query index in the update block so that successive
+            // queries map to the right LView slots.
+            let target = format!("ctx.{}", q.property_name);
+            if is_content {
+                create_stmts.push(format!(
+                    "{q_signal}(directiveIndex, {target}, {}, {flags}{read_arg});",
+                    q.predicate
+                ));
+            } else {
+                create_stmts.push(format!(
+                    "{q_signal}({target}, {}, {flags}{read_arg});",
+                    q.predicate
+                ));
+            }
+            update_stmts.push(format!("{advance}();"));
         } else {
-            format!("ctx.{} = _t", q.property_name)
-        };
-        update_stmts.push(format!(
-            "let _t; {refresh}(_t = {load}()) && ({assign_expr});"
-        ));
+            // Decorator-style query: the runtime stores the QueryList in
+            // an LView slot and we manually refresh + write to the field.
+            if is_content {
+                create_stmts.push(format!(
+                    "{q_traditional}(directiveIndex, {}, {flags}{read_arg});",
+                    q.predicate
+                ));
+            } else {
+                create_stmts.push(format!(
+                    "{q_traditional}({}, {flags}{read_arg});",
+                    q.predicate
+                ));
+            }
+            let assign_expr = if q.first {
+                format!("ctx.{} = _t.first", q.property_name)
+            } else {
+                format!("ctx.{} = _t", q.property_name)
+            };
+            update_stmts.push(format!(
+                "let _t; {refresh}(_t = {load}()) && ({assign_expr});"
+            ));
+        }
     }
 
     let mut body = String::from("if (rf & 1) { ");
@@ -528,8 +569,7 @@ pub(crate) fn build_view_queries(
         body.push(' ');
     }
     body.push('}');
-
-    Some(format!("function(rf, ctx) {{ {body} }}"))
+    body
 }
 
 /// A parsed query descriptor.
@@ -540,6 +580,10 @@ struct QueryDescriptor {
     is_static: bool,
     read: Option<String>,
     first: bool,
+    /// Set when the partial declaration marks this query as signal-based
+    /// (e.g. `viewChild()`/`contentChild()`). Drives the dispatch to
+    /// `ɵɵviewQuerySignal`/`ɵɵcontentQuerySignal` + `ɵɵqueryAdvance`.
+    is_signal: bool,
 }
 
 /// Compute the flags integer for a query.
@@ -594,6 +638,7 @@ fn parse_query_descriptors(
             let is_static = metadata::get_bool_prop(desc_obj, "static").unwrap_or(false);
             let first = metadata::get_bool_prop(desc_obj, "first").unwrap_or(false);
             let read = metadata::get_source_text(desc_obj, "read", source).map(|s| s.to_string());
+            let is_signal = metadata::get_bool_prop(desc_obj, "isSignal").unwrap_or(false);
 
             descriptors.push(QueryDescriptor {
                 property_name,
@@ -602,6 +647,7 @@ fn parse_query_descriptors(
                 is_static,
                 read,
                 first,
+                is_signal,
             });
         }
     }
@@ -683,6 +729,191 @@ mod tests {
         );
         assert!(result.contains("inputs:"));
         assert!(result.contains("outputs:"));
+    }
+
+    /// `input()` (signal-based) lands in the partial declaration as an
+    /// object descriptor with `isSignal: true`. The linker has to flip
+    /// bit 0 of the input flags so the runtime treats it as a signal —
+    /// otherwise the directive's value-setter writes to a plain field
+    /// and the signal's subscribers never fire.
+    #[test]
+    fn test_signal_input_sets_signal_flag() {
+        let result = parse_and_transform(
+            "{ type: MyDir, selector: '[myDir]', inputs: { value: { classPropertyName: 'value', publicName: 'value', isSignal: true, isRequired: false, transformFunction: null } } }",
+        );
+        assert!(
+            result.contains("inputs: { value: [1, 'value', 'value'] }"),
+            "expected SignalBased flag (1) in input array, got: {result}"
+        );
+    }
+
+    /// `input.required()` carries both `isSignal: true` and
+    /// `isRequired: true`. Required has no separate runtime flag — only
+    /// SignalBased should be set.
+    #[test]
+    fn test_signal_input_required_sets_signal_flag_only() {
+        let result = parse_and_transform(
+            "{ type: MyDir, selector: '[myDir]', inputs: { value: { classPropertyName: 'value', publicName: 'value', isSignal: true, isRequired: true, transformFunction: null } } }",
+        );
+        assert!(
+            result.contains("inputs: { value: [1, 'value', 'value'] }"),
+            "expected SignalBased flag only for required signal input, got: {result}"
+        );
+    }
+
+    /// `input()` with an alias (`{ alias: 'aliased' }` at the call site)
+    /// surfaces as `publicName !== classPropertyName`. The linker must
+    /// preserve the alias in array position 1 alongside the signal flag.
+    #[test]
+    fn test_signal_input_with_alias() {
+        let result = parse_and_transform(
+            "{ type: MyDir, selector: '[myDir]', inputs: { value: { classPropertyName: 'value', publicName: 'aliasedName', isSignal: true, isRequired: false, transformFunction: null } } }",
+        );
+        assert!(
+            result.contains("inputs: { value: [1, 'aliasedName', 'value'] }"),
+            "expected aliased signal input to keep the public name, got: {result}"
+        );
+    }
+
+    /// `input(0, { transform: trimString })` ships the transform
+    /// expression in the partial declaration. It must survive into the
+    /// runtime call as the 4th array element AND set the
+    /// `HasDecoratorInputTransform` flag (bit 1), which is what tells
+    /// the runtime to invoke the function on every value write.
+    #[test]
+    fn test_signal_input_with_transform() {
+        let result = parse_and_transform(
+            "{ type: MyDir, selector: '[myDir]', inputs: { value: { classPropertyName: 'value', publicName: 'value', isSignal: true, isRequired: false, transformFunction: trimString } } }",
+        );
+        assert!(
+            result.contains("inputs: { value: [3, 'value', 'value', trimString] }"),
+            "expected SignalBased|HasDecoratorInputTransform with transform ref, got: {result}"
+        );
+    }
+
+    /// Decorator-style `@Input({ transform: trimString })` carries the
+    /// transform without `isSignal`. Only the transform flag should be
+    /// set.
+    #[test]
+    fn test_decorator_input_with_transform_no_signal() {
+        let result = parse_and_transform(
+            "{ type: MyDir, selector: '[myDir]', inputs: { value: { classPropertyName: 'value', publicName: 'value', isSignal: false, isRequired: false, transformFunction: trimString } } }",
+        );
+        assert!(
+            result.contains("inputs: { value: [2, 'value', 'value', trimString] }"),
+            "expected HasDecoratorInputTransform-only for decorator transform, got: {result}"
+        );
+    }
+
+    /// `transformFunction: null` must NOT make it into the runtime
+    /// array — that would shift the array positions and cause the
+    /// runtime to call `null` as a function on every binding tick.
+    #[test]
+    fn test_null_transform_function_omitted() {
+        let result = parse_and_transform(
+            "{ type: MyDir, selector: '[myDir]', inputs: { value: { classPropertyName: 'value', publicName: 'value', isSignal: true, isRequired: false, transformFunction: null } } }",
+        );
+        assert!(
+            !result.contains(", null"),
+            "literal `null` transform must not be emitted as 4th element, got: {result}"
+        );
+    }
+
+    /// `viewChild()` lands in `viewQueries` with `isSignal: true`. The
+    /// runtime variant `ɵɵviewQuerySignal` takes the signal's storage
+    /// slot directly (`ctx.<prop>`) so it can write resolved values into
+    /// the signal — no `ɵɵqueryRefresh` plumbing is needed. The update
+    /// block emits a single `ɵɵqueryAdvance()` to keep the query index
+    /// in sync.
+    #[test]
+    fn test_signal_view_query_emits_view_query_signal() {
+        let result = parse_and_transform(
+            "{ type: MyDir, selector: '[myDir]', viewQueries: [{ propertyName: 'child', predicate: ChildCmp, descendants: true, first: true, isSignal: true, static: false }] }",
+        );
+        assert!(
+            result.contains("i0.\u{0275}\u{0275}viewQuerySignal(ctx.child, ChildCmp, 1)"),
+            "expected ɵɵviewQuerySignal create call, got: {result}"
+        );
+        assert!(
+            result.contains("i0.\u{0275}\u{0275}queryAdvance();"),
+            "expected ɵɵqueryAdvance update call, got: {result}"
+        );
+        // Traditional refresh/load must NOT show up for a pure-signal query.
+        assert!(
+            !result.contains("queryRefresh"),
+            "signal queries should not use ɵɵqueryRefresh, got: {result}"
+        );
+    }
+
+    /// `viewChildren()` (plural) carries `first: false` and produces a
+    /// signal whose value is a readonly array. The runtime call shape
+    /// is the same `ɵɵviewQuerySignal` — `first` only changes what the
+    /// runtime writes into the signal, not the create-call form.
+    #[test]
+    fn test_signal_view_query_plural() {
+        let result = parse_and_transform(
+            "{ type: MyDir, selector: '[myDir]', viewQueries: [{ propertyName: 'children', predicate: ChildCmp, descendants: true, first: false, isSignal: true, static: false }] }",
+        );
+        assert!(
+            result.contains("i0.\u{0275}\u{0275}viewQuerySignal(ctx.children, ChildCmp, 5)"),
+            "expected ɵɵviewQuerySignal with descendants|emitDistinctChangesOnly flags (1|4=5), got: {result}"
+        );
+    }
+
+    /// `contentChild()` lands in `queries` with `isSignal: true` and
+    /// must dispatch to `ɵɵcontentQuerySignal` with the directive index
+    /// as the leading argument.
+    #[test]
+    fn test_signal_content_query_emits_content_query_signal() {
+        let result = parse_and_transform(
+            "{ type: MyDir, selector: '[myDir]', queries: [{ propertyName: 'projected', predicate: SomeDir, descendants: true, first: true, isSignal: true, static: false }] }",
+        );
+        assert!(
+            result.contains(
+                "i0.\u{0275}\u{0275}contentQuerySignal(directiveIndex, ctx.projected, SomeDir, 1)"
+            ),
+            "expected ɵɵcontentQuerySignal create call with directiveIndex, got: {result}"
+        );
+        assert!(
+            result.contains("i0.\u{0275}\u{0275}queryAdvance();"),
+            "expected ɵɵqueryAdvance update call, got: {result}"
+        );
+    }
+
+    /// `viewChild('ref', { read: ElementRef })` propagates the read
+    /// token as the trailing argument so the runtime resolves the
+    /// `ElementRef` rather than the matched directive instance.
+    #[test]
+    fn test_signal_view_query_with_read() {
+        let result = parse_and_transform(
+            "{ type: MyDir, selector: '[myDir]', viewQueries: [{ propertyName: 'el', predicate: ['ref'], descendants: true, first: true, isSignal: true, static: false, read: ElementRef }] }",
+        );
+        assert!(
+            result.contains("i0.\u{0275}\u{0275}viewQuerySignal(ctx.el, ['ref'], 1, ElementRef)"),
+            "expected read token preserved as 4th arg, got: {result}"
+        );
+    }
+
+    /// Traditional non-signal queries must continue to compile to the
+    /// `ɵɵviewQuery` + `ɵɵqueryRefresh`/`ɵɵloadQuery` shape — adding
+    /// signal support cannot regress decorator-style `@ViewChild`.
+    #[test]
+    fn test_non_signal_view_query_still_uses_refresh_load() {
+        let result = parse_and_transform(
+            "{ type: MyDir, selector: '[myDir]', viewQueries: [{ propertyName: 'child', predicate: ChildCmp, descendants: true, first: true, static: false }] }",
+        );
+        assert!(
+            result.contains("i0.\u{0275}\u{0275}viewQuery(ChildCmp, 1)"),
+            "expected ɵɵviewQuery (decorator-style), got: {result}"
+        );
+        assert!(
+            result.contains("i0.\u{0275}\u{0275}queryRefresh"),
+            "expected ɵɵqueryRefresh in update block, got: {result}"
+        );
+        assert!(
+            !result.contains("viewQuerySignal"),
+            "decorator-style query must not dispatch to signal variant: {result}"
+        );
     }
 
     #[test]
