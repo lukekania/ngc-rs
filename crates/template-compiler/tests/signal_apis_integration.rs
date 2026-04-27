@@ -44,7 +44,7 @@ function trimString(v: string): string {
 @Component({
   selector: 'app-x',
   standalone: true,
-  template: '<span>x</span>',
+  template: '<span>x</span><ng-content />',
 })
 export class XComponent {
   // Signal inputs — plain, required, aliased, transformed.
@@ -179,12 +179,28 @@ fn signal_apis_reach_runtime_with_correct_shape() {
         "expected ElementRef read token preserved:\n{out}"
     );
 
+    // The signals fixture uses `<ng-content />` (via the contentChild
+    // demo). That requires `ɵɵprojectionDef()` at the head of the
+    // create block AND `ngContentSelectors: ['*']` on the def —
+    // without both, the runtime throws
+    // `Cannot read properties of null (reading '0')` from
+    // `ɵɵprojection` because `tNode.projection` is never populated.
+    assert!(
+        out.contains("\u{0275}\u{0275}projectionDef();"),
+        "expected ɵɵprojectionDef() call at head of create block, got:\n{out}"
+    );
+    assert!(
+        out.contains("ngContentSelectors: [\"*\"]"),
+        "expected ngContentSelectors on the component def, got:\n{out}"
+    );
+
     // Symbols must be added to the @angular/core import set so the
     // bundler can resolve them and the runtime calls dispatch.
     for symbol in [
         "\u{0275}\u{0275}viewQuerySignal",
         "\u{0275}\u{0275}contentQuerySignal",
         "\u{0275}\u{0275}queryAdvance",
+        "\u{0275}\u{0275}projectionDef",
     ] {
         assert!(
             out.contains(symbol),

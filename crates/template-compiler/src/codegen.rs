@@ -81,6 +81,19 @@ struct IvyCodegen {
     /// Entering `<svg>` pushes Svg; `<math>` pushes MathMl; `<foreignObject>`
     /// (which is itself SVG) pushes Html so its HTML descendants render correctly.
     namespace_stack: Vec<Namespace>,
+    /// `true` once a `<ng-content>` is encountered. Triggers two
+    /// out-of-band emissions on the host component:
+    ///   1. `ɵɵprojectionDef()` at the head of the create block — the
+    ///      runtime walks projected nodes through `tNode.projection`
+    ///      which `ɵɵprojection(idx)` later reads. Without the def
+    ///      call that field stays null and `ɵɵprojection` blows up
+    ///      with `Cannot read properties of null (reading '0')`.
+    ///   2. `ngContentSelectors: ['*']` on the `defineComponent` call
+    ///      so Angular's runtime knows what selectors the host
+    ///      projects. Default-projection components only need `['*']`;
+    ///      multi-slot projection (`<ng-content select="...">`) is
+    ///      not yet implemented.
+    has_projection: bool,
 }
 
 struct ChildTemplate {
@@ -114,6 +127,7 @@ pub fn generate_ivy(
         template_refs: BTreeMap::new(),
         namespace_state: Namespace::Html,
         namespace_stack: vec![Namespace::Html],
+        has_projection: false,
     };
 
     gen.ivy_imports
@@ -131,6 +145,17 @@ pub fn generate_ivy(
     let mut template_body = String::new();
     if !gen.creation.is_empty() {
         template_body.push_str("    if (rf & 1) {\n");
+        // When the template uses `<ng-content>`, the runtime needs
+        // `ɵɵprojectionDef()` to run once at the head of the create
+        // block so it can stash the projected children's TNodes onto
+        // the host's TNode. Subsequent `ɵɵprojection(idx)` calls then
+        // read `tNode.projection[idx]` — without the def call that's
+        // null and the runtime throws on the first projection.
+        if gen.has_projection {
+            gen.ivy_imports
+                .insert("\u{0275}\u{0275}projectionDef".to_string());
+            template_body.push_str("      \u{0275}\u{0275}projectionDef();\n");
+        }
         for instr in &gen.creation {
             template_body.push_str("      ");
             template_body.push_str(instr);
@@ -222,6 +247,15 @@ pub fn generate_ivy(
         dc.push_str(&format!(
             "    features: [\u{0275}\u{0275}HostDirectivesFeature({normalised})],\n"
         ));
+    }
+    // Components that project content need `ngContentSelectors` on the
+    // def so Angular's runtime can match `<ng-content select="...">`
+    // against the host's projected children. We only emit `<ng-content>`
+    // (no select-attribute support yet), so a single-entry `['*']`
+    // (catch-all) selector list is sufficient. The matching
+    // `ɵɵprojectionDef()` call lives at the head of the create block.
+    if gen.has_projection {
+        dc.push_str("    ngContentSelectors: [\"*\"],\n");
     }
     if !gen.consts.is_empty() {
         dc.push_str(&format!("    consts: [{}],\n", gen.consts.join(", ")));
@@ -439,8 +473,14 @@ impl IvyCodegen {
         // Special Angular elements
         match el.tag.as_str() {
             "ng-content" => {
+                // `ɵɵprojection(idx)` reads `tNode.projection` to find
+                // the projected children for slot `idx`. That field is
+                // populated by `ɵɵprojectionDef()`, which has to run
+                // *once* at the head of the host component's create
+                // block — see `has_projection` in the codegen state.
                 let slot = self.slot_index;
                 self.slot_index += 1;
+                self.has_projection = true;
                 self.ivy_imports
                     .insert("\u{0275}\u{0275}projection".to_string());
                 self.creation
