@@ -1653,10 +1653,17 @@ impl IvyCodegen {
         let parent_ns_state = self.namespace_state;
         self.namespace_state = Namespace::Html;
 
-        // Register the @for item variable as a local so ctx_expr_with_locals()
-        // does NOT prefix it with `ctx.`.  e.g. `p.id` stays `p.id`, not `ctx.p.id`.
+        // Register the @for item variable AND the implicit built-ins
+        // (`$index`, `$count`, `$first`, `$last`, `$even`, `$odd`) as locals
+        // so ctx_expr_with_locals() does NOT prefix them with `ctx.`. Each is
+        // declared at runtime from the embedded view's `_ctx` only when the
+        // body actually references it (matches ng build's emit and avoids
+        // bouncing through the parent component for purely local reads).
         let parent_locals = self.local_vars.clone();
         self.local_vars.insert(item_name.to_string());
+        for builtin in FOR_BUILTIN_LOCALS {
+            self.local_vars.insert((*builtin).to_string());
+        }
         // Track this @for's item variable and its depth for nested templates
         self.scope_stack.push(ScopeEntry::Repeater {
             item_name: item_name.to_string(),
@@ -1685,21 +1692,45 @@ impl IvyCodegen {
         }
         if !self.update.is_empty() || !parent_lets.is_empty() {
             code.push_str("  if (rf & 2) {\n");
-            // Extract item from _ctx and component context.
-            // Order matches ng build: item first, then nextContext.
-            code.push_str(&format!("    const {item_name} = _ctx.$implicit;\n"));
+            // Decide which embedded-view locals the body actually reads.
+            // Without this, every @for body unconditionally extracted the
+            // loop item and called ɵɵnextContext(N) — the latter shifted
+            // `ctx` to the parent component and broke `$index` / item
+            // resolution for purely local references (issue #91).
+            let body_text = self.update.join("\n");
+            let needs_item = identifier_used_in(&body_text, item_name);
+            let mut needed_builtins: Vec<&str> = Vec::new();
+            for builtin in FOR_BUILTIN_LOCALS {
+                if identifier_used_in(&body_text, builtin) {
+                    needed_builtins.push(*builtin);
+                }
+            }
+            let needs_parent_ctx = update_references_parent_ctx(&self.update);
+
+            if needs_item {
+                code.push_str(&format!("    const {item_name} = _ctx.$implicit;\n"));
+            }
+            for builtin in &needed_builtins {
+                code.push_str(&format!("    const {builtin} = _ctx.{builtin};\n"));
+            }
             // Template-reference reads must run BEFORE ɵɵnextContext —
             // ɵɵreference reads the current context LView.
             code.push_str(&self.build_ref_reads_prelude("    "));
-            let comp_depth = self.scope_stack.len() as u32;
-            self.ivy_imports
-                .insert("\u{0275}\u{0275}nextContext".to_string());
-            if comp_depth > 0 {
-                code.push_str(&format!(
-                    "    const ctx = \u{0275}\u{0275}nextContext({comp_depth});\n"
-                ));
-            } else {
-                code.push_str("    const ctx = \u{0275}\u{0275}nextContext();\n");
+            // Only walk to the parent component when something actually
+            // needs it (a parent-scope binding or a `@let` resolved via
+            // ɵɵreadContextLet, which itself takes the surrounding
+            // context as its base).
+            if needs_parent_ctx || !parent_lets.is_empty() {
+                let comp_depth = self.scope_stack.len() as u32;
+                self.ivy_imports
+                    .insert("\u{0275}\u{0275}nextContext".to_string());
+                if comp_depth > 1 {
+                    code.push_str(&format!(
+                        "    const ctx = \u{0275}\u{0275}nextContext({comp_depth});\n"
+                    ));
+                } else {
+                    code.push_str("    const ctx = \u{0275}\u{0275}nextContext();\n");
+                }
             }
             for (name, slot) in &parent_lets {
                 self.ivy_imports
@@ -2881,6 +2912,71 @@ fn ctx_expr_with_locals(expr: &str, locals: &BTreeSet<String>) -> String {
     }
 
     result
+}
+
+/// Built-in `@for` block locals exposed on the embedded view's context. Each
+/// is read via `_ctx.<name>` when the loop body references it. Order is fixed
+/// to keep the emitted prelude byte-stable across runs.
+const FOR_BUILTIN_LOCALS: &[&str] = &["$index", "$count", "$first", "$last", "$even", "$odd"];
+
+/// Check whether `needle` appears as a whole-word identifier in `haystack`.
+/// "Whole-word" treats ASCII alphanumerics, `_`, and `$` as identifier
+/// continuation — matching JavaScript's identifier rules for the names this
+/// function is used with (loop item aliases and `@for` built-ins). A match
+/// inside a string literal still counts as a hit; the haystack here is the
+/// already-compiled binding code, not arbitrary user prose.
+fn identifier_used_in(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let mut search_from = 0;
+    while let Some(rel) = haystack[search_from..].find(needle) {
+        let start = search_from + rel;
+        let end = start + needle.len();
+        let prev_ok = start == 0
+            || !haystack[..start]
+                .chars()
+                .next_back()
+                .is_some_and(is_js_ident_continue);
+        let next_ok = end == haystack.len()
+            || !haystack[end..]
+                .chars()
+                .next()
+                .is_some_and(is_js_ident_continue);
+        if prev_ok && next_ok {
+            return true;
+        }
+        search_from = start + 1;
+    }
+    false
+}
+
+fn is_js_ident_continue(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+/// Detect a reference to the parent component's `ctx` (rather than `_ctx`,
+/// `_outer_ctx`, etc.) anywhere in the joined update instructions. Used by
+/// `@for` body emission to decide whether to call `ɵɵnextContext`.
+fn update_references_parent_ctx(updates: &[String]) -> bool {
+    updates.iter().any(|s| has_bare_ctx_ref(s))
+}
+
+fn has_bare_ctx_ref(s: &str) -> bool {
+    let mut search_from = 0;
+    while let Some(rel) = s[search_from..].find("ctx.") {
+        let start = search_from + rel;
+        let prev_ok = start == 0
+            || !s[..start]
+                .chars()
+                .next_back()
+                .is_some_and(is_js_ident_continue);
+        if prev_ok {
+            return true;
+        }
+        search_from = start + 1;
+    }
+    false
 }
 
 /// Check if a string is a simple property path (e.g. `foo`, `foo.bar`, `$data`).
@@ -4620,5 +4716,251 @@ mod tests {
     fn test_scope_component_styles_host_selector() {
         let scoped = scope_component_styles("[`:host { display: block; }`]");
         assert_eq!(scoped, "[`[_nghost-%COMP%]{ display: block; }`]");
+    }
+
+    /// Helper: did the emitted source contain `ctx.<member>` without an
+    /// `_ctx.<member>` (or other identifier-prefixed) match swallowing it?
+    /// Used by the `@for`-body tests below to assert nothing resolves
+    /// against the parent component when it shouldn't.
+    fn contains_bare_ctx_member(body: &str, member: &str) -> bool {
+        let needle = format!("ctx.{member}");
+        let mut search_from = 0;
+        while let Some(rel) = body[search_from..].find(&needle) {
+            let start = search_from + rel;
+            let prev_is_ident = start > 0
+                && body[..start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(is_js_ident_continue);
+            if !prev_is_ident {
+                return true;
+            }
+            search_from = start + 1;
+        }
+        false
+    }
+
+    /// Regression for issue #91: `[attr.x]="$index"` inside an `@for` body
+    /// must resolve `$index` from the embedded view's `_ctx`, not via the
+    /// parent component (which has no such property). The body must not
+    /// shift to the parent with `ɵɵnextContext` when nothing references it.
+    #[test]
+    fn for_body_bare_dollar_index_resolves_from_embedded_ctx() {
+        let comp = test_component();
+        let nodes = vec![TemplateNode::ForBlock(ForBlockNode {
+            item_name: "bar".to_string(),
+            iterable: "bars()".to_string(),
+            track_expression: "$index".to_string(),
+            children: vec![TemplateNode::Element(ElementNode {
+                tag: "rect".to_string(),
+                attributes: vec![TemplateAttribute::Property {
+                    name: "attr.x".to_string(),
+                    expression: "$index".to_string(),
+                }],
+                children: vec![],
+                is_void: true,
+            })],
+            empty_children: None,
+        })];
+        let output = generate_ivy(&comp, &nodes).expect("should generate");
+        let body = output.child_template_functions.join("\n");
+        assert!(
+            body.contains("const $index = _ctx.$index;"),
+            "@for body must extract $index from the embedded view's _ctx: {body}"
+        );
+        assert!(
+            body.contains("\u{0275}\u{0275}attribute('x', $index)"),
+            "binding must reference the local $index, not ctx.$index: {body}"
+        );
+        assert!(
+            !contains_bare_ctx_member(&body, "$index"),
+            "must not emit ctx.$index against the parent component: {body}"
+        );
+        assert!(
+            !body.contains("\u{0275}\u{0275}nextContext"),
+            "no parent reference → ɵɵnextContext must not be emitted: {body}"
+        );
+    }
+
+    /// Arithmetic on `$index` exercises the oxc rewrite path. The compiled
+    /// expression must keep `$index` unprefixed so it picks up the local
+    /// declaration extracted from `_ctx`.
+    #[test]
+    fn for_body_dollar_index_arithmetic_resolves_locally() {
+        let comp = test_component();
+        let nodes = vec![TemplateNode::ForBlock(ForBlockNode {
+            item_name: "bar".to_string(),
+            iterable: "bars()".to_string(),
+            track_expression: "$index".to_string(),
+            children: vec![TemplateNode::Element(ElementNode {
+                tag: "rect".to_string(),
+                attributes: vec![TemplateAttribute::AttrBinding {
+                    name: "x".to_string(),
+                    expression: "$index * 20".to_string(),
+                }],
+                children: vec![],
+                is_void: true,
+            })],
+            empty_children: None,
+        })];
+        let output = generate_ivy(&comp, &nodes).expect("should generate");
+        let body = output.child_template_functions.join("\n");
+        assert!(
+            body.contains("const $index = _ctx.$index;"),
+            "@for body must extract $index when used in arithmetic: {body}"
+        );
+        assert!(
+            body.contains("\u{0275}\u{0275}attribute('x', $index * 20)"),
+            "arithmetic must keep $index unprefixed: {body}"
+        );
+        assert!(
+            !contains_bare_ctx_member(&body, "$index"),
+            "must not produce ctx.$index against the parent component: {body}"
+        );
+        assert!(
+            !body.contains("\u{0275}\u{0275}nextContext"),
+            "no parent reference → ɵɵnextContext must not be emitted: {body}"
+        );
+    }
+
+    /// Binding the loop item directly (`[attr.height]="bar"`) must read the
+    /// alias declared from `_ctx.$implicit` — not leave it as a free
+    /// identifier that throws ReferenceError at runtime.
+    #[test]
+    fn for_body_loop_item_attr_binding_resolves_to_dollar_implicit() {
+        let comp = test_component();
+        let nodes = vec![TemplateNode::ForBlock(ForBlockNode {
+            item_name: "bar".to_string(),
+            iterable: "bars()".to_string(),
+            track_expression: "$index".to_string(),
+            children: vec![TemplateNode::Element(ElementNode {
+                tag: "rect".to_string(),
+                attributes: vec![TemplateAttribute::AttrBinding {
+                    name: "height".to_string(),
+                    expression: "bar".to_string(),
+                }],
+                children: vec![],
+                is_void: true,
+            })],
+            empty_children: None,
+        })];
+        let output = generate_ivy(&comp, &nodes).expect("should generate");
+        let body = output.child_template_functions.join("\n");
+        assert!(
+            body.contains("const bar = _ctx.$implicit;"),
+            "loop item must be extracted from _ctx.$implicit: {body}"
+        );
+        assert!(
+            body.contains("\u{0275}\u{0275}attribute('height', bar)"),
+            "attribute binding must reference the local item alias: {body}"
+        );
+        assert!(
+            !body.contains("ctx.bar"),
+            "must not prefix the loop item with ctx.: {body}"
+        );
+        assert!(
+            !body.contains("\u{0275}\u{0275}nextContext"),
+            "no parent reference → ɵɵnextContext must not be emitted: {body}"
+        );
+    }
+
+    /// Mixed scopes: a listener on the `@for` body that calls a component
+    /// method with the loop item must reach both — the parent component
+    /// (for the method) AND the embedded view (for the item alias). The
+    /// listener preamble already handles this; the update block stays
+    /// `ɵɵnextContext`-free because no UPDATE binding references the
+    /// parent.
+    #[test]
+    fn for_body_mixed_scope_listener_resolves_both_contexts() {
+        let comp = test_component();
+        let nodes = vec![TemplateNode::ForBlock(ForBlockNode {
+            item_name: "bar".to_string(),
+            iterable: "bars()".to_string(),
+            track_expression: "$index".to_string(),
+            children: vec![TemplateNode::Element(ElementNode {
+                tag: "button".to_string(),
+                attributes: vec![TemplateAttribute::Event {
+                    name: "click".to_string(),
+                    handler: "select(bar)".to_string(),
+                }],
+                children: vec![],
+                is_void: false,
+            })],
+            empty_children: None,
+        })];
+        let output = generate_ivy(&comp, &nodes).expect("should generate");
+        let body = output.child_template_functions.join("\n");
+        assert!(
+            body.contains("const bar = _ctx.$implicit"),
+            "listener preamble must extract the loop item from _ctx.$implicit: {body}"
+        );
+        assert!(
+            body.contains("ctx.select(bar)"),
+            "method call must hit the parent component (ctx.) with the local item arg: {body}"
+        );
+        assert!(
+            body.contains("\u{0275}\u{0275}nextContext"),
+            "listener body must walk to the parent for ctx.select: {body}"
+        );
+    }
+
+    /// Non-SVG fixture covering the same fix in plain HTML: a list with a
+    /// `<div>` per item that exercises both the loop alias and `$index`.
+    /// Asserts the body no longer emits NaN-producing `ctx.$index` against
+    /// the parent component.
+    #[test]
+    fn for_body_plain_html_resolves_item_and_index() {
+        let comp = test_component();
+        let nodes = vec![TemplateNode::ForBlock(ForBlockNode {
+            item_name: "row".to_string(),
+            iterable: "rows()".to_string(),
+            track_expression: "$index".to_string(),
+            children: vec![TemplateNode::Element(ElementNode {
+                tag: "div".to_string(),
+                attributes: vec![
+                    TemplateAttribute::Property {
+                        name: "title".to_string(),
+                        expression: "row".to_string(),
+                    },
+                    TemplateAttribute::AttrBinding {
+                        name: "data-index".to_string(),
+                        expression: "$index".to_string(),
+                    },
+                ],
+                children: vec![],
+                is_void: false,
+            })],
+            empty_children: None,
+        })];
+        let output = generate_ivy(&comp, &nodes).expect("should generate");
+        let body = output.child_template_functions.join("\n");
+        assert!(
+            body.contains("const row = _ctx.$implicit;"),
+            "loop item must be extracted from _ctx.$implicit: {body}"
+        );
+        assert!(
+            body.contains("const $index = _ctx.$index;"),
+            "$index must be extracted from _ctx.$index: {body}"
+        );
+        assert!(
+            body.contains("\u{0275}\u{0275}property('title', row)"),
+            "property binding must reference the local row alias: {body}"
+        );
+        assert!(
+            body.contains("\u{0275}\u{0275}attribute('data-index', $index)"),
+            "attribute binding must reference the local $index: {body}"
+        );
+        assert!(
+            !contains_bare_ctx_member(&body, "row"),
+            "must not prefix the loop item with ctx.: {body}"
+        );
+        assert!(
+            !contains_bare_ctx_member(&body, "$index"),
+            "must not prefix $index with ctx.: {body}"
+        );
+        assert!(
+            !body.contains("\u{0275}\u{0275}nextContext"),
+            "no parent reference → ɵɵnextContext must not be emitted: {body}"
+        );
     }
 }
