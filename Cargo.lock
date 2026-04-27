@@ -584,7 +584,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-bundler"
-version = "0.7.34"
+version = "0.7.35"
 dependencies = [
  "dashmap",
  "ngc-diagnostics",
@@ -607,7 +607,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-diagnostics"
-version = "0.7.34"
+version = "0.7.35"
 dependencies = [
  "serde_json",
  "thiserror",
@@ -615,7 +615,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-linker"
-version = "0.7.34"
+version = "0.7.35"
 dependencies = [
  "insta",
  "ngc-diagnostics",
@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-npm-resolver"
-version = "0.7.34"
+version = "0.7.35"
 dependencies = [
  "dashmap",
  "ngc-diagnostics",
@@ -646,7 +646,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-project-resolver"
-version = "0.7.34"
+version = "0.7.35"
 dependencies = [
  "glob",
  "ngc-diagnostics",
@@ -661,7 +661,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-rs"
-version = "0.7.34"
+version = "0.7.35"
 dependencies = [
  "base64",
  "clap",
@@ -676,6 +676,7 @@ dependencies = [
  "ngc-template-compiler",
  "ngc-ts-transform",
  "oxc_sourcemap",
+ "petgraph",
  "regex",
  "serde",
  "serde_json",
@@ -688,7 +689,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-template-compiler"
-version = "0.7.34"
+version = "0.7.35"
 dependencies = [
  "insta",
  "ngc-diagnostics",
@@ -708,7 +709,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-ts-transform"
-version = "0.7.34"
+version = "0.7.35"
 dependencies = [
  "ngc-diagnostics",
  "oxc_allocator",
