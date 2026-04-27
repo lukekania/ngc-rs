@@ -43,6 +43,10 @@ enum Namespace {
 /// Internal codegen state.
 struct IvyCodegen {
     component_name: String,
+    /// Identifier names from the component's `imports: [...]` array.
+    /// Used by `@defer` deps-fn emission so the deferred view can resolve
+    /// `<my-tag>` against the same in-scope classes the bundler co-bundled.
+    component_imports: Vec<String>,
     slot_index: u32,
     var_count: u32,
     creation: Vec<String>,
@@ -121,6 +125,7 @@ pub fn generate_ivy(
 ) -> NgcResult<IvyOutput> {
     let mut gen = IvyCodegen {
         component_name: component.class_name.clone(),
+        component_imports: component.imports_identifiers.clone(),
         slot_index: 0,
         var_count: 0,
         creation: Vec::new(),
@@ -1935,7 +1940,8 @@ impl IvyCodegen {
             self.component_name, self.child_counter
         );
         self.child_counter += 1;
-        let deps_fn_code = build_defer_deps_fn(&deps_fn_name, &block.children);
+        let deps_fn_code =
+            build_defer_deps_fn(&deps_fn_name, &block.children, &self.component_imports);
         self.child_templates.push(ChildTemplate {
             function_name: deps_fn_name.clone(),
             decls: 0,
@@ -3587,25 +3593,36 @@ fn compile_event_handler(handler: &str, locals: &BTreeSet<String>) -> String {
 ///
 /// Real-world components are wired by the bundler's import-scanner picking
 /// up these `import(...)` calls as split points; resolving each call to a
-/// concrete module source is the author's responsibility for now — the
-/// specifier is derived from the tag (e.g. `<my-comp />` →
-/// `'./my-comp'`). Component authors who need a different path can
-/// re-author the helper by hand after compilation.
-fn build_defer_deps_fn(name: &str, children: &[TemplateNode]) -> String {
-    let mut tags: Vec<String> = Vec::new();
-    collect_custom_tags(children, &mut tags);
-    tags.sort();
-    tags.dedup();
+/// Returned array contents:
+/// - When the host component has any `imports: [...]` identifiers, return
+///   them directly. Angular's runtime accepts synchronous `Type` values in
+///   `DependencyResolverFn`'s array (the type is `Array<Promise<T> | T>`),
+///   resolves the deferred template's tags via selector match, and skips
+///   the network round-trip. This matches ngc-rs's bundling reality —
+///   imported components are co-bundled into the host chunk, not split
+///   into per-tag modules — so a synthetic `import('./<tag>')` would 404
+///   at runtime (NG0750).
+/// - Otherwise, fall back to the no-op `[]` so the runtime can still mark
+///   the block as resolved without crashing.
+fn build_defer_deps_fn(
+    name: &str,
+    children: &[TemplateNode],
+    component_imports: &[String],
+) -> String {
+    let has_custom_tags = {
+        let mut tags: Vec<String> = Vec::new();
+        collect_custom_tags(children, &mut tags);
+        !tags.is_empty()
+    };
 
     let mut code = format!("function {name}() {{\n  return [");
-    if tags.is_empty() {
+    if !has_custom_tags || component_imports.is_empty() {
         code.push(']');
     } else {
         code.push('\n');
-        for (i, tag) in tags.iter().enumerate() {
-            let symbol = kebab_to_pascal(tag);
-            code.push_str(&format!("    import('./{tag}').then(m => m.{symbol})"));
-            if i + 1 < tags.len() {
+        for (i, ident) in component_imports.iter().enumerate() {
+            code.push_str(&format!("    {ident}"));
+            if i + 1 < component_imports.len() {
                 code.push(',');
             }
             code.push('\n');
@@ -3666,24 +3683,6 @@ fn collect_custom_tags(nodes: &[TemplateNode], out: &mut Vec<String>) {
             _ => {}
         }
     }
-}
-
-/// Convert a kebab-case tag name to a PascalCase identifier.
-/// `my-cool-widget` → `MyCoolWidget`.
-fn kebab_to_pascal(tag: &str) -> String {
-    let mut out = String::with_capacity(tag.len());
-    let mut capitalize = true;
-    for ch in tag.chars() {
-        if ch == '-' {
-            capitalize = true;
-        } else if capitalize {
-            out.extend(ch.to_uppercase());
-            capitalize = false;
-        } else {
-            out.push(ch);
-        }
-    }
-    out
 }
 
 /// Parse an Angular duration string to milliseconds.
@@ -4610,20 +4609,33 @@ mod tests {
     }
 
     #[test]
-    fn test_defer_dep_fn_emits_import_for_custom_tag() {
-        let output = compile_template("@defer (on idle) { <my-c /> }");
+    fn test_defer_dep_fn_emits_component_imports_directly() {
+        // ngc-rs co-bundles imported components into the host chunk, so the
+        // deps fn returns synchronous class references — Angular's runtime
+        // resolves the deferred template's tags by selector match against
+        // them. This avoids the NG0750 "deferred chunk failed to load"
+        // path that an `import('./<tag>')` would take when no separate
+        // chunk exists.
+        let mut comp = test_component();
+        comp.imports_identifiers = vec!["HeavyComponent".to_string()];
+        let nodes = crate::parser::parse_template(
+            "@defer (on idle) { <my-c /> }",
+            &std::path::PathBuf::from("test.html"),
+        )
+        .expect("parse");
+        let output = generate_ivy(&comp, &nodes).expect("generate");
         let deps_fn = output
             .child_template_functions
             .iter()
             .find(|f| f.contains("DepsFn"))
             .expect("dep fn should be emitted");
         assert!(
-            deps_fn.contains("import('./my-c')"),
-            "dep fn should contain dynamic import for <my-c>: {deps_fn}"
+            deps_fn.contains("HeavyComponent"),
+            "dep fn should reference imported class directly: {deps_fn}"
         );
         assert!(
-            deps_fn.contains("m => m.MyC"),
-            "dep fn should reference PascalCase symbol: {deps_fn}"
+            !deps_fn.contains("import("),
+            "dep fn must not emit a dynamic import — co-bundled chunks 404: {deps_fn}"
         );
     }
 
@@ -4638,6 +4650,23 @@ mod tests {
         assert!(
             deps_fn.contains("return [];"),
             "dep fn with no custom tags should return []: {deps_fn}"
+        );
+    }
+
+    #[test]
+    fn test_defer_dep_fn_empty_when_component_has_no_imports() {
+        // Even with a custom tag inside the defer block, a component that
+        // declares no `imports: [...]` has nothing to surface to the
+        // deferred view — return [] rather than guessing a module path.
+        let output = compile_template("@defer (on idle) { <my-c /> }");
+        let deps_fn = output
+            .child_template_functions
+            .iter()
+            .find(|f| f.contains("DepsFn"))
+            .expect("dep fn should be emitted");
+        assert!(
+            deps_fn.contains("return [];"),
+            "no imports → empty array (avoids fabricating a 404 path): {deps_fn}"
         );
     }
 
