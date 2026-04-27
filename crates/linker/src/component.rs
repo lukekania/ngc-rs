@@ -323,12 +323,40 @@ fn build_inputs(obj: &ObjectExpression<'_>, source: &str) -> Option<String> {
                     }
                 }
                 Expression::ObjectExpression(input_obj) => {
-                    let alias = metadata::get_string_prop(input_obj, "alias")
+                    // Mirror the directive linker: honour modern partial
+                    // declarations that mark inputs with `isSignal` /
+                    // `transformFunction` so signal-based component inputs
+                    // (`input()`, `input.required()`, `model()`) reach the
+                    // runtime with the right `InputFlags` bits set.
+                    let alias = metadata::get_string_prop(input_obj, "publicName")
+                        .or_else(|| metadata::get_string_prop(input_obj, "alias"))
                         .unwrap_or_else(|| key.clone());
-                    let required = metadata::get_bool_prop(input_obj, "required") == Some(true);
-                    let flags = if required { 1 } else { 0 };
-                    if required || alias != key {
-                        entries.push(format!("{key}: [{flags}, '{alias}', '{key}']"));
+                    let is_required = metadata::get_bool_prop(input_obj, "isRequired")
+                        == Some(true)
+                        || metadata::get_bool_prop(input_obj, "required") == Some(true);
+                    let is_signal = metadata::get_bool_prop(input_obj, "isSignal") == Some(true);
+
+                    let transform_text = ["transformFunction", "transform"]
+                        .iter()
+                        .find_map(|name| metadata::get_source_text(input_obj, name, source))
+                        .filter(|s| s.trim() != "null");
+                    let has_transform = transform_text.is_some();
+
+                    let mut flags: u32 = 0;
+                    if is_signal {
+                        flags |= 1; // InputFlags.SignalBased
+                    }
+                    if has_transform {
+                        flags |= 2; // InputFlags.HasDecoratorInputTransform
+                    }
+
+                    if has_transform || is_signal || is_required || alias != key {
+                        let entry = if let Some(t) = transform_text {
+                            format!("{key}: [{flags}, '{alias}', '{key}', {t}]")
+                        } else {
+                            format!("{key}: [{flags}, '{alias}', '{key}']")
+                        };
+                        entries.push(entry);
                     } else {
                         entries.push(format!("{key}: '{key}'"));
                     }

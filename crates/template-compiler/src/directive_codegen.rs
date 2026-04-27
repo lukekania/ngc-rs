@@ -47,12 +47,42 @@ pub fn generate_directive_ivy(extracted: &ExtractedDirective) -> NgcResult<IvyOu
         props.push(format!("selectors: {}", selector::parse_selector(sel)));
     }
 
-    if let Some(ref inputs_src) = extracted.inputs_source {
-        props.push(format!("inputs: {inputs_src}"));
+    // Decorator-literal `inputs:` / `outputs:` come through verbatim
+    // as raw source. Signal-API class fields (`input()`, `output()`,
+    // `model()`, view/content queries) are merged in via
+    // `compile_signal_members`. When both shapes coexist on a directive
+    // the literal wins as the base and the signal entries are appended
+    // — Angular's compiler does the same.
+    let signal_members = crate::signal_codegen::compile_signal_members(
+        &[],
+        &extracted.signal_inputs,
+        &extracted.signal_outputs,
+        &extracted.signal_models,
+        &extracted.signal_queries,
+    );
+    for sym in &signal_members.ivy_imports {
+        ivy_imports.insert(sym.clone());
     }
 
-    if let Some(ref outputs_src) = extracted.outputs_source {
-        props.push(format!("outputs: {outputs_src}"));
+    let inputs_block = build_inputs_block(
+        extracted.inputs_source.as_deref(),
+        &signal_members.inputs_entries,
+    );
+    if let Some(b) = inputs_block {
+        props.push(b);
+    }
+    let outputs_block = build_outputs_block(
+        extracted.outputs_source.as_deref(),
+        &signal_members.outputs_entries,
+    );
+    if let Some(b) = outputs_block {
+        props.push(b);
+    }
+    if let Some(ref vq) = signal_members.view_query_prop {
+        props.push(vq.clone());
+    }
+    if let Some(ref cq) = signal_members.content_queries_prop {
+        props.push(cq.clone());
     }
 
     let host_props = build_host_props(&extracted.host_listeners, &extracted.host_bindings);
@@ -161,6 +191,63 @@ pub(crate) fn build_host_props(
     }
 }
 
+/// Combine the decorator-literal `inputs:` source (if any) with the
+/// signal-API entries produced by `signal_codegen` into a single
+/// `inputs: { ... }` property string.
+///
+/// When both are empty we return `None` so the caller can skip the
+/// property altogether — Angular's runtime treats a missing `inputs`
+/// the same as an empty map, and the smaller emit reads cleaner in
+/// codegen golden tests.
+///
+/// Splicing the two together by trimming the literal's outer braces is
+/// crude but sufficient: the decorator literal is always an
+/// `ObjectExpression` (the extractor only fills `inputs_source` from
+/// an object value), so matching the leading `{` / trailing `}` is
+/// safe.
+fn build_inputs_block(literal_src: Option<&str>, signal_entries: &[String]) -> Option<String> {
+    match (literal_src, signal_entries.is_empty()) {
+        (None, true) => None,
+        (Some(src), true) => Some(format!("inputs: {src}")),
+        (None, false) => Some(format!("inputs: {{ {} }}", signal_entries.join(", "))),
+        (Some(src), false) => {
+            let inner = src
+                .trim()
+                .trim_start_matches('{')
+                .trim_end_matches('}')
+                .trim();
+            let combined = if inner.is_empty() {
+                signal_entries.join(", ")
+            } else {
+                format!("{inner}, {}", signal_entries.join(", "))
+            };
+            Some(format!("inputs: {{ {combined} }}"))
+        }
+    }
+}
+
+/// Same idea as [`build_inputs_block`], for the `outputs` map.
+fn build_outputs_block(literal_src: Option<&str>, signal_entries: &[String]) -> Option<String> {
+    match (literal_src, signal_entries.is_empty()) {
+        (None, true) => None,
+        (Some(src), true) => Some(format!("outputs: {src}")),
+        (None, false) => Some(format!("outputs: {{ {} }}", signal_entries.join(", "))),
+        (Some(src), false) => {
+            let inner = src
+                .trim()
+                .trim_start_matches('{')
+                .trim_end_matches('}')
+                .trim();
+            let combined = if inner.is_empty() {
+                signal_entries.join(", ")
+            } else {
+                format!("{inner}, {}", signal_entries.join(", "))
+            };
+            Some(format!("outputs: {{ {combined} }}"))
+        }
+    }
+}
+
 /// Map a host binding target to the Ivy runtime symbol it dispatches to.
 /// Mirrors the dispatch logic in `host_codegen::dispatch_property_binding`.
 fn host_instruction_for(target: &str) -> &'static str {
@@ -198,6 +285,10 @@ mod tests {
             host_listeners: Vec::new(),
             host_bindings: Vec::new(),
             host_directives_source: None,
+            signal_inputs: Vec::new(),
+            signal_outputs: Vec::new(),
+            signal_models: Vec::new(),
+            signal_queries: Vec::new(),
             common: DecoratorCommon {
                 decorator_span: (0, 0),
                 class_body_start: 0,

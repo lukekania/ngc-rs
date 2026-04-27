@@ -81,6 +81,19 @@ struct IvyCodegen {
     /// Entering `<svg>` pushes Svg; `<math>` pushes MathMl; `<foreignObject>`
     /// (which is itself SVG) pushes Html so its HTML descendants render correctly.
     namespace_stack: Vec<Namespace>,
+    /// `true` once a `<ng-content>` is encountered. Triggers two
+    /// out-of-band emissions on the host component:
+    ///   1. `ɵɵprojectionDef()` at the head of the create block — the
+    ///      runtime walks projected nodes through `tNode.projection`
+    ///      which `ɵɵprojection(idx)` later reads. Without the def
+    ///      call that field stays null and `ɵɵprojection` blows up
+    ///      with `Cannot read properties of null (reading '0')`.
+    ///   2. `ngContentSelectors: ['*']` on the `defineComponent` call
+    ///      so Angular's runtime knows what selectors the host
+    ///      projects. Default-projection components only need `['*']`;
+    ///      multi-slot projection (`<ng-content select="...">`) is
+    ///      not yet implemented.
+    has_projection: bool,
 }
 
 struct ChildTemplate {
@@ -114,6 +127,7 @@ pub fn generate_ivy(
         template_refs: BTreeMap::new(),
         namespace_state: Namespace::Html,
         namespace_stack: vec![Namespace::Html],
+        has_projection: false,
     };
 
     gen.ivy_imports
@@ -131,6 +145,17 @@ pub fn generate_ivy(
     let mut template_body = String::new();
     if !gen.creation.is_empty() {
         template_body.push_str("    if (rf & 1) {\n");
+        // When the template uses `<ng-content>`, the runtime needs
+        // `ɵɵprojectionDef()` to run once at the head of the create
+        // block so it can stash the projected children's TNodes onto
+        // the host's TNode. Subsequent `ɵɵprojection(idx)` calls then
+        // read `tNode.projection[idx]` — without the def call that's
+        // null and the runtime throws on the first projection.
+        if gen.has_projection {
+            gen.ivy_imports
+                .insert("\u{0275}\u{0275}projectionDef".to_string());
+            template_body.push_str("      \u{0275}\u{0275}projectionDef();\n");
+        }
         for instr in &gen.creation {
             template_body.push_str("      ");
             template_body.push_str(instr);
@@ -168,14 +193,32 @@ pub fn generate_ivy(
     if component.standalone {
         dc.push_str("    standalone: true,\n");
     }
-    // Generate inputs property from @Input() decorated properties
-    if !component.input_properties.is_empty() {
-        let inputs: Vec<String> = component
-            .input_properties
-            .iter()
-            .map(|p| format!("{p}: '{p}'"))
-            .collect();
-        dc.push_str(&format!("    inputs: {{ {} }},\n", inputs.join(", ")));
+    // Merge `@Input()` decorator-style fields and signal-API class-field
+    // initialisations (`input()`, `output()`, `model()`, view/content
+    // queries) into a single `inputs` / `outputs` map plus optional
+    // `viewQuery` / `contentQueries` functions. Signal-based inputs
+    // ride along with the `SignalBased` runtime flag so the directive
+    // runtime knows to write into the WritableSignal rather than a
+    // plain field.
+    let signal_members = crate::signal_codegen::compile_signal_members(
+        &component.input_properties,
+        &component.signal_inputs,
+        &component.signal_outputs,
+        &component.signal_models,
+        &component.signal_queries,
+    );
+    for sym in &signal_members.ivy_imports {
+        gen.ivy_imports.insert(sym.clone());
+    }
+    if let Some(inputs) =
+        crate::signal_codegen::format_map("inputs", &signal_members.inputs_entries)
+    {
+        dc.push_str(&format!("    {inputs},\n"));
+    }
+    if let Some(outputs) =
+        crate::signal_codegen::format_map("outputs", &signal_members.outputs_entries)
+    {
+        dc.push_str(&format!("    {outputs},\n"));
     }
     let host_props = crate::directive_codegen::build_host_props(
         &component.host_listeners,
@@ -205,6 +248,15 @@ pub fn generate_ivy(
             "    features: [\u{0275}\u{0275}HostDirectivesFeature({normalised})],\n"
         ));
     }
+    // Components that project content need `ngContentSelectors` on the
+    // def so Angular's runtime can match `<ng-content select="...">`
+    // against the host's projected children. We only emit `<ng-content>`
+    // (no select-attribute support yet), so a single-entry `['*']`
+    // (catch-all) selector list is sufficient. The matching
+    // `ɵɵprojectionDef()` call lives at the head of the create block.
+    if gen.has_projection {
+        dc.push_str("    ngContentSelectors: [\"*\"],\n");
+    }
     if !gen.consts.is_empty() {
         dc.push_str(&format!("    consts: [{}],\n", gen.consts.join(", ")));
     }
@@ -216,6 +268,21 @@ pub fn generate_ivy(
     ));
     dc.push_str(&template_body);
     dc.push_str("    }");
+
+    // Signal-based queries are emitted as their own `viewQuery` /
+    // `contentQueries` functions on the define call (signal queries
+    // and decorator-style queries can't share a function — the signal
+    // variant uses `ɵɵqueryAdvance`, the decorator variant uses
+    // `ɵɵqueryRefresh`/`ɵɵloadQuery`). When this component eventually
+    // supports decorator-style `@ViewChild` queries on the AOT path
+    // too, those will need to be merged in here as additional
+    // statements within the same function body.
+    if let Some(ref vq) = signal_members.view_query_prop {
+        dc.push_str(&format!(",\n    {vq}"));
+    }
+    if let Some(ref cq) = signal_members.content_queries_prop {
+        dc.push_str(&format!(",\n    {cq}"));
+    }
 
     // Component dependencies. Emit the imports array verbatim here; the linker's
     // post-pass (crates/linker/src/module_registry.rs) walks every
@@ -234,6 +301,15 @@ pub fn generate_ivy(
         // Angular's runtime reads `data.animation` when resolving `@`-prefixed
         // property/listener bindings through the animation renderer.
         dc.push_str(&format!(",\n    data: {{ animation: {animations_src} }}"));
+    }
+    if let Some(cd) = component.change_detection {
+        // `changeDetection: 0` (`OnPush`) is what flips
+        // `def.onPush = true`, which in turn makes the runtime use
+        // OnPush-style refresh — the only mode that respects signal-driven
+        // change detection in zoneless apps. Without it, components
+        // running under `provideZonelessChangeDetection()` never re-render
+        // on signal writes and event-handler updates appear inert.
+        dc.push_str(&format!(",\n    changeDetection: {cd}"));
     }
     dc.push_str("\n  })");
 
@@ -406,8 +482,14 @@ impl IvyCodegen {
         // Special Angular elements
         match el.tag.as_str() {
             "ng-content" => {
+                // `ɵɵprojection(idx)` reads `tNode.projection` to find
+                // the projected children for slot `idx`. That field is
+                // populated by `ɵɵprojectionDef()`, which has to run
+                // *once* at the head of the host component's create
+                // block — see `has_projection` in the codegen state.
                 let slot = self.slot_index;
                 self.slot_index += 1;
+                self.has_projection = true;
                 self.ivy_imports
                     .insert("\u{0275}\u{0275}projection".to_string());
                 self.creation
@@ -669,13 +751,28 @@ impl IvyCodegen {
                         }
                     }
                     TemplateAttribute::TwoWayBinding { name, expression } => {
+                        // Two-way listener `(xChange)="expr = $event"`
+                        // for signal-aware bindings: the runtime helper
+                        // `ɵɵtwoWayBindingSet(target, value)` calls
+                        // `.set(value)` on a `WritableSignal` and
+                        // returns `true`; for non-signals it returns
+                        // `false`, so the `||` falls through to a
+                        // plain assignment. Writing `target = $event`
+                        // unconditionally would replace the signal
+                        // FIELD on the parent (turning
+                        // `parentActive: WritableSignal<boolean>` into
+                        // `parentActive: boolean`), and the very next
+                        // `parentActive()` template read would throw
+                        // "is not a function".
                         self.ivy_imports
-                            .insert("\u{0275}\u{0275}listener".to_string());
+                            .insert("\u{0275}\u{0275}twoWayListener".to_string());
+                        self.ivy_imports
+                            .insert("\u{0275}\u{0275}twoWayBindingSet".to_string());
                         let depth = self.scope_depth();
-                        // Template refs stay as bare identifiers; they resolve
-                        // via the `const <name> = ɵɵreference(<slot>);` prelude
-                        // at the top of the update block / listener body.
                         let compiled_target = ctx_expr_with_locals(expression, &self.local_vars);
+                        let body = format!(
+                            "\u{0275}\u{0275}twoWayBindingSet({compiled_target}, $event) || ({compiled_target} = $event); return $event;"
+                        );
                         if depth > 0 {
                             self.ivy_imports
                                 .insert("\u{0275}\u{0275}restoreView".to_string());
@@ -683,12 +780,12 @@ impl IvyCodegen {
                                 .insert("\u{0275}\u{0275}nextContext".to_string());
                             let listener_preamble = self.generate_listener_preamble();
                             self.creation.push(format!(
-                                "\u{0275}\u{0275}listener('{}Change', function($event) {{ {listener_preamble}return {compiled_target} = $event; }});",
+                                "\u{0275}\u{0275}twoWayListener('{}Change', function($event) {{ {listener_preamble}{body} }});",
                                 name,
                             ));
                         } else {
                             self.creation.push(format!(
-                                "\u{0275}\u{0275}listener('{}Change', function($event) {{ return {compiled_target} = $event; }});",
+                                "\u{0275}\u{0275}twoWayListener('{}Change', function($event) {{ {body} }});",
                                 name,
                             ));
                         }
@@ -2287,11 +2384,24 @@ impl IvyCodegen {
                     }
                 }
                 TemplateAttribute::TwoWayBinding { name, expression } => {
+                    // Two-way binding `[(x)]="expr"` must dispatch to
+                    // the signal-aware `ɵɵtwoWayProperty` instead of
+                    // `ɵɵproperty`. When `expr` is a `WritableSignal`,
+                    // `ɵɵtwoWayProperty` unwraps it (calls the signal
+                    // to read the value); for plain values it behaves
+                    // like `ɵɵproperty`. Emitting `ɵɵproperty(name,
+                    // signalRef)` would pass the signal OBJECT into
+                    // the child input, so the child sees the wrapper
+                    // rather than the value and template reads
+                    // (`signal()`) on the parent later see whatever
+                    // the listener wrote (likely a non-callable).
                     self.ivy_imports
-                        .insert("\u{0275}\u{0275}property".to_string());
+                        .insert("\u{0275}\u{0275}twoWayProperty".to_string());
                     let compiled = self.compile_binding_expr(expression);
-                    self.update
-                        .push(format!("\u{0275}\u{0275}property('{}', {compiled});", name,));
+                    self.update.push(format!(
+                        "\u{0275}\u{0275}twoWayProperty('{}', {compiled});",
+                        name,
+                    ));
                     self.var_count += 1;
                 }
                 TemplateAttribute::ClassBinding {
@@ -3630,6 +3740,11 @@ mod tests {
             host_bindings: Vec::new(),
             animations_source: None,
             host_directives_source: None,
+            signal_inputs: Vec::new(),
+            signal_outputs: Vec::new(),
+            signal_models: Vec::new(),
+            signal_queries: Vec::new(),
+            change_detection: None,
         }
     }
 
