@@ -3594,14 +3594,15 @@ fn compile_event_handler(handler: &str, locals: &BTreeSet<String>) -> String {
 /// Real-world components are wired by the bundler's import-scanner picking
 /// up these `import(...)` calls as split points; resolving each call to a
 /// Returned array contents:
-/// - When the host component has any `imports: [...]` identifiers, return
-///   them directly. Angular's runtime accepts synchronous `Type` values in
-///   `DependencyResolverFn`'s array (the type is `Array<Promise<T> | T>`),
-///   resolves the deferred template's tags via selector match, and skips
-///   the network round-trip. This matches ngc-rs's bundling reality —
-///   imported components are co-bundled into the host chunk, not split
-///   into per-tag modules — so a synthetic `import('./<tag>')` would 404
-///   at runtime (NG0750).
+/// - When the host component has any `imports: [...]` identifiers, wrap
+///   each in `Promise.resolve(...)`. Angular's runtime models the deps
+///   resolver as `Array<Promise<DependencyType>>` and feeds the resolved
+///   values through `Promise.all`; passing a bare class confuses the
+///   downstream "extract default export" step and the deferred view
+///   ends up without a populated `directiveRegistry`. ngc-rs co-bundles
+///   imported components into the host chunk, so there is no separate
+///   chunk to dynamically `import()` — `Promise.resolve` keeps the
+///   shape Angular expects without a network round-trip.
 /// - Otherwise, fall back to the no-op `[]` so the runtime can still mark
 ///   the block as resolved without crashing.
 fn build_defer_deps_fn(
@@ -3621,7 +3622,7 @@ fn build_defer_deps_fn(
     } else {
         code.push('\n');
         for (i, ident) in component_imports.iter().enumerate() {
-            code.push_str(&format!("    {ident}"));
+            code.push_str(&format!("    Promise.resolve({ident})"));
             if i + 1 < component_imports.len() {
                 code.push(',');
             }
@@ -4630,8 +4631,8 @@ mod tests {
             .find(|f| f.contains("DepsFn"))
             .expect("dep fn should be emitted");
         assert!(
-            deps_fn.contains("HeavyComponent"),
-            "dep fn should reference imported class directly: {deps_fn}"
+            deps_fn.contains("Promise.resolve(HeavyComponent)"),
+            "dep fn should wrap imported class in Promise.resolve so the runtime's directiveRegistry pipeline sees a Promise<Type>: {deps_fn}"
         );
         assert!(
             !deps_fn.contains("import("),
