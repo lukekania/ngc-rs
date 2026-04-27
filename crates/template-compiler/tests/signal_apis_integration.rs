@@ -131,9 +131,12 @@ fn signal_apis_reach_runtime_with_correct_shape() {
     // — never the legacy `ɵɵviewQuery` / `ɵɵcontentQuery` for these.
     // The `ctx.<prop>` target in arg 1 (or arg 2 for content) is what
     // lets the runtime write into the WritableSignal slot directly.
+    // `viewChild('ref')` wraps the bare-string predicate in an array
+    // — runtime treats `'ref'` (string) as a `ProviderToken` and
+    // `['ref']` (array) as a template-ref selector.
     assert!(
-        out.contains("\u{0275}\u{0275}viewQuerySignal(ctx.v"),
-        "expected viewQuerySignal create call for `v`, got:\n{out}"
+        out.contains("\u{0275}\u{0275}viewQuerySignal(ctx.v, ['ref']"),
+        "expected viewQuerySignal create call for `v` with wrapped predicate, got:\n{out}"
     );
     assert!(
         out.contains("\u{0275}\u{0275}viewQuerySignal(ctx.vs"),

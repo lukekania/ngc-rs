@@ -1161,12 +1161,21 @@ pub(crate) fn extract_signal_members(
                 });
             }
             SignalFactory::Query { kind, .. } => {
+                // Predicate handling matches Angular's compiler:
+                //   * String literal `viewChild('ref')` → `['ref']`. Bare
+                //     strings would otherwise be read as a `ProviderToken`
+                //     and the runtime would never resolve the template ref.
+                //   * Anything else (class ref, `InjectionToken`, array
+                //     literal) flows through verbatim.
                 let predicate_source = call
                     .arguments
                     .first()
-                    .map(|arg| {
-                        let span = arg.span();
-                        source[span.start as usize..span.end as usize].to_string()
+                    .map(|arg| match arg {
+                        Argument::StringLiteral(s) => format!("['{}']", s.value),
+                        _ => {
+                            let span = arg.span();
+                            source[span.start as usize..span.end as usize].to_string()
+                        }
                     })
                     .unwrap_or_else(|| "null".to_string());
                 let (_, _, read_source, is_static) = parse_signal_options(source, call, 1);
@@ -2140,7 +2149,10 @@ export class XComponent {
             by_name("cs").kind,
             SignalQueryKind::ContentChildren
         ));
-        assert_eq!(by_name("v").predicate_source, "'ref'");
+        // Bare string predicate must be wrapped in an array — the
+        // runtime distinguishes `['ref']` (template ref) from `'ref'`
+        // (provider token).
+        assert_eq!(by_name("v").predicate_source, "['ref']");
         assert_eq!(by_name("cs").read_source.as_deref(), Some("ElementRef"));
     }
 
