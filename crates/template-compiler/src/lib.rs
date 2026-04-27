@@ -131,6 +131,7 @@ pub fn generate_template_fn(
         signal_outputs: Vec::new(),
         signal_models: Vec::new(),
         signal_queries: Vec::new(),
+        change_detection: None,
     };
 
     let ivy_output = codegen::generate_ivy(&extracted, &template_ast)?;

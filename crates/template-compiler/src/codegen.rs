@@ -302,6 +302,15 @@ pub fn generate_ivy(
         // property/listener bindings through the animation renderer.
         dc.push_str(&format!(",\n    data: {{ animation: {animations_src} }}"));
     }
+    if let Some(cd) = component.change_detection {
+        // `changeDetection: 0` (`OnPush`) is what flips
+        // `def.onPush = true`, which in turn makes the runtime use
+        // OnPush-style refresh — the only mode that respects signal-driven
+        // change detection in zoneless apps. Without it, components
+        // running under `provideZonelessChangeDetection()` never re-render
+        // on signal writes and event-handler updates appear inert.
+        dc.push_str(&format!(",\n    changeDetection: {cd}"));
+    }
     dc.push_str("\n  })");
 
     // Collect child template functions
@@ -3735,6 +3744,7 @@ mod tests {
             signal_outputs: Vec::new(),
             signal_models: Vec::new(),
             signal_queries: Vec::new(),
+            change_detection: None,
         }
     }
 

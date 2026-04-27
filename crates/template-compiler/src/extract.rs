@@ -80,6 +80,13 @@ pub struct ExtractedComponent {
     pub signal_models: Vec<SignalModelSpec>,
     /// Class fields initialised with `viewChild`/`viewChildren`/`contentChild`/`contentChildren`.
     pub signal_queries: Vec<SignalQuerySpec>,
+    /// Numeric `ChangeDetectionStrategy` value from the decorator's
+    /// `changeDetection` property (`0` for `OnPush`, `1` for `Default`),
+    /// or `None` when the property is absent. Threaded through to
+    /// `defineComponent({ changeDetection })` — required for zoneless
+    /// apps so `OnPush` components actually mark themselves dirty when
+    /// signal writes happen inside event handlers.
+    pub change_detection: Option<u32>,
 }
 
 /// A method-level `@HostListener(event, [args])` extraction.
@@ -376,6 +383,7 @@ pub fn extract_component(source: &str, file_path: &Path) -> NgcResult<Option<Ext
             signal_outputs,
             signal_models,
             signal_queries,
+            change_detection: metadata.change_detection,
         }));
     }
 
@@ -1441,46 +1449,34 @@ struct DecoratorMetadata {
     style_urls: Vec<String>,
     animations_source: Option<String>,
     host_directives_source: Option<String>,
+    change_detection: Option<u32>,
 }
 
 /// Extract metadata from the `@Component({...})` decorator argument.
 fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<DecoratorMetadata> {
+    let empty = || DecoratorMetadata {
+        selector: String::new(),
+        template: None,
+        template_url: None,
+        standalone: false,
+        imports_source: None,
+        imports_identifiers: Vec::new(),
+        styles_source: None,
+        inline_styles: Vec::new(),
+        style_urls: Vec::new(),
+        animations_source: None,
+        host_directives_source: None,
+        change_detection: None,
+    };
+
     let call = match &decorator.expression {
         Expression::CallExpression(call) => call,
-        _ => {
-            return Ok(DecoratorMetadata {
-                selector: String::new(),
-                template: None,
-                template_url: None,
-                standalone: false,
-                imports_source: None,
-                imports_identifiers: Vec::new(),
-                styles_source: None,
-                inline_styles: Vec::new(),
-                style_urls: Vec::new(),
-                animations_source: None,
-                host_directives_source: None,
-            });
-        }
+        _ => return Ok(empty()),
     };
 
     let arg = match call.arguments.first() {
         Some(Argument::ObjectExpression(obj)) => obj,
-        _ => {
-            return Ok(DecoratorMetadata {
-                selector: String::new(),
-                template: None,
-                template_url: None,
-                standalone: false,
-                imports_source: None,
-                imports_identifiers: Vec::new(),
-                styles_source: None,
-                inline_styles: Vec::new(),
-                style_urls: Vec::new(),
-                animations_source: None,
-                host_directives_source: None,
-            });
-        }
+        _ => return Ok(empty()),
     };
 
     let mut selector = String::new();
@@ -1494,6 +1490,7 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
     let mut style_urls: Vec<String> = Vec::new();
     let mut animations_source = None;
     let mut host_directives_source = None;
+    let mut change_detection = None;
 
     for prop in &arg.properties {
         if let ObjectPropertyKind::ObjectProperty(prop) = prop {
@@ -1618,6 +1615,24 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
                         host_directives_source = Some(source[start..end].to_string());
                     }
                 }
+                "changeDetection" => {
+                    // Recognise `ChangeDetectionStrategy.OnPush` / `Default`
+                    // member references and lower them to the runtime
+                    // numeric values (0 / 1). Anything else (a literal,
+                    // an aliased import, a ternary) we just leave
+                    // unresolved — the linker / runtime gets a missing
+                    // `changeDetection` key in that case, which is
+                    // identical behaviour to omitting the property.
+                    if let Expression::StaticMemberExpression(member) = &prop.value {
+                        change_detection = match member.property.name.as_str() {
+                            "OnPush" => Some(0),
+                            "Default" => Some(1),
+                            _ => None,
+                        };
+                    } else if let Expression::NumericLiteral(n) = &prop.value {
+                        change_detection = Some(n.value as u32);
+                    }
+                }
                 _ => {}
             }
         }
@@ -1635,6 +1650,7 @@ fn extract_decorator_metadata(source: &str, decorator: &Decorator) -> NgcResult<
         style_urls,
         animations_source,
         host_directives_source,
+        change_detection,
     })
 }
 

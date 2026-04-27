@@ -162,6 +162,7 @@ mod tests {
             signal_outputs: Vec::new(),
             signal_models: Vec::new(),
             signal_queries: Vec::new(),
+            change_detection: None,
         }
     }
 
