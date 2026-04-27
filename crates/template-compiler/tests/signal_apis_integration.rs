@@ -83,32 +83,36 @@ fn signal_apis_reach_runtime_with_correct_shape() {
 
     let out = &compiled.source;
 
-    // Plain `input()` — SignalBased flag (bit 0) only.
+    // Plain `input()` — SignalBased flag (bit 0) only. Compact
+    // 2-element form `[flags, publicName]` because the public name
+    // matches the class property name.
     assert!(
-        out.contains("name: [1, 'name', 'name']"),
-        "expected plain input to set SignalBased flag, got:\n{out}"
+        out.contains("name: [1, 'name']"),
+        "expected plain input to set SignalBased flag (compact form), got:\n{out}"
     );
 
     // `input.required()` keeps the same SignalBased flag — required is
     // not a separate runtime flag.
     assert!(
-        out.contains("required: [1, 'required', 'required']"),
+        out.contains("required: [1, 'required']"),
         "expected required input to set SignalBased flag, got:\n{out}"
     );
 
-    // Alias surfaces in array position 1 (publicName), property name in
-    // position 2.
+    // Alias surfaces in array position 1 (publicName), property name
+    // in position 2 — this is the 3-element form because the names
+    // differ.
     assert!(
         out.contains("aliased: [1, 'pub', 'aliased']"),
         "expected aliased input to keep public name in position 1, got:\n{out}"
     );
 
-    // Transform sets BOTH SignalBased (bit 0) and
-    // HasDecoratorInputTransform (bit 1) → flags = 3 — and rides along
-    // as the 4th array element so the runtime can call it.
+    // Signal-based transforms stay on the SIGNAL (the field
+    // initializer carries the transform); they do NOT replicate into
+    // the inputs def. Flags stay at SignalBased (1) and the entry is
+    // the compact 2-element form. Angular's `ng build` does the same.
     assert!(
-        out.contains("trimmed: [3, 'trimmed', 'trimmed', trimString]"),
-        "expected transform input to carry function ref + flag bit 1, got:\n{out}"
+        out.contains("trimmed: [1, 'trimmed']"),
+        "expected signal input with transform to use compact form, got:\n{out}"
     );
 
     // Output → identity entry in the outputs map.
@@ -117,14 +121,20 @@ fn signal_apis_reach_runtime_with_correct_shape() {
         "expected output to land in outputs map, got:\n{out}"
     );
 
-    // Model emits a paired input + `<name>Change` output.
+    // Model emits a paired input + change output. The output map MUST
+    // be keyed by the class-property name (so the runtime finds the
+    // model signal at `instance.<field>` to subscribe to) and valued
+    // with the public event name (`<field>Change`). Keying by the
+    // public event name silently breaks two-way binding because the
+    // runtime then tries to read a non-existent
+    // `instance.<field>Change` field.
     assert!(
-        out.contains("value: [1, 'value', 'value']"),
-        "expected model input entry, got:\n{out}"
+        out.contains("value: [1, 'value']"),
+        "expected model input entry (compact form), got:\n{out}"
     );
     assert!(
-        out.contains("valueChange: 'valueChange'"),
-        "expected model paired Change output, got:\n{out}"
+        out.contains("value: 'valueChange'"),
+        "expected outputs entry keyed by class prop, valued with public event name, got:\n{out}"
     );
 
     // Signal queries dispatch to `ɵɵviewQuerySignal` / `ɵɵcontentQuerySignal`
@@ -133,10 +143,12 @@ fn signal_apis_reach_runtime_with_correct_shape() {
     // lets the runtime write into the WritableSignal slot directly.
     // `viewChild('ref')` wraps the bare-string predicate in an array
     // — runtime treats `'ref'` (string) as a `ProviderToken` and
-    // `['ref']` (array) as a template-ref selector.
+    // `['ref']` (array) as a template-ref selector. Flags = 5
+    // (descendants=true | emitDistinctChangesOnly=true), matching
+    // Angular's compiler emission for signal queries.
     assert!(
-        out.contains("\u{0275}\u{0275}viewQuerySignal(ctx.v, ['ref']"),
-        "expected viewQuerySignal create call for `v` with wrapped predicate, got:\n{out}"
+        out.contains("\u{0275}\u{0275}viewQuerySignal(ctx.v, ['ref'], 5)"),
+        "expected viewQuerySignal create call for `v` with flags=5, got:\n{out}"
     );
     assert!(
         out.contains("\u{0275}\u{0275}viewQuerySignal(ctx.vs"),

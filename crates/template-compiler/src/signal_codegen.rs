@@ -75,19 +75,36 @@ pub fn compile_signal_members(
     }
 
     for spec in signal_inputs {
+        // Signal-based inputs DO NOT propagate the `transform` into the
+        // runtime `inputs` def — Angular's compiler keeps it on the
+        // signal field's `InputSignalNode.transformFn` (set by the
+        // `input(default, { transform })` factory at instantiation
+        // time). The runtime's `writeToDirectiveInput` always prefers
+        // `inputSignalNode.transformFn` over the def's `transform`, so
+        // emitting the transform in the def is at best dead weight and
+        // at worst confusing diff noise vs. `ng build`.
         input_entries.push(format_signal_input_entry(
             &spec.property_name,
             spec.alias.as_deref(),
             spec.is_required,
-            spec.transform_source.as_deref(),
+            None,
         ));
     }
 
     for spec in signal_models {
-        // `model<T>()` is sugar for a paired signal input + `<name>Change`
-        // output. The output's public name follows the input alias when
-        // one is set (`model({ alias: 'pub' })` → input `pub` + output
-        // `pubChange`), matching Angular's compiler.
+        // `model<T>()` is sugar for a paired signal input + `<publicName>Change`
+        // output. Angular's runtime inverts the outputs map to
+        // `{ publicName: classPropName }`, then on the change event it
+        // looks up `instance[classPropName]` to subscribe to. For a
+        // model the change-event source is the model SIGNAL itself
+        // (`instance.<field>`) — NOT a separate field named
+        // `<field>Change`. So the outputs entry must be keyed by the
+        // model's class-property name and valued with the public event
+        // name (`<publicName>Change`); emitting
+        // `{ <publicName>Change: '<publicName>Change' }` would make the
+        // runtime try to subscribe to a non-existent
+        // `instance.<publicName>Change` field and silently drop the
+        // two-way binding.
         let public = spec.alias.as_deref().unwrap_or(&spec.property_name);
         input_entries.push(format_signal_input_entry(
             &spec.property_name,
@@ -95,8 +112,7 @@ pub fn compile_signal_members(
             spec.is_required,
             None,
         ));
-        let change_name = format!("{public}Change");
-        output_entries.push(format!("{}: '{}'", change_name, change_name));
+        output_entries.push(format!("{}: '{}Change'", spec.property_name, public));
     }
 
     for spec in signal_outputs {
@@ -142,9 +158,20 @@ pub fn compile_signal_members(
     }
 }
 
-/// Format a single `inputs` map entry from a [`SignalInputSpec`] /
-/// [`SignalModelSpec`]. The signal-based bit is always set; the
-/// transform bit is added only when a transform expression is present.
+/// Format a single `inputs` map entry, matching Angular's compact
+/// emission rules:
+///
+/// * `[flags, publicName]` when `publicName == classPropertyName` and
+///   no decorator transform.
+/// * `[flags, publicName, classPropertyName]` when the names differ.
+/// * `[flags, publicName, classPropertyName, transform]` when a
+///   decorator-style transform is in play (only ever for non-signal
+///   inputs — signal inputs keep their transform on the signal field).
+///
+/// `SignalBased` (bit 0) is always set here because every caller is a
+/// signal-API field. `HasDecoratorInputTransform` (bit 1) is only set
+/// when `transform_source` is provided — and signal-input callers pass
+/// `None`, so it's effectively for decorator inputs going forward.
 fn format_signal_input_entry(
     property_name: &str,
     alias: Option<&str>,
@@ -152,14 +179,17 @@ fn format_signal_input_entry(
     transform_source: Option<&str>,
 ) -> String {
     let public = alias.unwrap_or(property_name);
+    let names_differ = public != property_name;
     let mut flags: u32 = 1; // SignalBased
     if transform_source.is_some() {
         flags |= 2; // HasDecoratorInputTransform
     }
-    if let Some(t) = transform_source {
-        format!("{property_name}: [{flags}, '{public}', '{property_name}', {t}]")
-    } else {
-        format!("{property_name}: [{flags}, '{public}', '{property_name}']")
+    match (names_differ, transform_source) {
+        (false, None) => format!("{property_name}: [{flags}, '{public}']"),
+        (true, None) => format!("{property_name}: [{flags}, '{public}', '{property_name}']"),
+        (_, Some(t)) => {
+            format!("{property_name}: [{flags}, '{public}', '{property_name}', {t}]")
+        }
     }
 }
 
@@ -220,19 +250,26 @@ fn build_query_function(queries: &[&SignalQuerySpec], is_content: bool) -> Strin
 }
 
 /// Compute the runtime `QueryFlags` integer for a signal-based query.
-/// Mirrors the linker: bit 0 = descendants, bit 1 = isStatic,
-/// bit 2 = emitDistinctChangesOnly (set for plural `*Children` variants
-/// to match Angular's `QueryList` distinct-emission semantics).
+///
+/// Matches Angular's compiler-cli behaviour bit-for-bit:
+/// * bit 0 (`descendants`) — kind-specific default unless the user
+///   passed an explicit `descendants:` option. Only `contentChildren`
+///   defaults to `false`; `viewChild` / `viewChildren` / `contentChild`
+///   all default to `true`.
+/// * bit 1 (`isStatic`) — from the `static:` option.
+/// * bit 2 (`emitDistinctChangesOnly`) — **always set for signal queries**,
+///   regardless of `first` / multi. Unlike `QueryList`-backed decorator
+///   queries (which only set this bit when emitting many results),
+///   Angular's signal-query compiler unconditionally sets it.
 fn compute_signal_query_flags(q: &SignalQuerySpec) -> u32 {
-    let mut flags: u32 = 0;
-    if q.kind.default_descendants() {
+    let mut flags: u32 = 4; // emitDistinctChangesOnly — always set for signal queries
+    if q.descendants
+        .unwrap_or_else(|| q.kind.default_descendants())
+    {
         flags |= 1;
     }
     if q.is_static {
         flags |= 2;
-    }
-    if !q.kind.is_first() {
-        flags |= 4;
     }
     flags
 }
@@ -262,29 +299,41 @@ mod tests {
         }
     }
 
-    /// Plain `input()` should set the `SignalBased` flag (bit 0) so
-    /// the runtime knows the field is a `WritableSignal` and not a
-    /// plain assignable property.
+    /// Plain `input()` should emit the compact 2-element form
+    /// `[flags, publicName]` since the public name matches the class
+    /// property name. SignalBased flag (bit 0) is always set so the
+    /// runtime knows the field is a `WritableSignal` and not a plain
+    /// assignable property.
     #[test]
     fn signal_input_emits_signal_flag() {
         let r = compile_signal_members(&[], &[input("name")], &[], &[], &[]);
         assert!(
-            r.inputs_entries[0].contains("name: [1, 'name', 'name']"),
+            r.inputs_entries[0].contains("name: [1, 'name']"),
             "got: {:?}",
             r.inputs_entries
         );
     }
 
-    /// `input(0, { transform: trim })` adds the
-    /// `HasDecoratorInputTransform` flag (bit 1) AND surfaces the
-    /// transform reference verbatim as the array's 4th element so the
-    /// runtime can call it on each value.
+    /// `input(0, { transform: trim })` keeps the transform on the
+    /// signal field — Angular's compiler does NOT replicate it into
+    /// the inputs def for signal inputs (the runtime reads
+    /// `inputSignalNode.transformFn` directly). So flags stay at
+    /// SignalBased only and the entry is the compact 2-element form.
     #[test]
-    fn signal_input_with_transform_emits_transform_flag() {
+    fn signal_input_with_transform_keeps_transform_on_signal() {
         let mut spec = input("name");
         spec.transform_source = Some("trimString".into());
         let r = compile_signal_members(&[], &[spec], &[], &[], &[]);
-        assert!(r.inputs_entries[0].contains("name: [3, 'name', 'name', trimString]"));
+        assert!(
+            r.inputs_entries[0].contains("name: [1, 'name']"),
+            "expected compact form for signal input (transform stays on signal field), got: {:?}",
+            r.inputs_entries
+        );
+        assert!(
+            !r.inputs_entries[0].contains("trimString"),
+            "transform must NOT appear in the def for signal inputs: {:?}",
+            r.inputs_entries
+        );
     }
 
     /// Aliased `input(0, { alias: 'pub' })` keeps `publicName` in
@@ -326,7 +375,10 @@ mod tests {
     }
 
     /// `model<T>()` desugars to a signal input named after the field
-    /// PLUS an output named `<name>Change`. Both entries must appear.
+    /// PLUS an output. The outputs entry is keyed by the class-property
+    /// name so the runtime can locate `instance.<field>` (the model
+    /// signal it subscribes to) — the public event name `<field>Change`
+    /// is the VALUE.
     #[test]
     fn signal_model_emits_input_and_change_output() {
         let spec = SignalModelSpec {
@@ -335,13 +387,14 @@ mod tests {
             is_required: false,
         };
         let r = compile_signal_members(&[], &[], &[], &[spec], &[]);
-        assert!(r.inputs_entries[0].contains("value: [1, 'value', 'value']"));
-        assert!(r.outputs_entries[0].contains("valueChange: 'valueChange'"));
+        assert!(r.inputs_entries[0].contains("value: [1, 'value']"));
+        assert!(r.outputs_entries[0].contains("value: 'valueChange'"));
     }
 
     /// Aliased `model({ alias: 'pub' })` emits the aliased input AND
-    /// `pubChange` (the change-event public name follows the input
-    /// alias, NOT the property name).
+    /// the change output's PUBLIC name uses the alias (`pubChange`),
+    /// while the outputs map's KEY remains the original class property
+    /// name — that's what the runtime looks up on the instance.
     #[test]
     fn signal_model_alias_propagates_to_change_event() {
         let spec = SignalModelSpec {
@@ -351,7 +404,7 @@ mod tests {
         };
         let r = compile_signal_members(&[], &[], &[], &[spec], &[]);
         assert!(r.inputs_entries[0].contains("internal: [1, 'public', 'internal']"));
-        assert!(r.outputs_entries[0].contains("publicChange: 'publicChange'"));
+        assert!(r.outputs_entries[0].contains("internal: 'publicChange'"));
     }
 
     /// Decorator-style `@Input()` entries (bare property names) flow
@@ -364,27 +417,32 @@ mod tests {
         assert!(r
             .inputs_entries
             .iter()
-            .any(|e| e.contains("signalInput: [1, 'signalInput', 'signalInput']")));
+            .any(|e| e.contains("signalInput: [1, 'signalInput']")));
+    }
+
+    fn query(name: &str, kind: SignalQueryKind, predicate: &str) -> SignalQuerySpec {
+        SignalQuerySpec {
+            property_name: name.into(),
+            kind,
+            predicate_source: predicate.into(),
+            read_source: None,
+            is_static: false,
+            descendants: None,
+        }
     }
 
     /// `viewChild('ref')` lands as a single signal-based view query.
-    /// `descendants` defaults to `true` for view queries (flag bit 0)
-    /// AND `first: true` (so bit 2 stays clear). Predicate text is
-    /// preserved verbatim because it can be either a string literal
-    /// (`['ref']`) or a class reference.
+    /// Angular's compiler ALWAYS sets the `emitDistinctChangesOnly` bit
+    /// (bit 2 = 4) for signal queries, regardless of whether the query
+    /// is single (`first: true`) or multi. With the kind's default
+    /// `descendants: true` (bit 0 = 1), flags = 5.
     #[test]
     fn signal_view_child_emits_view_query_signal() {
-        let q = SignalQuerySpec {
-            property_name: "child".into(),
-            kind: SignalQueryKind::ViewChild,
-            predicate_source: "ChildCmp".into(),
-            read_source: None,
-            is_static: false,
-        };
+        let q = query("child", SignalQueryKind::ViewChild, "ChildCmp");
         let r = compile_signal_members(&[], &[], &[], &[], &[q]);
         let vq = r.view_query_prop.as_ref().expect("expected viewQuery");
         assert!(
-            vq.contains("\u{0275}\u{0275}viewQuerySignal(ctx.child, ChildCmp, 1)"),
+            vq.contains("\u{0275}\u{0275}viewQuerySignal(ctx.child, ChildCmp, 5)"),
             "got: {vq}"
         );
         assert!(
@@ -393,47 +451,64 @@ mod tests {
         );
     }
 
-    /// `viewChildren()` (plural) sets both `descendants` (bit 0) and
-    /// `emitDistinctChangesOnly` (bit 2) for a flags integer of 5,
-    /// matching Angular's compiler emission for `QueryList`-style
-    /// multi-result queries.
+    /// `viewChildren()` shares the same flags shape as `viewChild`
+    /// because the `emitDistinctChangesOnly` bit is unconditionally set
+    /// for signal queries (the runtime distinguishes single vs. multi
+    /// by other means — what the bit really gates is QueryList semantics
+    /// that signal queries no longer use).
     #[test]
     fn signal_view_children_sets_distinct_changes_flag() {
-        let q = SignalQuerySpec {
-            property_name: "children".into(),
-            kind: SignalQueryKind::ViewChildren,
-            predicate_source: "ChildCmp".into(),
-            read_source: None,
-            is_static: false,
-        };
+        let q = query("children", SignalQueryKind::ViewChildren, "ChildCmp");
         let r = compile_signal_members(&[], &[], &[], &[], &[q]);
         let vq = r.view_query_prop.as_ref().expect("viewQuery");
         assert!(
-            vq.contains("ɵɵviewQuerySignal(ctx.children, ChildCmp, 5)")
-                || vq.contains("\u{0275}\u{0275}viewQuerySignal(ctx.children, ChildCmp, 5)")
+            vq.contains("\u{0275}\u{0275}viewQuerySignal(ctx.children, ChildCmp, 5)"),
+            "got: {vq}"
         );
     }
 
-    /// `contentChild()` defaults to `descendants: false` (bit 0 clear)
-    /// — only the direct children get matched unless the user opts
-    /// into descendants explicitly. `first: true` so distinct-changes
-    /// is also clear, leaving flags at 0.
+    /// Signal-based `contentChild()` defaults to `descendants: true`
+    /// — opposite of decorator-style `@ContentChild` which defaults to
+    /// `descendants: false`. Combined with the always-on
+    /// `emitDistinctChangesOnly` bit, flags = 5.
     #[test]
-    fn signal_content_child_defaults_no_descendants() {
-        let q = SignalQuerySpec {
-            property_name: "projected".into(),
-            kind: SignalQueryKind::ContentChild,
-            predicate_source: "SomeDir".into(),
-            read_source: None,
-            is_static: false,
-        };
+    fn signal_content_child_defaults_descendants_true() {
+        let q = query("projected", SignalQueryKind::ContentChild, "SomeDir");
         let r = compile_signal_members(&[], &[], &[], &[], &[q]);
         let cq = r.content_queries_prop.as_ref().expect("contentQueries");
         assert!(
             cq.contains(
-                "\u{0275}\u{0275}contentQuerySignal(directiveIndex, ctx.projected, SomeDir, 0)"
+                "\u{0275}\u{0275}contentQuerySignal(directiveIndex, ctx.projected, SomeDir, 5)"
             ),
-            "expected directiveIndex-leading content query call with flags=0, got: {cq}"
+            "expected contentChild defaults to descendants=true (flags=5), got: {cq}"
+        );
+    }
+
+    /// `contentChildren()` is the only signal-query factory that
+    /// defaults to `descendants: false`. Bit 0 stays clear; bit 2 is
+    /// always set → flags = 4.
+    #[test]
+    fn signal_content_children_defaults_no_descendants() {
+        let q = query("all", SignalQueryKind::ContentChildren, "SomeDir");
+        let r = compile_signal_members(&[], &[], &[], &[], &[q]);
+        let cq = r.content_queries_prop.as_ref().expect("contentQueries");
+        assert!(
+            cq.contains("\u{0275}\u{0275}contentQuerySignal(directiveIndex, ctx.all, SomeDir, 4)"),
+            "expected contentChildren defaults to descendants=false (flags=4), got: {cq}"
+        );
+    }
+
+    /// User-supplied `descendants: false` on a `viewChild` (which
+    /// defaults to `true`) must override the kind's default.
+    #[test]
+    fn signal_query_user_descendants_overrides_default() {
+        let mut q = query("child", SignalQueryKind::ViewChild, "C");
+        q.descendants = Some(false);
+        let r = compile_signal_members(&[], &[], &[], &[], &[q]);
+        let vq = r.view_query_prop.as_ref().expect("viewQuery");
+        assert!(
+            vq.contains("\u{0275}\u{0275}viewQuerySignal(ctx.child, C, 4)"),
+            "expected user-supplied descendants:false to clear bit 0, got: {vq}"
         );
     }
 
@@ -442,16 +517,11 @@ mod tests {
     /// rather than the matched directive instance.
     #[test]
     fn signal_view_child_with_read_token() {
-        let q = SignalQuerySpec {
-            property_name: "el".into(),
-            kind: SignalQueryKind::ViewChild,
-            predicate_source: "['ref']".into(),
-            read_source: Some("ElementRef".into()),
-            is_static: false,
-        };
+        let mut q = query("el", SignalQueryKind::ViewChild, "['ref']");
+        q.read_source = Some("ElementRef".into());
         let r = compile_signal_members(&[], &[], &[], &[], &[q]);
         let vq = r.view_query_prop.as_ref().expect("viewQuery");
-        assert!(vq.contains("\u{0275}\u{0275}viewQuerySignal(ctx.el, ['ref'], 1, ElementRef)"));
+        assert!(vq.contains("\u{0275}\u{0275}viewQuerySignal(ctx.el, ['ref'], 5, ElementRef)"));
     }
 
     /// Mixing view + content signal queries on the same class produces
@@ -462,20 +532,8 @@ mod tests {
     #[test]
     fn mixed_view_and_content_queries_split_into_two_props() {
         let queries = vec![
-            SignalQuerySpec {
-                property_name: "child".into(),
-                kind: SignalQueryKind::ViewChild,
-                predicate_source: "C".into(),
-                read_source: None,
-                is_static: false,
-            },
-            SignalQuerySpec {
-                property_name: "projected".into(),
-                kind: SignalQueryKind::ContentChild,
-                predicate_source: "P".into(),
-                read_source: None,
-                is_static: false,
-            },
+            query("child", SignalQueryKind::ViewChild, "C"),
+            query("projected", SignalQueryKind::ContentChild, "P"),
         ];
         let r = compile_signal_members(&[], &[], &[], &[], &queries);
         let vq = r.view_query_prop.expect("viewQuery");
@@ -484,5 +542,36 @@ mod tests {
         assert!(!vq.contains("ctx.projected"));
         assert!(cq.contains("ctx.projected"));
         assert!(!cq.contains("ctx.child"));
+    }
+
+    /// `model<T>()` desugars to a paired SignalBased input + change
+    /// event. The OUTPUTS map must be keyed by the model's class
+    /// property name (matching `instance.<field>`, where the runtime
+    /// finds the model signal to subscribe to) — keying by the public
+    /// event name (`<field>Change`) sends the runtime looking for a
+    /// non-existent `instance.<field>Change` and the two-way binding
+    /// silently drops on every emission.
+    #[test]
+    fn signal_model_outputs_keyed_by_class_property() {
+        let spec = SignalModelSpec {
+            property_name: "active".into(),
+            alias: None,
+            is_required: false,
+        };
+        let r = compile_signal_members(&[], &[], &[], &[spec], &[]);
+        assert!(
+            r.outputs_entries
+                .iter()
+                .any(|e| e == "active: 'activeChange'"),
+            "expected outputs keyed by class prop, got: {:?}",
+            r.outputs_entries
+        );
+        assert!(
+            !r.outputs_entries
+                .iter()
+                .any(|e| e.starts_with("activeChange:")),
+            "outputs map must NOT be keyed by the public event name: {:?}",
+            r.outputs_entries
+        );
     }
 }

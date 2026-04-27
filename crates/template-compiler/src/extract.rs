@@ -122,6 +122,11 @@ pub struct SignalInputSpec {
     pub is_required: bool,
     /// Raw source text of the `transform` reference, if present (e.g.
     /// `trimString` or `(v) => v.trim()`). `None` means no transform.
+    /// For signal-based inputs the runtime reads the transform off the
+    /// signal field at write time, so codegen doesn't actually splice
+    /// this into the inputs def — but we still capture it so future
+    /// passes (lints, source maps, type checking) have it available.
+    #[allow(dead_code)]
     pub transform_source: Option<String>,
 }
 
@@ -170,6 +175,12 @@ pub struct SignalQuerySpec {
     pub read_source: Option<String>,
     /// `static: true` from the options object — defaults to `false`.
     pub is_static: bool,
+    /// User-supplied `descendants` option, or `None` to use the
+    /// kind-specific default. Tracking this separately from the kind
+    /// lets `descendants: false` on a `viewChild` (which defaults to
+    /// `true`) survive into codegen instead of getting masked by the
+    /// default.
+    pub descendants: Option<bool>,
 }
 
 /// Which signal-query factory created the field.
@@ -187,6 +198,11 @@ pub enum SignalQueryKind {
 
 impl SignalQueryKind {
     /// `true` for `viewChild` / `contentChild` (single) variants.
+    /// Currently unused in codegen (the always-on
+    /// `emitDistinctChangesOnly` flag for signal queries means we don't
+    /// branch on first/multi for signal queries), but kept for parity
+    /// with linker-side query handling and as a future-proofing hook.
+    #[allow(dead_code)]
     pub fn is_first(self) -> bool {
         matches!(self, Self::ViewChild | Self::ContentChild)
     }
@@ -197,11 +213,13 @@ impl SignalQueryKind {
         matches!(self, Self::ViewChild | Self::ViewChildren)
     }
 
-    /// Default `descendants` flag for the kind. View queries always walk
-    /// descendants; content queries default to direct-children only
-    /// unless the user passes `descendants: true` in options.
+    /// Default `descendants` flag for the kind, matching Angular's
+    /// signal-query compiler defaults. **Only `contentChildren` defaults
+    /// to `false`** — `viewChild` / `viewChildren` / `contentChild`
+    /// all default to `true`. (Note: this differs from decorator-style
+    /// `@ContentChild`, which defaults to `descendants: false`.)
     pub fn default_descendants(self) -> bool {
-        self.is_view()
+        !matches!(self, Self::ContentChildren)
     }
 }
 
@@ -1133,30 +1151,29 @@ pub(crate) fn extract_signal_members(
         match factory {
             SignalFactory::Input { required } => {
                 let opts_idx = if required { 0 } else { 1 };
-                let (alias, transform_source, _read, _is_static) =
-                    parse_signal_options(source, call, opts_idx);
+                let opts = parse_signal_options(source, call, opts_idx);
                 out.inputs.push(SignalInputSpec {
                     property_name,
-                    alias,
+                    alias: opts.alias,
                     is_required: required,
-                    transform_source,
+                    transform_source: opts.transform,
                 });
             }
             SignalFactory::Output => {
                 // `output()` / `output<T>()` only accepts an optional
                 // options object as its first arg (no positional default).
-                let (alias, _, _, _) = parse_signal_options(source, call, 0);
+                let opts = parse_signal_options(source, call, 0);
                 out.outputs.push(SignalOutputSpec {
                     property_name,
-                    alias,
+                    alias: opts.alias,
                 });
             }
             SignalFactory::Model { required } => {
                 let opts_idx = if required { 0 } else { 1 };
-                let (alias, _, _, _) = parse_signal_options(source, call, opts_idx);
+                let opts = parse_signal_options(source, call, opts_idx);
                 out.models.push(SignalModelSpec {
                     property_name,
-                    alias,
+                    alias: opts.alias,
                     is_required: required,
                 });
             }
@@ -1178,13 +1195,14 @@ pub(crate) fn extract_signal_members(
                         }
                     })
                     .unwrap_or_else(|| "null".to_string());
-                let (_, _, read_source, is_static) = parse_signal_options(source, call, 1);
+                let opts = parse_signal_options(source, call, 1);
                 out.queries.push(SignalQuerySpec {
                     property_name,
                     kind,
                     predicate_source,
-                    read_source,
-                    is_static,
+                    read_source: opts.read,
+                    is_static: opts.is_static,
+                    descendants: opts.descendants,
                 });
             }
         }
@@ -1254,25 +1272,37 @@ fn name_to_factory(name: &str, dotted: bool) -> Option<SignalFactory> {
     }
 }
 
-/// Pull `alias`, `transform`, `read`, `static` out of an options object
-/// argument at the given positional index, if it's an object literal.
-/// Returns (alias, transform_source, read_source, is_static).
+/// Options pulled from the second argument of a signal-API factory
+/// call (`input(default, { ... })`, `viewChild(predicate, { ... })`).
+/// Each field is `None` when absent from the options object so callers
+/// can distinguish "user wrote `false`" from "user didn't write
+/// anything" — that distinction matters for `descendants`, which has
+/// kind-specific defaults that should only kick in when omitted.
+#[derive(Debug, Default)]
+struct SignalOptions {
+    alias: Option<String>,
+    transform: Option<String>,
+    read: Option<String>,
+    is_static: bool,
+    descendants: Option<bool>,
+}
+
+/// Pull `alias`, `transform`, `read`, `static`, `descendants` out of an
+/// options object argument at the given positional index, if it's an
+/// object literal. Missing or non-object args produce defaults.
 fn parse_signal_options(
     source: &str,
     call: &oxc_ast::ast::CallExpression<'_>,
     idx: usize,
-) -> (Option<String>, Option<String>, Option<String>, bool) {
+) -> SignalOptions {
+    let mut out = SignalOptions::default();
+
     let Some(arg) = call.arguments.get(idx) else {
-        return (None, None, None, false);
+        return out;
     };
     let Argument::ObjectExpression(opts) = arg else {
-        return (None, None, None, false);
+        return out;
     };
-
-    let mut alias = None;
-    let mut transform = None;
-    let mut read = None;
-    let mut is_static = false;
 
     for prop in &opts.properties {
         let ObjectPropertyKind::ObjectProperty(prop) = prop else {
@@ -1286,27 +1316,32 @@ fn parse_signal_options(
         match key {
             "alias" => {
                 if let Expression::StringLiteral(s) = &prop.value {
-                    alias = Some(s.value.to_string());
+                    out.alias = Some(s.value.to_string());
                 }
             }
             "transform" => {
                 let span = prop.value.span();
-                transform = Some(source[span.start as usize..span.end as usize].to_string());
+                out.transform = Some(source[span.start as usize..span.end as usize].to_string());
             }
             "read" => {
                 let span = prop.value.span();
-                read = Some(source[span.start as usize..span.end as usize].to_string());
+                out.read = Some(source[span.start as usize..span.end as usize].to_string());
             }
             "static" => {
                 if let Expression::BooleanLiteral(b) = &prop.value {
-                    is_static = b.value;
+                    out.is_static = b.value;
+                }
+            }
+            "descendants" => {
+                if let Expression::BooleanLiteral(b) = &prop.value {
+                    out.descendants = Some(b.value);
                 }
             }
             _ => {}
         }
     }
 
-    (alias, transform, read, is_static)
+    out
 }
 
 /// Extract constructor parameters from a class body for DI-aware factory generation.
