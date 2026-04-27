@@ -44,7 +44,7 @@ function trimString(v: string): string {
 @Component({
   selector: 'app-x',
   standalone: true,
-  template: '<span>x</span><ng-content />',
+  template: '<span [(value)]="value">x</span><ng-content />',
 })
 export class XComponent {
   // Signal inputs — plain, required, aliased, transformed.
@@ -194,6 +194,25 @@ fn signal_apis_reach_runtime_with_correct_shape() {
         "expected ngContentSelectors on the component def, got:\n{out}"
     );
 
+    // Two-way binding `[(value)]="value"` to a model signal MUST
+    // dispatch to the signal-aware `ɵɵtwoWayProperty` /
+    // `ɵɵtwoWayListener` instructions plus `ɵɵtwoWayBindingSet` —
+    // emitting plain `ɵɵproperty` + assignment would replace the
+    // model signal with a raw value on every emission, and the next
+    // template `value()` read throws "is not a function".
+    assert!(
+        out.contains("\u{0275}\u{0275}twoWayProperty('value'"),
+        "expected ɵɵtwoWayProperty for two-way binding, got:\n{out}"
+    );
+    assert!(
+        out.contains("\u{0275}\u{0275}twoWayListener('valueChange'"),
+        "expected ɵɵtwoWayListener for two-way binding, got:\n{out}"
+    );
+    assert!(
+        out.contains("\u{0275}\u{0275}twoWayBindingSet(ctx.value, $event)"),
+        "expected ɵɵtwoWayBindingSet inside listener body, got:\n{out}"
+    );
+
     // Symbols must be added to the @angular/core import set so the
     // bundler can resolve them and the runtime calls dispatch.
     for symbol in [
@@ -201,6 +220,9 @@ fn signal_apis_reach_runtime_with_correct_shape() {
         "\u{0275}\u{0275}contentQuerySignal",
         "\u{0275}\u{0275}queryAdvance",
         "\u{0275}\u{0275}projectionDef",
+        "\u{0275}\u{0275}twoWayProperty",
+        "\u{0275}\u{0275}twoWayListener",
+        "\u{0275}\u{0275}twoWayBindingSet",
     ] {
         assert!(
             out.contains(symbol),

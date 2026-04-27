@@ -742,13 +742,28 @@ impl IvyCodegen {
                         }
                     }
                     TemplateAttribute::TwoWayBinding { name, expression } => {
+                        // Two-way listener `(xChange)="expr = $event"`
+                        // for signal-aware bindings: the runtime helper
+                        // `ɵɵtwoWayBindingSet(target, value)` calls
+                        // `.set(value)` on a `WritableSignal` and
+                        // returns `true`; for non-signals it returns
+                        // `false`, so the `||` falls through to a
+                        // plain assignment. Writing `target = $event`
+                        // unconditionally would replace the signal
+                        // FIELD on the parent (turning
+                        // `parentActive: WritableSignal<boolean>` into
+                        // `parentActive: boolean`), and the very next
+                        // `parentActive()` template read would throw
+                        // "is not a function".
                         self.ivy_imports
-                            .insert("\u{0275}\u{0275}listener".to_string());
+                            .insert("\u{0275}\u{0275}twoWayListener".to_string());
+                        self.ivy_imports
+                            .insert("\u{0275}\u{0275}twoWayBindingSet".to_string());
                         let depth = self.scope_depth();
-                        // Template refs stay as bare identifiers; they resolve
-                        // via the `const <name> = ɵɵreference(<slot>);` prelude
-                        // at the top of the update block / listener body.
                         let compiled_target = ctx_expr_with_locals(expression, &self.local_vars);
+                        let body = format!(
+                            "\u{0275}\u{0275}twoWayBindingSet({compiled_target}, $event) || ({compiled_target} = $event); return $event;"
+                        );
                         if depth > 0 {
                             self.ivy_imports
                                 .insert("\u{0275}\u{0275}restoreView".to_string());
@@ -756,12 +771,12 @@ impl IvyCodegen {
                                 .insert("\u{0275}\u{0275}nextContext".to_string());
                             let listener_preamble = self.generate_listener_preamble();
                             self.creation.push(format!(
-                                "\u{0275}\u{0275}listener('{}Change', function($event) {{ {listener_preamble}return {compiled_target} = $event; }});",
+                                "\u{0275}\u{0275}twoWayListener('{}Change', function($event) {{ {listener_preamble}{body} }});",
                                 name,
                             ));
                         } else {
                             self.creation.push(format!(
-                                "\u{0275}\u{0275}listener('{}Change', function($event) {{ return {compiled_target} = $event; }});",
+                                "\u{0275}\u{0275}twoWayListener('{}Change', function($event) {{ {body} }});",
                                 name,
                             ));
                         }
@@ -2360,11 +2375,24 @@ impl IvyCodegen {
                     }
                 }
                 TemplateAttribute::TwoWayBinding { name, expression } => {
+                    // Two-way binding `[(x)]="expr"` must dispatch to
+                    // the signal-aware `ɵɵtwoWayProperty` instead of
+                    // `ɵɵproperty`. When `expr` is a `WritableSignal`,
+                    // `ɵɵtwoWayProperty` unwraps it (calls the signal
+                    // to read the value); for plain values it behaves
+                    // like `ɵɵproperty`. Emitting `ɵɵproperty(name,
+                    // signalRef)` would pass the signal OBJECT into
+                    // the child input, so the child sees the wrapper
+                    // rather than the value and template reads
+                    // (`signal()`) on the parent later see whatever
+                    // the listener wrote (likely a non-callable).
                     self.ivy_imports
-                        .insert("\u{0275}\u{0275}property".to_string());
+                        .insert("\u{0275}\u{0275}twoWayProperty".to_string());
                     let compiled = self.compile_binding_expr(expression);
-                    self.update
-                        .push(format!("\u{0275}\u{0275}property('{}', {compiled});", name,));
+                    self.update.push(format!(
+                        "\u{0275}\u{0275}twoWayProperty('{}', {compiled});",
+                        name,
+                    ));
                     self.var_count += 1;
                 }
                 TemplateAttribute::ClassBinding {
