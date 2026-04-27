@@ -72,6 +72,11 @@ struct IvyCodegen {
     /// Maps `#refName` → LView slot that stores the resolved ref value.
     /// Binding expressions reading these names are rewritten to `ɵɵreference(slot)`.
     template_refs: BTreeMap<String, u32>,
+    /// Companion to `template_refs`: maps `#refName` → slot of the *element*
+    /// the ref was declared on. `@defer` triggers like `on hover(ref)` need
+    /// the underlying element's slot (the runtime resolves the TNode there),
+    /// not the ref-value slot consumed by `ɵɵreference`.
+    template_ref_elements: BTreeMap<String, u32>,
     /// Namespace most recently emitted in the current template function's
     /// creation block. Compared against each element's target namespace to
     /// decide whether a ɵɵnamespaceHTML/SVG/MathML transition is needed.
@@ -102,6 +107,11 @@ struct ChildTemplate {
     decls: u32,
     vars: u32,
     code: String,
+    /// Template-reference *element* slots declared inside this child
+    /// template. Maps `#refName` → slot of the element the ref was declared
+    /// on (NOT the ref-value slot). `@defer` triggers like `on hover(ref)`
+    /// look this up in their placeholder block to anchor on the right TNode.
+    template_ref_elements: BTreeMap<String, u32>,
 }
 
 /// Generate Ivy instructions from a parsed template AST and component metadata.
@@ -125,6 +135,7 @@ pub fn generate_ivy(
         last_update_slot: None,
         pipe_var_offset: 0,
         template_refs: BTreeMap::new(),
+        template_ref_elements: BTreeMap::new(),
         namespace_state: Namespace::Html,
         namespace_stack: vec![Namespace::Html],
         has_projection: false,
@@ -673,7 +684,7 @@ impl IvyCodegen {
 
             // Allocate ref slots BEFORE emitting bindings so that expressions
             // using the ref name can resolve to the correct ɵɵreference(slot).
-            self.reserve_template_refs(&refs);
+            self.reserve_template_refs(&refs, slot);
 
             self.emit_i18n_attributes(el, slot);
 
@@ -723,7 +734,7 @@ impl IvyCodegen {
 
             // Allocate ref slots BEFORE listeners, bindings, or children.
             // Listener bodies and descendant bindings may reference these names.
-            self.reserve_template_refs(&refs);
+            self.reserve_template_refs(&refs, slot);
 
             // Event listeners and two-way binding listeners in creation block
             for attr in &el.attributes {
@@ -958,8 +969,11 @@ impl IvyCodegen {
 
     /// Reserve a slot for each template reference on the current element and
     /// register the ref in `template_refs` + `local_vars` so binding
-    /// expressions can resolve it.
-    fn reserve_template_refs(&mut self, refs: &[(String, String)]) {
+    /// expressions can resolve it. `element_slot` is the slot of the element
+    /// the refs are declared on; it is recorded in `template_ref_elements`
+    /// for `@defer` triggers that anchor on the element itself rather than
+    /// the ref-value slot.
+    fn reserve_template_refs(&mut self, refs: &[(String, String)], element_slot: u32) {
         if refs.is_empty() {
             return;
         }
@@ -969,6 +983,8 @@ impl IvyCodegen {
             let ref_slot = self.slot_index;
             self.slot_index += 1;
             self.template_refs.insert(name.clone(), ref_slot);
+            self.template_ref_elements
+                .insert(name.clone(), element_slot);
             self.local_vars.insert(name.clone());
         }
     }
@@ -1093,6 +1109,7 @@ impl IvyCodegen {
         let parent_consts = std::mem::take(&mut self.consts);
         let parent_lets = self.let_declarations.clone();
         let parent_refs = std::mem::take(&mut self.template_refs);
+        let parent_ref_elements = std::mem::take(&mut self.template_ref_elements);
         // Each child template function runs with its own namespace flag that
         // starts as HTML, so reset the tracked state. The stack is left
         // intact — its top is the outer child_ns and remains the correct
@@ -1153,6 +1170,8 @@ impl IvyCodegen {
         self.consts = parent_consts;
         self.let_declarations = parent_lets;
         self.template_refs = parent_refs;
+        let child_ref_elements =
+            std::mem::replace(&mut self.template_ref_elements, parent_ref_elements);
         self.namespace_state = parent_ns_state;
 
         ChildTemplate {
@@ -1160,6 +1179,7 @@ impl IvyCodegen {
             decls,
             vars,
             code,
+            template_ref_elements: child_ref_elements,
         }
     }
 
@@ -1532,6 +1552,7 @@ impl IvyCodegen {
         let parent_update = std::mem::take(&mut self.update);
         let parent_lets = self.let_declarations.clone();
         let parent_refs = std::mem::take(&mut self.template_refs);
+        let parent_ref_elements = std::mem::take(&mut self.template_ref_elements);
         self.scope_stack.push(ScopeEntry::Conditional);
         // Reset namespace_state for this child template function (its runtime
         // namespace flag starts as HTML). The stack is left intact so nested
@@ -1618,6 +1639,8 @@ impl IvyCodegen {
         self.update = parent_update;
         self.let_declarations = parent_lets;
         self.template_refs = parent_refs;
+        let child_ref_elements =
+            std::mem::replace(&mut self.template_ref_elements, parent_ref_elements);
         self.namespace_state = parent_ns_state;
 
         ChildTemplate {
@@ -1625,6 +1648,7 @@ impl IvyCodegen {
             decls,
             vars,
             code,
+            template_ref_elements: child_ref_elements,
         }
     }
 
@@ -1643,6 +1667,7 @@ impl IvyCodegen {
         let parent_update = std::mem::take(&mut self.update);
         let parent_lets = self.let_declarations.clone();
         let parent_refs = std::mem::take(&mut self.template_refs);
+        let parent_ref_elements = std::mem::take(&mut self.template_ref_elements);
 
         self.slot_index = 0;
         self.var_count = 0;
@@ -1766,6 +1791,8 @@ impl IvyCodegen {
         self.let_declarations = parent_lets;
         self.local_vars = parent_locals;
         self.template_refs = parent_refs;
+        let child_ref_elements =
+            std::mem::replace(&mut self.template_ref_elements, parent_ref_elements);
         self.namespace_state = parent_ns_state;
 
         ChildTemplate {
@@ -1773,6 +1800,7 @@ impl IvyCodegen {
             decls,
             vars,
             code,
+            template_ref_elements: child_ref_elements,
         }
     }
 
@@ -1826,8 +1854,8 @@ impl IvyCodegen {
     /// Generate an `@defer` block with its `@placeholder` / `@loading` /
     /// `@error` sub-blocks and trigger instructions.
     ///
-    /// Emits per the issue spec:
-    /// `ɵɵdefer(index, dependencyFn, loadingTmpl?, placeholderTmpl?, errorTmpl?)`
+    /// Emits Angular Ivy's v21 `ɵɵdefer` signature:
+    /// `ɵɵdefer(index, primaryTmplIndex, depsFn, loadingTmpl?, placeholderTmpl?, errorTmpl?)`
     /// followed by the trigger instructions:
     /// - `on viewport|idle|hover|interaction|immediate` → `ɵɵdeferOn*`
     /// - `on timer(<duration>)` → `ɵɵdeferOnTimer(<ms>)`
@@ -1913,6 +1941,7 @@ impl IvyCodegen {
             decls: 0,
             vars: 0,
             code: deps_fn_code,
+            template_ref_elements: BTreeMap::new(),
         });
 
         // Emit ɵɵtemplate(slot, fn, decls, vars) for each template.
@@ -1941,8 +1970,10 @@ impl IvyCodegen {
             ));
         }
 
-        // Build the ɵɵdefer call, following the issue's signature:
-        //   ɵɵdefer(index, dependencyFn, loadingTmpl?, placeholderTmpl?, errorTmpl?)
+        // Build the ɵɵdefer call. Ivy's signature in v21:
+        //   ɵɵdefer(index, primaryTmplIndex, depsFn,
+        //           loadingTmplIndex?, placeholderTmplIndex?, errorTmplIndex?)
+        // Trailing nulls are omitted to match ng build's emit.
         let loading_arg = loading_info
             .as_ref()
             .map(|(s, _, _)| s.to_string())
@@ -1955,9 +1986,27 @@ impl IvyCodegen {
             .as_ref()
             .map(|(s, _, _)| s.to_string())
             .unwrap_or_else(|| "null".to_string());
+        let mut defer_args = vec![format!("{main_slot}"), deps_fn_name.clone()];
+        let trailing = [loading_arg, placeholder_arg, error_arg];
+        let last_present = trailing.iter().rposition(|s| s != "null");
+        if let Some(idx) = last_present {
+            for arg in trailing.iter().take(idx + 1) {
+                defer_args.push(arg.clone());
+            }
+        }
         self.creation.push(format!(
-            "\u{0275}\u{0275}defer({defer_slot}, {deps_fn_name}, {loading_arg}, {placeholder_arg}, {error_arg});"
+            "\u{0275}\u{0275}defer({defer_slot}, {});",
+            defer_args.join(", ")
         ));
+
+        // Resolve trigger element refs against the placeholder block's
+        // template references. For implicit anchors (no `(ref)`), Angular
+        // uses the placeholder template's first element (slot 0). The map
+        // values are *element* slots, not ref-value slots — defer triggers
+        // anchor on the underlying TNode, not the resolved ref value.
+        let placeholder_refs = placeholder_info
+            .as_ref()
+            .map(|(_, _, child)| child.template_ref_elements.clone());
 
         // Move the child templates for placeholder/loading/error into the
         // component's child_templates vec. They were produced inside each
@@ -1974,26 +2023,40 @@ impl IvyCodegen {
 
         // Trigger instructions — emit for each trigger, prefetch variants last.
         for trig in &block.triggers {
-            self.emit_defer_trigger(trig, defer_slot, false);
+            self.emit_defer_trigger(trig, defer_slot, false, placeholder_refs.as_ref());
         }
         for trig in &block.prefetch_triggers {
-            self.emit_defer_trigger(trig, defer_slot, true);
+            self.emit_defer_trigger(trig, defer_slot, true, placeholder_refs.as_ref());
         }
     }
 
     /// Emit a single trigger instruction for an `@defer` block. `on`-family
     /// triggers land in the creation block; `when` triggers land in the update
     /// block with an `ɵɵadvance` to the defer slot.
-    fn emit_defer_trigger(&mut self, trig: &DeferTrigger, defer_slot: u32, prefetch: bool) {
+    ///
+    /// For viewport / hover / interaction triggers, the trigger element's slot
+    /// index inside the placeholder block is passed as the first argument
+    /// followed by `walkUpTimes = -1` (the runtime sentinel meaning "look up
+    /// in the placeholder embedded view"). With an explicit `(ref)`, the slot
+    /// is the ref's recorded slot in the placeholder template; without one,
+    /// it defaults to the placeholder's first element (slot 0).
+    fn emit_defer_trigger(
+        &mut self,
+        trig: &DeferTrigger,
+        defer_slot: u32,
+        prefetch: bool,
+        placeholder_refs: Option<&BTreeMap<String, u32>>,
+    ) {
         match trig {
-            DeferTrigger::Viewport(_) => {
+            DeferTrigger::Viewport(ref_name) => {
                 let sym = if prefetch {
                     "\u{0275}\u{0275}deferPrefetchOnViewport"
                 } else {
                     "\u{0275}\u{0275}deferOnViewport"
                 };
                 self.ivy_imports.insert(sym.to_string());
-                self.creation.push(format!("{sym}();"));
+                let args = trigger_element_args(ref_name.as_deref(), placeholder_refs);
+                self.creation.push(format!("{sym}({args});"));
             }
             DeferTrigger::Idle => {
                 let sym = if prefetch {
@@ -2013,23 +2076,25 @@ impl IvyCodegen {
                 self.ivy_imports.insert(sym.to_string());
                 self.creation.push(format!("{sym}();"));
             }
-            DeferTrigger::Hover(_) => {
+            DeferTrigger::Hover(ref_name) => {
                 let sym = if prefetch {
                     "\u{0275}\u{0275}deferPrefetchOnHover"
                 } else {
                     "\u{0275}\u{0275}deferOnHover"
                 };
                 self.ivy_imports.insert(sym.to_string());
-                self.creation.push(format!("{sym}();"));
+                let args = trigger_element_args(ref_name.as_deref(), placeholder_refs);
+                self.creation.push(format!("{sym}({args});"));
             }
-            DeferTrigger::Interaction(_) => {
+            DeferTrigger::Interaction(ref_name) => {
                 let sym = if prefetch {
                     "\u{0275}\u{0275}deferPrefetchOnInteraction"
                 } else {
                     "\u{0275}\u{0275}deferOnInteraction"
                 };
                 self.ivy_imports.insert(sym.to_string());
-                self.creation.push(format!("{sym}();"));
+                let args = trigger_element_args(ref_name.as_deref(), placeholder_refs);
+                self.creation.push(format!("{sym}({args});"));
             }
             DeferTrigger::Timer(duration) => {
                 let sym = if prefetch {
@@ -3626,6 +3691,32 @@ fn kebab_to_pascal(tag: &str) -> String {
 /// Accepts `<number>ms` or `<number>s`; a bare number is treated as ms.
 /// Unknown suffixes fall back to the raw string as the argument (so the
 /// runtime or a later lint can flag it).
+/// Build the `(triggerIndex, walkUpTimes)` argument list for a viewport /
+/// hover / interaction defer trigger. Returns the slot index of the trigger
+/// element inside the placeholder block paired with `-1`, the runtime
+/// sentinel that tells `ɵɵdeferOn*` to resolve the index in the placeholder
+/// embedded view rather than walking up parent LViews.
+///
+/// With an explicit `(ref)`, the slot is the ref's recorded position; with
+/// an implicit anchor, it falls back to the placeholder's first element
+/// (slot 0). When there is no placeholder block at all (an unanchored
+/// viewport trigger) the runtime accepts no arguments and falls back to the
+/// LContainer comment node, so the call is emitted bare.
+fn trigger_element_args(
+    ref_name: Option<&str>,
+    placeholder_refs: Option<&BTreeMap<String, u32>>,
+) -> String {
+    match (ref_name, placeholder_refs) {
+        (Some(name), Some(refs)) => {
+            let slot = refs.get(name).copied().unwrap_or(0);
+            format!("{slot}, -1")
+        }
+        (None, Some(_)) => "0, -1".to_string(),
+        // No placeholder block: runtime resolves against the LContainer host.
+        _ => String::new(),
+    }
+}
+
 fn parse_duration_to_ms(duration: &str) -> String {
     let trimmed = duration.trim();
     if let Some(prefix) = trimmed.strip_suffix("ms") {
@@ -4547,6 +4638,135 @@ mod tests {
         assert!(
             deps_fn.contains("return [];"),
             "dep fn with no custom tags should return []: {deps_fn}"
+        );
+    }
+
+    #[test]
+    fn test_defer_emits_primary_template_index_in_second_position() {
+        // Issue #90 defect 1: ɵɵdefer was missing the primary-template index,
+        // causing the runtime to misread the deps fn as a TView descriptor.
+        let output = compile_template("@defer (on immediate) { <my-c /> }");
+        let dc = &output.static_fields[0];
+        // defer block at slot 0; main (primary) template at slot 1.
+        assert!(
+            dc.contains("\u{0275}\u{0275}defer(0, 1, "),
+            "ɵɵdefer should emit (slot, primaryIdx, depsFn, …): {dc}"
+        );
+        assert!(
+            dc.contains("\u{0275}\u{0275}deferOnImmediate();"),
+            "deferOnImmediate is element-free and takes no args: {dc}"
+        );
+    }
+
+    #[test]
+    fn test_defer_immediate_omits_trailing_null_subblock_args() {
+        // Without sub-blocks, ng build emits ɵɵdefer(slot, primary, deps) —
+        // trailing nulls for loading/placeholder/error are trimmed.
+        let output = compile_template("@defer (on immediate) { <my-c /> }");
+        let dc = &output.static_fields[0];
+        assert!(
+            dc.contains("\u{0275}\u{0275}defer(0, 1, TestComponent_Defer_1_DepsFn);"),
+            "no sub-blocks → no trailing nulls: {dc}"
+        );
+    }
+
+    #[test]
+    fn test_defer_with_sub_blocks_emits_slot_indices_in_load_placeholder_error_order() {
+        let output = compile_template(
+            "@defer (on idle) { <my-c /> } @placeholder { <p>wait</p> } @loading { <p>load</p> } @error { <p>err</p> }",
+        );
+        let dc = &output.static_fields[0];
+        // Slot layout: defer=0, primary=1, placeholder=2, loading=3, error=4.
+        // Args after the deps fn are loading, placeholder, error.
+        assert!(
+            dc.contains("\u{0275}\u{0275}defer(0, 1, TestComponent_Defer_4_DepsFn, 3, 2, 4);"),
+            "expected (slot, primary, deps, loading, placeholder, error): {dc}"
+        );
+    }
+
+    #[test]
+    fn test_defer_on_viewport_with_placeholder_passes_first_element_slot() {
+        // Issue #90 defect 2: ɵɵdeferOnViewport must receive the trigger
+        // element slot (placeholder's first element by default) plus the
+        // walkUpTimes=-1 sentinel so the runtime resolves it in the
+        // placeholder embedded view.
+        let output =
+            compile_template("@defer (on viewport) { <my-c /> } @placeholder { <p>scroll…</p> }");
+        let dc = &output.static_fields[0];
+        assert!(
+            dc.contains("\u{0275}\u{0275}deferOnViewport(0, -1);"),
+            "viewport with placeholder should anchor on placeholder's first element: {dc}"
+        );
+    }
+
+    #[test]
+    fn test_defer_on_viewport_without_placeholder_emits_bare_call() {
+        // No placeholder → no embedded view to read; runtime falls back to
+        // the LContainer comment node, mirroring ng build.
+        let output = compile_template("@defer (on viewport) { <my-c /> }");
+        let dc = &output.static_fields[0];
+        assert!(
+            dc.contains("\u{0275}\u{0275}deferOnViewport();"),
+            "viewport without placeholder should emit bare call: {dc}"
+        );
+    }
+
+    #[test]
+    fn test_defer_on_hover_with_ref_resolves_placeholder_ref_slot() {
+        let output = compile_template(
+            "@defer (on hover(trigger)) { <my-c /> } @placeholder { <p #trigger>hover me</p> }",
+        );
+        let dc = &output.static_fields[0];
+        // The <p #trigger> sits at slot 0 of the placeholder template;
+        // walkUpTimes=-1 directs the runtime into that embedded view.
+        assert!(
+            dc.contains("\u{0275}\u{0275}deferOnHover(0, -1);"),
+            "hover(ref) should resolve to placeholder ref's slot: {dc}"
+        );
+    }
+
+    #[test]
+    fn test_defer_on_interaction_with_ref_resolves_placeholder_ref_slot() {
+        let output = compile_template(
+            "@defer (on interaction(clicker)) { <my-c /> } @placeholder { <button #clicker>click</button> }",
+        );
+        let dc = &output.static_fields[0];
+        assert!(
+            dc.contains("\u{0275}\u{0275}deferOnInteraction(0, -1);"),
+            "interaction(ref) should resolve to placeholder ref's slot: {dc}"
+        );
+    }
+
+    #[test]
+    fn test_defer_prefetch_on_hover_with_ref_resolves_slot() {
+        // Prefetch variants resolve refs the same way as their runtime peers.
+        let output = compile_template(
+            "@defer (on idle; prefetch on hover(trigger)) { <my-c /> } @placeholder { <p #trigger>hover</p> }",
+        );
+        let dc = &output.static_fields[0];
+        assert!(
+            dc.contains("\u{0275}\u{0275}deferPrefetchOnHover(0, -1);"),
+            "prefetch on hover(ref) should pass placeholder ref slot: {dc}"
+        );
+        assert!(
+            dc.contains("\u{0275}\u{0275}deferOnIdle();"),
+            "non-element runtime trigger remains arg-free: {dc}"
+        );
+    }
+
+    #[test]
+    fn test_defer_when_expr_unchanged_by_primary_index_fix() {
+        // Sanity: `when` triggers still emit in the update block, untouched
+        // by the create-block primary-index change.
+        let output = compile_template("@defer (when isReady) { <my-c /> }");
+        let dc = &output.static_fields[0];
+        assert!(
+            dc.contains("\u{0275}\u{0275}defer(0, 1, "),
+            "defer call carries primary-index even with `when`: {dc}"
+        );
+        assert!(
+            dc.contains("\u{0275}\u{0275}deferWhen(ctx.isReady);"),
+            "deferWhen still routed to update block: {dc}"
         );
     }
 
