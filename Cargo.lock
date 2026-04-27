@@ -676,6 +676,7 @@ dependencies = [
  "ngc-template-compiler",
  "ngc-ts-transform",
  "oxc_sourcemap",
+ "petgraph",
  "regex",
  "serde",
  "serde_json",

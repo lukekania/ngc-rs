@@ -14,6 +14,7 @@ use ngc_template_compiler::{StyleContext, StyleLanguage};
 
 mod localize;
 mod ngsw;
+mod polyfills;
 
 /// Result of the bundled build pipeline.
 #[derive(serde::Serialize)]
@@ -558,11 +559,22 @@ fn run_build(
         output_files.push(path);
     }
 
-    // Step 8: Generate polyfills.js
+    // Step 8: Generate polyfills.js — resolve each entry through the npm
+    // resolver (bare specifier) or `ts-transform` (relative .ts), build a
+    // synthetic side-effect entry, and run it through the bundler so the
+    // output ships resolved code rather than bare ES module specifiers.
+    let mut polyfills_filename: Option<String> = None;
     if let Some(ref ap) = angular_project {
         if !ap.polyfills.is_empty() {
-            let path = generate_polyfills(&ap.polyfills, &out_dir)?;
-            output_files.push(path);
+            let bundle = polyfills::generate_polyfills(
+                &ap.polyfills,
+                &out_dir,
+                &config_dir,
+                bundle_options,
+                configuration,
+            )?;
+            polyfills_filename = Some(bundle.filename);
+            output_files.extend(bundle.output_files);
         }
     }
 
@@ -597,7 +609,7 @@ fn run_build(
                 index_path,
                 &ap.index_output,
                 !ap.styles.is_empty(),
-                !ap.polyfills.is_empty(),
+                polyfills_filename.as_deref(),
                 &out_dir,
                 &bundle_output.main_filename,
                 &index_opts,
@@ -1005,20 +1017,6 @@ fn apply_file_replacements(
         .collect()
 }
 
-/// Generate dist/polyfills.js with import statements for each polyfill entry.
-fn generate_polyfills(polyfills: &[String], out_dir: &Path) -> NgcResult<PathBuf> {
-    let content: String = polyfills
-        .iter()
-        .map(|p| format!("import '{p}';\n"))
-        .collect();
-    let path = out_dir.join("polyfills.js");
-    std::fs::write(&path, &content).map_err(|e| NgcError::Io {
-        path: path.clone(),
-        source: e,
-    })?;
-    Ok(path)
-}
-
 /// Read and concatenate global style files, writing dist/styles.css.
 ///
 /// Accepts `.css`, `.scss`, `.sass`, `.less`, and `.styl`/`.stylus` files.
@@ -1345,7 +1343,7 @@ fn generate_index_html(
     index_source: &Path,
     output_filename: &str,
     has_styles: bool,
-    has_polyfills: bool,
+    polyfills_filename: Option<&str>,
     out_dir: &Path,
     main_filename: &str,
     options: &IndexHtmlOptions,
@@ -1387,10 +1385,10 @@ fn generate_index_html(
 
     // Inject script tags before </body>
     let mut scripts = String::new();
-    if has_polyfills {
-        let src = format!("{deploy_url}polyfills.js");
+    if let Some(polyfills) = polyfills_filename {
+        let src = format!("{deploy_url}{polyfills}");
         let integrity = if options.subresource_integrity {
-            Some(compute_sri_hash(&out_dir.join("polyfills.js"))?)
+            Some(compute_sri_hash(&out_dir.join(polyfills))?)
         } else {
             None
         };
@@ -1920,26 +1918,6 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_polyfills_content() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let path = generate_polyfills(&["zone.js".to_string()], dir.path()).unwrap();
-        let content = std::fs::read_to_string(path).unwrap();
-        assert_eq!(content, "import 'zone.js';\n");
-    }
-
-    #[test]
-    fn test_generate_polyfills_multiple() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let path = generate_polyfills(
-            &["zone.js".to_string(), "zone.js/testing".to_string()],
-            dir.path(),
-        )
-        .unwrap();
-        let content = std::fs::read_to_string(path).unwrap();
-        assert_eq!(content, "import 'zone.js';\nimport 'zone.js/testing';\n");
-    }
-
-    #[test]
     fn test_index_html_injection() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let index_src = dir.path().join("index.html");
@@ -1955,7 +1933,7 @@ mod tests {
             &index_src,
             "index.html",
             true,
-            true,
+            Some("polyfills.js"),
             dir.path(),
             "main.js",
             &IndexHtmlOptions::default(),
@@ -1977,7 +1955,7 @@ mod tests {
             &index_src,
             "index.html",
             false,
-            false,
+            None,
             dir.path(),
             "main.js",
             &IndexHtmlOptions::default(),
@@ -2016,7 +1994,7 @@ mod tests {
             &index_src,
             "index.html",
             true,
-            true,
+            Some("polyfills.js"),
             dir.path(),
             "main.js",
             &opts,
@@ -2044,7 +2022,7 @@ mod tests {
             &index_src,
             "index.html",
             false,
-            false,
+            None,
             dir.path(),
             "main.js",
             &opts,
@@ -2067,7 +2045,7 @@ mod tests {
             &index_src,
             "index.html",
             true,
-            true,
+            Some("polyfills.js"),
             dir.path(),
             "main.js",
             &opts,
@@ -2090,7 +2068,7 @@ mod tests {
             &index_src,
             "index.html",
             true,
-            true,
+            Some("polyfills.js"),
             dir.path(),
             "main.js",
             &opts,
@@ -2111,7 +2089,7 @@ mod tests {
             &index_src,
             "index.html",
             true,
-            true,
+            Some("polyfills.js"),
             dir.path(),
             "main.js",
             &opts,
@@ -2140,7 +2118,7 @@ mod tests {
             &index_src,
             "index.html",
             true,
-            true,
+            Some("polyfills.js"),
             dir.path(),
             "main.js",
             &opts,
@@ -2163,7 +2141,7 @@ mod tests {
             &index_src,
             "index.html",
             true,
-            true,
+            Some("polyfills.js"),
             dir.path(),
             "main.js",
             &opts,
