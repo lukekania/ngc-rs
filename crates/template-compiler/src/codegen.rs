@@ -1653,10 +1653,17 @@ impl IvyCodegen {
         let parent_ns_state = self.namespace_state;
         self.namespace_state = Namespace::Html;
 
-        // Register the @for item variable as a local so ctx_expr_with_locals()
-        // does NOT prefix it with `ctx.`.  e.g. `p.id` stays `p.id`, not `ctx.p.id`.
+        // Register the @for item variable AND the implicit built-ins
+        // (`$index`, `$count`, `$first`, `$last`, `$even`, `$odd`) as locals
+        // so ctx_expr_with_locals() does NOT prefix them with `ctx.`. Each is
+        // declared at runtime from the embedded view's `_ctx` only when the
+        // body actually references it (matches ng build's emit and avoids
+        // bouncing through the parent component for purely local reads).
         let parent_locals = self.local_vars.clone();
         self.local_vars.insert(item_name.to_string());
+        for builtin in FOR_BUILTIN_LOCALS {
+            self.local_vars.insert((*builtin).to_string());
+        }
         // Track this @for's item variable and its depth for nested templates
         self.scope_stack.push(ScopeEntry::Repeater {
             item_name: item_name.to_string(),
@@ -1685,21 +1692,45 @@ impl IvyCodegen {
         }
         if !self.update.is_empty() || !parent_lets.is_empty() {
             code.push_str("  if (rf & 2) {\n");
-            // Extract item from _ctx and component context.
-            // Order matches ng build: item first, then nextContext.
-            code.push_str(&format!("    const {item_name} = _ctx.$implicit;\n"));
+            // Decide which embedded-view locals the body actually reads.
+            // Without this, every @for body unconditionally extracted the
+            // loop item and called ɵɵnextContext(N) — the latter shifted
+            // `ctx` to the parent component and broke `$index` / item
+            // resolution for purely local references (issue #91).
+            let body_text = self.update.join("\n");
+            let needs_item = identifier_used_in(&body_text, item_name);
+            let mut needed_builtins: Vec<&str> = Vec::new();
+            for builtin in FOR_BUILTIN_LOCALS {
+                if identifier_used_in(&body_text, builtin) {
+                    needed_builtins.push(*builtin);
+                }
+            }
+            let needs_parent_ctx = update_references_parent_ctx(&self.update);
+
+            if needs_item {
+                code.push_str(&format!("    const {item_name} = _ctx.$implicit;\n"));
+            }
+            for builtin in &needed_builtins {
+                code.push_str(&format!("    const {builtin} = _ctx.{builtin};\n"));
+            }
             // Template-reference reads must run BEFORE ɵɵnextContext —
             // ɵɵreference reads the current context LView.
             code.push_str(&self.build_ref_reads_prelude("    "));
-            let comp_depth = self.scope_stack.len() as u32;
-            self.ivy_imports
-                .insert("\u{0275}\u{0275}nextContext".to_string());
-            if comp_depth > 0 {
-                code.push_str(&format!(
-                    "    const ctx = \u{0275}\u{0275}nextContext({comp_depth});\n"
-                ));
-            } else {
-                code.push_str("    const ctx = \u{0275}\u{0275}nextContext();\n");
+            // Only walk to the parent component when something actually
+            // needs it (a parent-scope binding or a `@let` resolved via
+            // ɵɵreadContextLet, which itself takes the surrounding
+            // context as its base).
+            if needs_parent_ctx || !parent_lets.is_empty() {
+                let comp_depth = self.scope_stack.len() as u32;
+                self.ivy_imports
+                    .insert("\u{0275}\u{0275}nextContext".to_string());
+                if comp_depth > 1 {
+                    code.push_str(&format!(
+                        "    const ctx = \u{0275}\u{0275}nextContext({comp_depth});\n"
+                    ));
+                } else {
+                    code.push_str("    const ctx = \u{0275}\u{0275}nextContext();\n");
+                }
             }
             for (name, slot) in &parent_lets {
                 self.ivy_imports
@@ -2881,6 +2912,71 @@ fn ctx_expr_with_locals(expr: &str, locals: &BTreeSet<String>) -> String {
     }
 
     result
+}
+
+/// Built-in `@for` block locals exposed on the embedded view's context. Each
+/// is read via `_ctx.<name>` when the loop body references it. Order is fixed
+/// to keep the emitted prelude byte-stable across runs.
+const FOR_BUILTIN_LOCALS: &[&str] = &["$index", "$count", "$first", "$last", "$even", "$odd"];
+
+/// Check whether `needle` appears as a whole-word identifier in `haystack`.
+/// "Whole-word" treats ASCII alphanumerics, `_`, and `$` as identifier
+/// continuation — matching JavaScript's identifier rules for the names this
+/// function is used with (loop item aliases and `@for` built-ins). A match
+/// inside a string literal still counts as a hit; the haystack here is the
+/// already-compiled binding code, not arbitrary user prose.
+fn identifier_used_in(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let mut search_from = 0;
+    while let Some(rel) = haystack[search_from..].find(needle) {
+        let start = search_from + rel;
+        let end = start + needle.len();
+        let prev_ok = start == 0
+            || !haystack[..start]
+                .chars()
+                .next_back()
+                .is_some_and(is_js_ident_continue);
+        let next_ok = end == haystack.len()
+            || !haystack[end..]
+                .chars()
+                .next()
+                .is_some_and(is_js_ident_continue);
+        if prev_ok && next_ok {
+            return true;
+        }
+        search_from = start + 1;
+    }
+    false
+}
+
+fn is_js_ident_continue(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+/// Detect a reference to the parent component's `ctx` (rather than `_ctx`,
+/// `_outer_ctx`, etc.) anywhere in the joined update instructions. Used by
+/// `@for` body emission to decide whether to call `ɵɵnextContext`.
+fn update_references_parent_ctx(updates: &[String]) -> bool {
+    updates.iter().any(|s| has_bare_ctx_ref(s))
+}
+
+fn has_bare_ctx_ref(s: &str) -> bool {
+    let mut search_from = 0;
+    while let Some(rel) = s[search_from..].find("ctx.") {
+        let start = search_from + rel;
+        let prev_ok = start == 0
+            || !s[..start]
+                .chars()
+                .next_back()
+                .is_some_and(is_js_ident_continue);
+        if prev_ok {
+            return true;
+        }
+        search_from = start + 1;
+    }
+    false
 }
 
 /// Check if a string is a simple property path (e.g. `foo`, `foo.bar`, `$data`).
