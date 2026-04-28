@@ -4979,6 +4979,42 @@ mod tests {
     }
 
     #[test]
+    fn test_icu_select_inside_i18n_uses_var_select_placeholder() {
+        let output = compile_template(
+            "<span i18n>{ gender, select, male {he} female {she} other {they} }</span>",
+        );
+        let dc = &output.static_fields[0];
+        assert!(
+            dc.contains("{${\"\\u{FFFD}0\\u{FFFD}\"}:VAR_SELECT:, select, "),
+            "ICU switch must emit indexed runtime placeholder with VAR_SELECT block label: {dc}"
+        );
+        assert!(
+            dc.contains("\u{0275}\u{0275}i18nExp(ctx.gender);"),
+            "update block should emit ɵɵi18nExp(ctx.gender): {dc}"
+        );
+        assert!(
+            dc.contains("\u{0275}\u{0275}i18nApply(1);"),
+            "update block should emit ɵɵi18nApply(slot): {dc}"
+        );
+    }
+
+    #[test]
+    fn test_icu_selectordinal_inside_i18n_uses_var_selectordinal_placeholder() {
+        let output = compile_template(
+            "<span i18n>{ rank, selectordinal, =1 {1st} =2 {2nd} other {#th} }</span>",
+        );
+        let dc = &output.static_fields[0];
+        assert!(
+            dc.contains("{${\"\\u{FFFD}0\\u{FFFD}\"}:VAR_SELECTORDINAL:, selectordinal, "),
+            "ICU switch must emit indexed runtime placeholder with VAR_SELECTORDINAL block label: {dc}"
+        );
+        assert!(
+            dc.contains("\u{0275}\u{0275}i18nExp(ctx.rank);"),
+            "update block should emit ɵɵi18nExp(ctx.rank): {dc}"
+        );
+    }
+
+    #[test]
     fn test_scope_component_styles_single_element_array() {
         let scoped = scope_component_styles("[`.a { color: red; }`]");
         assert_eq!(scoped, "[`.a[_ngcontent-%COMP%]{ color: red; }`]");
