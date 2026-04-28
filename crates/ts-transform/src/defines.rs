@@ -12,7 +12,7 @@
 //! `IdentifierReference`.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::IdentifierReference;
@@ -20,6 +20,7 @@ use oxc_ast_visit::Visit;
 use oxc_parser::Parser;
 use oxc_semantic::{IsGlobalReference, Scoping, SemanticBuilder};
 use oxc_span::SourceType;
+use rayon::prelude::*;
 
 /// Map of identifier name → replacement source text.
 ///
@@ -103,6 +104,31 @@ pub fn apply_defines(source: &str, file_name: &str, defines: &DefineMap) -> Stri
     }
     out.push_str(&source[cursor..]);
     out
+}
+
+/// Apply `defines` to every module in `modules` in parallel.
+///
+/// Each module is keyed by its canonical path; the path's extension drives
+/// the parser's source-type detection. The map is updated in place.
+pub fn apply_defines_to_modules(modules: &mut HashMap<PathBuf, String>, defines: &DefineMap) {
+    if defines.is_empty() {
+        return;
+    }
+    let updates: Vec<(PathBuf, String)> = modules
+        .par_iter()
+        .filter_map(|(path, code)| {
+            let file_name = path.to_string_lossy();
+            let next = apply_defines(code, file_name.as_ref(), defines);
+            if next == *code {
+                None
+            } else {
+                Some((path.clone(), next))
+            }
+        })
+        .collect();
+    for (path, code) in updates {
+        modules.insert(path, code);
+    }
 }
 
 struct Collector<'a, 'b> {

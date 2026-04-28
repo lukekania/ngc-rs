@@ -491,6 +491,19 @@ fn run_build(
         }
     }
 
+    // Production-only: substitute Angular's build-time flags with their
+    // literal values so the minifier can dead-code-eliminate `if (ngDevMode)`
+    // branches throughout `@angular/core` and friends. Replaces the runtime
+    // `globalThis.ngDevMode = false` prologue from earlier ngc-rs versions.
+    if configuration == Some("production") {
+        let define_span = tracing::info_span!("define_substitution").entered();
+        ngc_ts_transform::apply_defines_to_modules(
+            &mut modules,
+            &ngc_ts_transform::DefineMap::production_angular(),
+        );
+        drop(define_span);
+    }
+
     let bundle_input = BundleInput {
         modules,
         graph,
