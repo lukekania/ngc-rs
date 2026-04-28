@@ -202,6 +202,13 @@ pub enum NgcError {
         /// Description of what went wrong while watching files.
         message: String,
     },
+
+    /// The dev server failed to start, bind, or otherwise serve requests.
+    #[error("dev server error: {message}")]
+    ServeError {
+        /// Description of what went wrong.
+        message: String,
+    },
 }
 
 /// A type alias for Results using NgcError.
