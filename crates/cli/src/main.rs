@@ -16,6 +16,7 @@ mod incremental;
 mod localize;
 mod ngsw;
 mod polyfills;
+mod serve_cmd;
 mod watch_cmd;
 
 /// Result of the bundled build pipeline.
@@ -86,6 +87,29 @@ enum Commands {
         #[arg(long)]
         localize: bool,
     },
+    /// Serve the project: build once, watch for changes, and host the
+    /// resulting `dist/` directory over HTTP with live reload. Mirrors
+    /// `ng serve` for everyday Angular development.
+    Serve {
+        /// Path to tsconfig.json
+        #[arg(long, default_value = "tsconfig.json")]
+        project: PathBuf,
+        /// Build configuration name (e.g. "production", "development").
+        /// Defaults to "development", which disables minification, content
+        /// hashing, and tree shaking for fast incremental rebuilds.
+        #[arg(long, short = 'c', default_value = "development")]
+        configuration: String,
+        /// Port the dev server binds to.
+        #[arg(long, default_value_t = 4200)]
+        port: u16,
+        /// Host the dev server binds to.
+        #[arg(long, default_value = "localhost")]
+        host: String,
+        /// Open the default browser to the served URL once the server is
+        /// listening.
+        #[arg(long)]
+        open: bool,
+    },
     /// Extract translatable messages from every component template in the
     /// project and emit a `messages.xlf` (XLIFF 1.2) file.
     ExtractI18n {
@@ -143,6 +167,18 @@ fn main() {
                 Vec::new(),
                 |_| false,
             ) {
+                eprintln!("{} {e}", "Error:".red().bold());
+                process::exit(1);
+            }
+        }
+        Commands::Serve {
+            project,
+            configuration,
+            port,
+            host,
+            open,
+        } => {
+            if let Err(e) = serve_cmd::run(&project, Some(&configuration), &host, port, open) {
                 eprintln!("{} {e}", "Error:".red().bold());
                 process::exit(1);
             }
@@ -1019,6 +1055,43 @@ fn build_options(configuration: Option<&str>) -> BundleOptions {
         },
         _ => BundleOptions::default(),
     }
+}
+
+/// Resolve the effective output directory for a project the same way
+/// [`run_build_with_cache`] does, without running a build.
+///
+/// The serve command needs to know where the dev server should mount its
+/// static root before the first rebuild emits files; this helper picks the
+/// same directory the build pipeline will write to so live-reload sees a
+/// populated tree on the very first request.
+pub(crate) fn resolve_out_dir(
+    project: &Path,
+    out_dir_override: Option<&Path>,
+    configuration: Option<&str>,
+) -> NgcResult<PathBuf> {
+    let angular_project = find_and_resolve_angular_json(project, configuration)?;
+    let tsconfig_path = angular_project
+        .as_ref()
+        .map(|ap| ap.ts_config.clone())
+        .unwrap_or_else(|| project.to_path_buf());
+    let config = ngc_project_resolver::tsconfig::resolve_tsconfig(&tsconfig_path)?;
+    let config_dir = config
+        .config_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    let resolved = out_dir_override
+        .map(PathBuf::from)
+        .or_else(|| angular_project.as_ref().map(|ap| ap.output_path.clone()))
+        .or_else(|| {
+            config
+                .compiler_options
+                .out_dir
+                .as_ref()
+                .map(|o| config_dir.join(o))
+        })
+        .unwrap_or_else(|| config_dir.join("dist"));
+    Ok(resolved)
 }
 
 /// Try to find angular.json by searching upward from the project file's directory.

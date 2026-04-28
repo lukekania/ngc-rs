@@ -20,6 +20,8 @@ ngc-template-compiler = { path = "../template-compiler" }
 ngc-npm-resolver = { path = "../npm-resolver" }
 ngc-linker = { path = "../linker" }
 ngc-watch = { path = "../watch" }
+ngc-dev-server = { path = "../dev-server" }
+ctrlc = "3.4"
 clap = { version = "4.5", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -88,7 +88,12 @@ pub fn run(
     watcher.run_until(build_fn, should_stop)
 }
 
-fn watch_root(project: &Path) -> PathBuf {
+/// Pick the directory the watcher should monitor for changes.
+///
+/// Defaults to the parent directory of `project` (the tsconfig file). Falls
+/// back to the current working directory when `project` is a bare filename
+/// or has no parent component.
+pub(crate) fn watch_root(project: &Path) -> PathBuf {
     project
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -96,7 +101,10 @@ fn watch_root(project: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn is_ts_path(p: &Path) -> bool {
+/// `true` when `p` has a `.ts`/`.tsx` extension. Used to decide whether a
+/// dirty-set is small enough for surgical cache invalidation versus a full
+/// flush (templates and styles cross-cut the cache).
+pub(crate) fn is_ts_path(p: &Path) -> bool {
     matches!(
         p.extension().and_then(|e| e.to_str()),
         Some("ts") | Some("tsx")
