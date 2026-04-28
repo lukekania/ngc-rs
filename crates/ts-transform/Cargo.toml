@@ -10,6 +10,8 @@ repository.workspace = true
 [dependencies]
 ngc-diagnostics = { path = "../diagnostics" }
 oxc_allocator = "0.122"
+oxc_ast = "0.122"
+oxc_ast_visit = "0.122"
 oxc_parser = "0.122"
 oxc_transformer = "0.122"
 oxc_codegen = "0.122"

@@ -224,13 +224,21 @@ pub fn generate_polyfills(
         }
     }
 
+    // Substitute Angular's build-time flags so any dev-only branches reachable
+    // from the polyfill graph (e.g. zone.js' development guards) are dropped
+    // by the minifier.
+    if configuration == Some("production") {
+        ngc_ts_transform::apply_defines_to_modules(
+            &mut modules,
+            &ngc_ts_transform::DefineMap::production_angular(),
+        );
+    }
+
     // Phase 5: bundle. Disable content-hashing inside the bundler — the
     // bundler's hash machinery hard-codes `main.js` as the entry filename;
     // we apply hashing ourselves below so the output is named `polyfills`.
-    // Disable dev-mode globals — they're a `main.js`-only prologue.
     let mut polyfill_bundle_options = bundle_options;
     polyfill_bundle_options.content_hash = false;
-    polyfill_bundle_options.inject_dev_mode_globals = false;
 
     let bundle_input = BundleInput {
         modules,
