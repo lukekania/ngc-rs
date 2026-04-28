@@ -125,6 +125,10 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
 
     // Process main chunk first to get specifier→namespace mapping
     let main_chunk = &chunk_graph.chunks[0];
+    let subpath_ctx = Some(shake::SubpathImportContext {
+        root_dir: &input.root_dir,
+        export_conditions: &condition_refs,
+    });
     let main_unused = if input.options.tree_shake {
         // Lazy chunks consume symbols from main cross-chunk; those consumptions
         // are invisible to the per-chunk shake analysis below. Precompute them
@@ -138,6 +142,7 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
             &main_chunk.modules,
             &input.modules,
             &prefix_refs,
+            subpath_ctx,
         )?;
 
         shake::analyze_unused_exports(
@@ -146,6 +151,7 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
             &main_chunk.entry,
             &prefix_refs,
             Some(&externally_used),
+            subpath_ctx,
         )?
     } else {
         HashMap::new()
@@ -191,6 +197,7 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
                     &chunk.entry,
                     &prefix_refs,
                     None,
+                    subpath_ctx,
                 )?
             } else {
                 HashMap::new()
