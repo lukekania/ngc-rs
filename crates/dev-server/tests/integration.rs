@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::channel;
 use std::time::Duration;
 
-use ngc_dev_server::{DevServer, DevServerConfig, LIVE_RELOAD_SCRIPT, ReloadEvent};
+use ngc_dev_server::{DevServer, DevServerConfig, ReloadEvent, LIVE_RELOAD_SCRIPT};
 use tempfile::TempDir;
 
 struct Fixture {
@@ -69,9 +69,7 @@ fn http_get(addr: std::net::SocketAddr, path: &str) -> HttpResponse {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("read timeout");
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
-    );
+    let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).expect("write");
     stream.flush().expect("flush");
 
@@ -242,11 +240,7 @@ fn trigger_reload_pushes_event_to_sse_client() {
 #[test]
 fn unknown_extension_serves_octet_stream() {
     let root = TempDir::new().expect("tempdir");
-    write_file(
-        root.path(),
-        "index.html",
-        b"<html><body></body></html>",
-    );
+    write_file(root.path(), "index.html", b"<html><body></body></html>");
     write_file(root.path(), "blob.weird", b"\x00\x01\x02blob");
     let cfg = DevServerConfig::new(root.path()).with_port(0);
     let (_tx, rx) = channel::<ReloadEvent>();

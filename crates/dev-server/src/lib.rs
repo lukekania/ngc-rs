@@ -28,7 +28,7 @@
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -231,11 +231,7 @@ fn serve_loop(server: Arc<Server>, root: PathBuf, clients: SseClients) {
     }
 }
 
-fn handle_request(
-    request: tiny_http::Request,
-    root: &Path,
-    clients: &SseClients,
-) -> NgcResult<()> {
+fn handle_request(request: tiny_http::Request, root: &Path, clients: &SseClients) -> NgcResult<()> {
     if !matches!(request.method(), Method::Get | Method::Head) {
         let resp = Response::from_string("method not allowed").with_status_code(StatusCode(405));
         return request.respond(resp).map_err(io_err);
