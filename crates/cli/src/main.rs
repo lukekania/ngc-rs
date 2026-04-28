@@ -947,7 +947,6 @@ fn build_options(configuration: Option<&str>) -> BundleOptions {
             minify: true,
             content_hash: true,
             tree_shake: true,
-            inject_dev_mode_globals: true,
         },
         _ => BundleOptions::default(),
     }
@@ -2185,7 +2184,6 @@ mod tests {
         assert!(opts.minify);
         assert!(opts.content_hash);
         assert!(opts.tree_shake);
-        assert!(opts.inject_dev_mode_globals);
     }
 
     #[test]
@@ -2195,7 +2193,6 @@ mod tests {
         assert!(!opts.minify);
         assert!(!opts.content_hash);
         assert!(!opts.tree_shake);
-        assert!(!opts.inject_dev_mode_globals);
     }
 
     #[test]
@@ -2205,7 +2202,6 @@ mod tests {
         assert!(!opts.minify);
         assert!(!opts.content_hash);
         assert!(!opts.tree_shake);
-        assert!(!opts.inject_dev_mode_globals);
     }
 
     #[test]
