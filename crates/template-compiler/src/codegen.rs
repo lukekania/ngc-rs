@@ -1935,8 +1935,17 @@ impl IvyCodegen {
         // LContainer slot allocated AFTER all sub-block templates so the
         // runtime's first-create pass has populated each template TNode's
         // `tView` before `triggerResourceLoading` dereferences it.
+        //
+        // `ɵɵdefer` actually consumes TWO slots: the LContainer at `slot`
+        // and `tDetails` at `slot + 1` (Angular's `setTDeferBlockDetails`
+        // writes to `tView.data[deferBlockIndex + 1]`). Reusing `slot + 1`
+        // for the next instruction would point its TNode lookup at the
+        // tDetails object — whose `.attrs` is undefined, which the
+        // directive-matcher reads via `getNameOnlyMarkerIndex(tNode.attrs)`
+        // and crashes the parent template's first-create pass. Reserve the
+        // shadow slot to keep the next instruction's slot collision-free.
         let defer_slot = self.slot_index;
-        self.slot_index += 1;
+        self.slot_index += 2;
 
         // Build the dependency resolver function. Emitted as a module-scope
         // helper so the bundler's import scanner can pick up any `import()`
