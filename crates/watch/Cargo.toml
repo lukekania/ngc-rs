@@ -1,0 +1,16 @@
+[package]
+name = "ngc-watch"
+description = "File-system watcher with debounced incremental rebuilds for ngc-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ngc-diagnostics = { path = "../diagnostics" }
+notify = { version = "6.1", default-features = false, features = ["macos_fsevent"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
