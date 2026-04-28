@@ -4951,13 +4951,30 @@ mod tests {
             "<span i18n>{ count, plural, =0 {none} =1 {one} other {many} }</span>",
         );
         let dc = &output.static_fields[0];
+        // The runtime ICU parser (ICU_BLOCK_REGEXP in @angular/core) matches
+        // the switch position against `\uFFFD<idx>\uFFFD`, so the binding
+        // must round-trip through $localize as that marker; VAR_PLURAL is
+        // the translator-facing placeholder name carried as a `:NAME:` block
+        // label that $localize strips at runtime.
         assert!(
-            dc.contains("{count, plural, "),
-            "ICU body should be inlined into the localize message: {dc}"
+            dc.contains("{${\"\\u{FFFD}0\\u{FFFD}\"}:VAR_PLURAL:, plural, "),
+            "ICU switch must emit indexed runtime placeholder with VAR_PLURAL block label: {dc}"
         );
         assert!(
             dc.contains("=0 {none}") && dc.contains("other {many}"),
             "ICU case bodies should be preserved: {dc}"
+        );
+        assert!(
+            output.ivy_imports.contains("\u{0275}\u{0275}i18nExp"),
+            "ɵɵi18nExp should be imported: {dc}"
+        );
+        assert!(
+            dc.contains("\u{0275}\u{0275}i18nExp(ctx.count);"),
+            "update block should emit ɵɵi18nExp(ctx.count): {dc}"
+        );
+        assert!(
+            dc.contains("\u{0275}\u{0275}i18nApply(1);"),
+            "update block should emit ɵɵi18nApply(slot): {dc}"
         );
     }
 
