@@ -1867,27 +1867,27 @@ impl IvyCodegen {
     /// - `when <expr>` → `ɵɵdeferWhen(ctx.<expr>)` in the update block
     /// - prefetch variants → `ɵɵdeferPrefetchOn*` / `ɵɵdeferPrefetchWhen`
     ///
-    /// Slot layout:
-    /// - `index` — the defer block slot (used by the runtime for state).
-    /// - `index + 1` — primary (main) template.
-    /// - `index + 2..` — placeholder, loading, error templates (in that order,
-    ///   if present).
+    /// Slot layout (matches `ng build`'s emit):
+    /// - Primary (main) template — first.
+    /// - Placeholder, loading, error templates — next, in that order, if present.
+    /// - LContainer slot for the defer block — LAST.
     ///
-    /// The dependency function is emitted as a module-level helper that
-    /// returns an array of dynamic `import()` promises — one per custom
-    /// element tag inside the defer block that matches a `imports_identifiers`
-    /// entry on the component. When no match is found the array is empty.
+    /// Allocating the LContainer last is load-bearing: Angular's runtime
+    /// `triggerResourceLoading` reads `primaryBlockTNode.tView` after the
+    /// parent template's first-create pass populated each `ɵɵtemplate(slot,
+    /// …)` TNode's `tView`. With the LContainer first, the parent's create
+    /// pass walks slots in a different order and the primary TNode's tView
+    /// stays unset, so the runtime trips on
+    /// `Cannot read properties of undefined (reading 'directiveRegistry')`
+    /// the moment a deferred dep resolves.
     fn generate_defer_block(&mut self, block: &DeferBlockNode) {
-        let defer_slot = self.slot_index;
-        self.slot_index += 1;
-
         self.ivy_imports.insert("\u{0275}\u{0275}defer".to_string());
         self.ivy_imports
             .insert("\u{0275}\u{0275}template".to_string());
         self.ivy_imports
             .insert("\u{0275}\u{0275}advance".to_string());
 
-        // Main template (always present).
+        // Main template (always present) — allocated FIRST.
         let main_slot = self.slot_index;
         self.slot_index += 1;
         let main_fn = format!(
@@ -1931,6 +1931,12 @@ impl IvyCodegen {
             let child = self.generate_child_template(&fn_name, children);
             (slot, fn_name, child)
         });
+
+        // LContainer slot allocated AFTER all sub-block templates so the
+        // runtime's first-create pass has populated each template TNode's
+        // `tView` before `triggerResourceLoading` dereferences it.
+        let defer_slot = self.slot_index;
+        self.slot_index += 1;
 
         // Build the dependency resolver function. Emitted as a module-scope
         // helper so the bundler's import scanner can pick up any `import()`
@@ -4521,7 +4527,12 @@ mod tests {
                 .contains("\u{0275}\u{0275}deferOnViewport"),
             "deferOnViewport should be imported"
         );
-        assert!(dc.contains("\u{0275}\u{0275}defer(0, "), "defer call: {dc}");
+        // defer LContainer at slot 1 (allocated after the primary template
+        // at slot 0), primary index 0 in the second position.
+        assert!(
+            dc.contains("\u{0275}\u{0275}defer(1, 0, "),
+            "defer call: {dc}"
+        );
         assert!(
             dc.contains("\u{0275}\u{0275}deferOnViewport();"),
             "deferOnViewport call: {dc}"
@@ -4602,10 +4613,11 @@ mod tests {
         assert!(child_source.contains("TestComponent_DeferLoading_"));
         assert!(child_source.contains("TestComponent_DeferError_"));
         assert!(child_source.contains("DepsFn"));
-        // defer passes all three sub-block slot indices as trailing args.
+        // Slot layout: primary=0, placeholder=1, loading=2, error=3,
+        // defer LContainer=4 (allocated last).
         assert!(
-            dc.contains("\u{0275}\u{0275}defer(0, "),
-            "defer block at slot 0: {dc}"
+            dc.contains("\u{0275}\u{0275}defer(4, 0, "),
+            "defer LContainer at slot 4 with primary index 0: {dc}"
         );
     }
 
@@ -4677,10 +4689,12 @@ mod tests {
         // causing the runtime to misread the deps fn as a TView descriptor.
         let output = compile_template("@defer (on immediate) { <my-c /> }");
         let dc = &output.static_fields[0];
-        // defer block at slot 0; main (primary) template at slot 1.
+        // primary template at slot 0, defer LContainer at slot 1
+        // (allocated last so the parent's first-create pass populates the
+        // primary's tView before the runtime dereferences it).
         assert!(
-            dc.contains("\u{0275}\u{0275}defer(0, 1, "),
-            "ɵɵdefer should emit (slot, primaryIdx, depsFn, …): {dc}"
+            dc.contains("\u{0275}\u{0275}defer(1, 0, "),
+            "ɵɵdefer should emit (deferSlot, primaryIdx, depsFn, …): {dc}"
         );
         assert!(
             dc.contains("\u{0275}\u{0275}deferOnImmediate();"),
@@ -4695,7 +4709,7 @@ mod tests {
         let output = compile_template("@defer (on immediate) { <my-c /> }");
         let dc = &output.static_fields[0];
         assert!(
-            dc.contains("\u{0275}\u{0275}defer(0, 1, TestComponent_Defer_1_DepsFn);"),
+            dc.contains("\u{0275}\u{0275}defer(1, 0, TestComponent_Defer_1_DepsFn);"),
             "no sub-blocks → no trailing nulls: {dc}"
         );
     }
@@ -4706,11 +4720,12 @@ mod tests {
             "@defer (on idle) { <my-c /> } @placeholder { <p>wait</p> } @loading { <p>load</p> } @error { <p>err</p> }",
         );
         let dc = &output.static_fields[0];
-        // Slot layout: defer=0, primary=1, placeholder=2, loading=3, error=4.
-        // Args after the deps fn are loading, placeholder, error.
+        // Slot layout: primary=0, placeholder=1, loading=2, error=3,
+        // defer LContainer=4. Args after deps fn are loading, placeholder,
+        // error.
         assert!(
-            dc.contains("\u{0275}\u{0275}defer(0, 1, TestComponent_Defer_4_DepsFn, 3, 2, 4);"),
-            "expected (slot, primary, deps, loading, placeholder, error): {dc}"
+            dc.contains("\u{0275}\u{0275}defer(4, 0, TestComponent_Defer_4_DepsFn, 2, 1, 3);"),
+            "expected (deferSlot, primary, deps, loading, placeholder, error): {dc}"
         );
     }
 
@@ -4791,7 +4806,7 @@ mod tests {
         let output = compile_template("@defer (when isReady) { <my-c /> }");
         let dc = &output.static_fields[0];
         assert!(
-            dc.contains("\u{0275}\u{0275}defer(0, 1, "),
+            dc.contains("\u{0275}\u{0275}defer(1, 0, "),
             "defer call carries primary-index even with `when`: {dc}"
         );
         assert!(
