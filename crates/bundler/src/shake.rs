@@ -17,6 +17,16 @@ use oxc_span::SourceType;
 use rayon::prelude::*;
 use tracing::debug;
 
+/// Context for resolving `#`-prefixed subpath imports against the project's
+/// `package.json` `imports` field. When `None`, `#`-aliased specifiers are
+/// not resolvable and their use-edges are ignored (matching the pre-#92
+/// behavior — used by tests that don't construct a real project).
+#[derive(Clone, Copy)]
+pub struct SubpathImportContext<'a> {
+    pub root_dir: &'a Path,
+    pub export_conditions: &'a [&'a str],
+}
+
 /// Information about a module's exports and imports for tree shaking analysis.
 struct ModuleInfo {
     /// Names exported by this module.
@@ -47,6 +57,7 @@ pub fn analyze_unused_exports(
     entry: &PathBuf,
     local_prefixes: &[&str],
     externally_used: Option<&HashSet<String>>,
+    subpath_ctx: Option<SubpathImportContext<'_>>,
 ) -> NgcResult<HashMap<PathBuf, HashSet<String>>> {
     // Step 1: Parse each module in parallel and collect export/import info.
     // `analyze_module` only reads its inputs, so per-module work is independent.
@@ -74,9 +85,13 @@ pub fn analyze_unused_exports(
     for (importer_path, info) in &module_infos {
         for (specifier, imported_names) in &info.local_imports {
             // Resolve specifier to a module path
-            if let Some(target_path) =
-                resolve_local_specifier(specifier, importer_path, module_paths, local_prefixes)
-            {
+            if let Some(target_path) = resolve_local_specifier(
+                specifier,
+                importer_path,
+                module_paths,
+                local_prefixes,
+                subpath_ctx,
+            ) {
                 debug!(
                     importer = %importer_path.display(),
                     specifier = specifier,
@@ -242,13 +257,32 @@ fn collect_declaration_names(decl: &oxc_ast::ast::Declaration, names: &mut HashS
 /// Try to resolve a local import specifier to a module path.
 ///
 /// This is a best-effort resolution — it checks if the specifier starts with
-/// a local prefix and tries to find a matching module path.
+/// a local prefix and tries to find a matching module path. When `subpath_ctx`
+/// is provided, `#`-prefixed specifiers are also resolved through the
+/// project's `package.json` `imports` field — without this, a class field
+/// initializer reading a value from a `#`-aliased module (issue #92) is not
+/// recognized as a use of the target's export, the declaration gets shaken
+/// out, and the class throws `ReferenceError` at instance construction.
 fn resolve_local_specifier(
     specifier: &str,
     importer: &Path,
     module_paths: &[PathBuf],
     local_prefixes: &[&str],
+    subpath_ctx: Option<SubpathImportContext<'_>>,
 ) -> Option<PathBuf> {
+    if specifier.starts_with('#') {
+        let ctx = subpath_ctx?;
+        let resolved = ngc_npm_resolver::resolve::resolve_subpath_import(
+            specifier,
+            Some(importer),
+            ctx.root_dir,
+            ctx.export_conditions,
+        )
+        .ok()?;
+        let canonical = resolved.canonicalize().unwrap_or(resolved);
+        return module_paths.iter().find(|p| **p == canonical).cloned();
+    }
+
     let is_local = local_prefixes.iter().any(|p| specifier.starts_with(p));
     if !is_local {
         return None;
@@ -322,6 +356,7 @@ pub fn collect_cross_chunk_used_names(
     provider_modules: &[PathBuf],
     all_code: &HashMap<PathBuf, String>,
     local_prefixes: &[&str],
+    subpath_ctx: Option<SubpathImportContext<'_>>,
 ) -> NgcResult<HashSet<String>> {
     let provider_set: HashSet<&PathBuf> = provider_modules.iter().collect();
 
@@ -344,6 +379,7 @@ pub fn collect_cross_chunk_used_names(
                     consumer_path,
                     provider_modules,
                     local_prefixes,
+                    subpath_ctx,
                 ) else {
                     continue;
                 };
@@ -385,12 +421,14 @@ pub fn collect_cross_chunk_used_names(
             all_code,
             &mut provider_exports,
             &mut used,
+            subpath_ctx,
         )?;
     }
 
     Ok(used)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn expand_namespace_imports(
     code: &str,
     consumer_path: &Path,
@@ -399,6 +437,7 @@ fn expand_namespace_imports(
     all_code: &HashMap<PathBuf, String>,
     provider_exports: &mut HashMap<PathBuf, HashSet<String>>,
     used: &mut HashSet<String>,
+    subpath_ctx: Option<SubpathImportContext<'_>>,
 ) -> NgcResult<()> {
     let allocator = Allocator::new();
     let parsed = Parser::new(&allocator, code, SourceType::mjs()).parse();
@@ -421,9 +460,13 @@ fn expand_namespace_imports(
             continue;
         }
         let source = import.source.value.to_string();
-        let Some(target) =
-            resolve_local_specifier(&source, consumer_path, provider_modules, local_prefixes)
-        else {
+        let Some(target) = resolve_local_specifier(
+            &source,
+            consumer_path,
+            provider_modules,
+            local_prefixes,
+            subpath_ctx,
+        ) else {
             continue;
         };
         let exports = match provider_exports.get(&target) {
@@ -471,6 +514,7 @@ mod tests {
             &PathBuf::from("/root/main.js"),
             &["."],
             None,
+            None,
         )
         .expect("should analyze");
 
@@ -501,6 +545,7 @@ mod tests {
             &modules,
             &PathBuf::from("/root/main.ts"),
             &["."],
+            None,
             None,
         )
         .expect("should analyze");
@@ -533,6 +578,7 @@ mod tests {
             &modules,
             &PathBuf::from("/root/main.ts"),
             &["."],
+            None,
             None,
         )
         .expect("should analyze");
@@ -572,6 +618,7 @@ mod tests {
             &PathBuf::from("/root/main.js"),
             &["."],
             Some(&externally_used),
+            None,
         )
         .expect("should analyze");
 
@@ -612,8 +659,9 @@ mod tests {
                 .into(),
         );
 
-        let used = collect_cross_chunk_used_names(&[canon_comp], &[canon_svc], &modules, &["."])
-            .expect("should collect");
+        let used =
+            collect_cross_chunk_used_names(&[canon_comp], &[canon_svc], &modules, &["."], None)
+                .expect("should collect");
         assert!(
             used.contains("AnalyticsService"),
             "import of ./foo.service must resolve to foo.service.ts"
@@ -650,8 +698,9 @@ mod tests {
             "import { AnalyticsService } from '../svc';\nnew AnalyticsService();\n".into(),
         );
 
-        let used = collect_cross_chunk_used_names(&[canon_comp], &[canon_svc], &modules, &["."])
-            .expect("should collect");
+        let used =
+            collect_cross_chunk_used_names(&[canon_comp], &[canon_svc], &modules, &["."], None)
+                .expect("should collect");
         assert!(used.contains("AnalyticsService"));
     }
 }

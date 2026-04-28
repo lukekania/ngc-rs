@@ -301,3 +301,248 @@ fn subpath_import_in_lazy_chunk_does_not_leak_to_main_import() {
         "lazy chunk must not pull APP_ENV from ./main.js: {lazy_code}"
     );
 }
+
+/// Regression for issue #92: a `#`-aliased const referenced from a class field
+/// initializer must survive tree-shaking. Before the fix, shake's
+/// `resolve_local_specifier` returned `None` for `#`-prefixed specifiers, so
+/// the consumer's import edge was never recorded as a use of the target's
+/// export. The const declaration was then dropped by the rewriter, and the
+/// runtime threw `ReferenceError: APP_ENV is not defined` from the class
+/// field initializer.
+#[test]
+fn subpath_import_const_referenced_from_class_field_survives_tree_shake() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+
+    fs::write(
+        root.join("tsconfig.json"),
+        r#"{ "include": ["src/**/*.ts"], "exclude": [] }"#,
+    )
+    .expect("write tsconfig");
+
+    fs::write(
+        root.join("package.json"),
+        r##"{
+          "name": "class-field-fixture",
+          "imports": { "#env/*": "./src/env/*.js" }
+        }"##,
+    )
+    .expect("write package.json");
+
+    let src = root.join("src");
+    fs::create_dir_all(src.join("env")).expect("create src/env");
+
+    fs::write(
+        src.join("main.ts"),
+        "import { Comp } from './comp';\nnew Comp();\n",
+    )
+    .expect("write main.ts");
+
+    // The shape from the issue: a class field initializer reads an imported
+    // const. The import target is a `#`-aliased file under the project's
+    // `imports` map.
+    fs::write(
+        src.join("comp.ts"),
+        "import { APP_ENV } from '#env/config';\n\
+         export class Comp {\n  \
+           env = APP_ENV;\n\
+         }\n",
+    )
+    .expect("write comp.ts");
+
+    fs::write(
+        src.join("env/config.js"),
+        "export const APP_ENV = { name: 'env-fixture' };\n",
+    )
+    .expect("write config.js");
+
+    fs::create_dir_all(root.join("node_modules")).expect("create node_modules");
+
+    let file_graph = resolve_project(&root.join("tsconfig.json")).expect("resolve project");
+
+    let entry = file_graph
+        .entry_points
+        .iter()
+        .find(|p| p.file_name().is_some_and(|n| n == "main.ts"))
+        .cloned()
+        .expect("main.ts should be an entry point");
+
+    let bare_specs: Vec<String> = file_graph.npm_import_sites.keys().cloned().collect();
+    let npm = resolve_npm_dependencies(&bare_specs, root, DEVELOPMENT_BROWSER_CONDITIONS)
+        .expect("npm resolution");
+
+    let mut graph = file_graph.graph;
+    let mut path_index = file_graph.path_index;
+    for path in npm.modules.keys() {
+        if !path_index.contains_key(path) {
+            let idx = graph.add_node(path.clone());
+            path_index.insert(path.clone(), idx);
+        }
+    }
+
+    let config_path = npm
+        .modules
+        .keys()
+        .find(|p| p.ends_with("src/env/config.js"))
+        .cloned()
+        .expect("config.js should be in npm resolution");
+    for (spec, sites) in &file_graph.npm_import_sites {
+        if spec == "#env/config" {
+            let to_idx = path_index[&config_path];
+            for (from_file, kind) in sites {
+                if let Some(&from_idx) = path_index.get(from_file) {
+                    graph.add_edge(from_idx, to_idx, *kind);
+                }
+            }
+        }
+    }
+
+    let mut modules: HashMap<PathBuf, String> = HashMap::new();
+    for idx in graph.node_indices() {
+        let path = &graph[idx];
+        let source = npm
+            .modules
+            .get(path)
+            .cloned()
+            .or_else(|| fs::read_to_string(path).ok())
+            .unwrap_or_else(|| panic!("source missing for {}", path.display()));
+        modules.insert(path.clone(), source);
+    }
+
+    let input = BundleInput {
+        modules,
+        graph,
+        entry,
+        local_prefixes: vec![".".to_string()],
+        root_dir: root.to_path_buf(),
+        options: BundleOptions {
+            tree_shake: true,
+            ..BundleOptions::default()
+        },
+        per_module_maps: HashMap::new(),
+        bundled_specifiers: npm.resolved_specifiers.clone(),
+        export_conditions: Vec::new(),
+    };
+
+    let output = bundle(&input).expect("bundle succeeds");
+
+    let main_code = output
+        .chunks
+        .get(&output.main_filename)
+        .expect("main chunk present");
+
+    // The const declaration must survive — that's the bug under repair.
+    assert!(
+        main_code.contains("APP_ENV"),
+        "main chunk should retain the APP_ENV const declaration after tree-shaking; got:\n{main_code}"
+    );
+    assert!(
+        main_code.contains("name: 'env-fixture'") || main_code.contains("name:'env-fixture'"),
+        "main chunk should retain the APP_ENV literal value: {main_code}"
+    );
+}
+
+/// Same shape as the `#`-aliased test above but using a plain relative
+/// specifier — locks in that the same code path keeps working for
+/// non-aliased imports (the existing common case).
+#[test]
+fn relative_import_const_referenced_from_class_field_survives_tree_shake() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+
+    fs::write(
+        root.join("tsconfig.json"),
+        r#"{ "include": ["src/**/*.ts"], "exclude": [] }"#,
+    )
+    .expect("write tsconfig");
+
+    fs::write(
+        root.join("package.json"),
+        r##"{ "name": "relative-class-field-fixture" }"##,
+    )
+    .expect("write package.json");
+
+    let src = root.join("src");
+    fs::create_dir_all(&src).expect("create src");
+
+    fs::write(
+        src.join("main.ts"),
+        "import { Comp } from './comp';\nnew Comp();\n",
+    )
+    .expect("write main.ts");
+
+    fs::write(
+        src.join("config.ts"),
+        "export const APP_ENV = { name: 'relative-fixture' };\n",
+    )
+    .expect("write config.ts");
+
+    fs::write(
+        src.join("comp.ts"),
+        "import { APP_ENV } from './config';\n\
+         export class Comp {\n  \
+           env = APP_ENV;\n\
+         }\n",
+    )
+    .expect("write comp.ts");
+
+    fs::create_dir_all(root.join("node_modules")).expect("create node_modules");
+
+    let file_graph = resolve_project(&root.join("tsconfig.json")).expect("resolve project");
+
+    let entry = file_graph
+        .entry_points
+        .iter()
+        .find(|p| p.file_name().is_some_and(|n| n == "main.ts"))
+        .cloned()
+        .expect("main.ts should be an entry point");
+
+    let bare_specs: Vec<String> = file_graph.npm_import_sites.keys().cloned().collect();
+    let npm = resolve_npm_dependencies(&bare_specs, root, DEVELOPMENT_BROWSER_CONDITIONS)
+        .expect("npm resolution");
+
+    let graph = file_graph.graph;
+    let mut modules: HashMap<PathBuf, String> = HashMap::new();
+    for idx in graph.node_indices() {
+        let path = &graph[idx];
+        let source = npm
+            .modules
+            .get(path)
+            .cloned()
+            .or_else(|| fs::read_to_string(path).ok())
+            .unwrap_or_else(|| panic!("source missing for {}", path.display()));
+        modules.insert(path.clone(), source);
+    }
+
+    let input = BundleInput {
+        modules,
+        graph,
+        entry,
+        local_prefixes: vec![".".to_string()],
+        root_dir: root.to_path_buf(),
+        options: BundleOptions {
+            tree_shake: true,
+            ..BundleOptions::default()
+        },
+        per_module_maps: HashMap::new(),
+        bundled_specifiers: npm.resolved_specifiers.clone(),
+        export_conditions: Vec::new(),
+    };
+
+    let output = bundle(&input).expect("bundle succeeds");
+
+    let main_code = output
+        .chunks
+        .get(&output.main_filename)
+        .expect("main chunk present");
+
+    assert!(
+        main_code.contains("APP_ENV"),
+        "main chunk should retain the APP_ENV const declaration after tree-shaking; got:\n{main_code}"
+    );
+    assert!(
+        main_code.contains("name: 'relative-fixture'")
+            || main_code.contains("name:'relative-fixture'"),
+        "main chunk should retain APP_ENV's literal: {main_code}"
+    );
+}
