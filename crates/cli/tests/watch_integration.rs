@@ -181,7 +181,10 @@ fn watch_rebuilds_on_edit() {
     }
 
     let main_v2 = read_main_chunk(&out_dir);
-    assert!(main_v2.contains(" v2"), "watch bundle missing v2 after edit");
+    assert!(
+        main_v2.contains(" v2"),
+        "watch bundle missing v2 after edit"
+    );
     assert!(
         !main_v2.contains(" v1"),
         "watch bundle still contains v1 after edit"
