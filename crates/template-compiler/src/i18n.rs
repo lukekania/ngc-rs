@@ -157,7 +157,7 @@ fn walk_children(children: &[TemplateNode], body: &mut String, interpolations: &
                 // switch expression into `interpolations` makes the caller
                 // emit the matching `ɵɵi18nExp(ctx.<expr>)` in the update
                 // block.
-                let idx = interpolations.len();
+                let switch_idx = interpolations.len();
                 interpolations.push(icu.switch_expression.clone());
                 let (placeholder_name, category_kw) = match icu.category {
                     crate::ast::IcuCategory::Plural => ("VAR_PLURAL", "plural"),
@@ -166,9 +166,16 @@ fn walk_children(children: &[TemplateNode], body: &mut String, interpolations: &
                         ("VAR_SELECTORDINAL", "selectordinal")
                     }
                 };
+                // `#` is the canonical reference to the switch binding inside
+                // a `plural` / `selectordinal` case body — `select` leaves it
+                // as literal text.
+                let substitute_hash = matches!(
+                    icu.category,
+                    crate::ast::IcuCategory::Plural | crate::ast::IcuCategory::SelectOrdinal
+                );
                 body.push('{');
                 body.push_str(&format!(
-                    "${{\"\\u{{FFFD}}{idx}\\u{{FFFD}}\"}}:{placeholder_name}:"
+                    "${{\"\\u{{FFFD}}{switch_idx}\\u{{FFFD}}\"}}:{placeholder_name}:"
                 ));
                 body.push_str(", ");
                 body.push_str(category_kw);
@@ -176,7 +183,13 @@ fn walk_children(children: &[TemplateNode], body: &mut String, interpolations: &
                 for case in &icu.cases {
                     append_template_text(body, &case.key);
                     body.push_str(" {");
-                    append_template_text(body, &case.body);
+                    append_icu_case_body(
+                        body,
+                        interpolations,
+                        &case.body,
+                        switch_idx,
+                        substitute_hash,
+                    );
                     body.push_str("} ");
                 }
                 body.push('}');
@@ -187,6 +200,50 @@ fn walk_children(children: &[TemplateNode], body: &mut String, interpolations: &
                 // /`@for` children into their own sub-messages.
             }
         }
+    }
+}
+
+/// Walk an ICU case body, expanding `{{expr}}` interpolations and (for
+/// `plural` / `selectordinal`) the `#` token into runtime placeholders.
+///
+/// Each `{{expr}}` becomes a fresh `${"\u{FFFD}<idx>\u{FFFD}"}:INTERPOLATION:`
+/// marker and pushes its expression into `interpolations`. `#` reuses the
+/// switch expression's placeholder index so the existing `ɵɵi18nExp` for the
+/// switch also feeds the case-body substitution — Angular's runtime ICU
+/// model treats the case body and the switch as a single binding.
+fn append_icu_case_body(
+    body: &mut String,
+    interpolations: &mut Vec<String>,
+    case_body: &str,
+    switch_idx: usize,
+    substitute_hash: bool,
+) {
+    let mut rest = case_body;
+    while !rest.is_empty() {
+        if let Some(after_open) = rest.strip_prefix("{{") {
+            if let Some(end) = after_open.find("}}") {
+                let expr = after_open[..end].trim();
+                let new_idx = interpolations.len();
+                interpolations.push(expr.to_string());
+                body.push_str(&format!(
+                    "${{\"\\u{{FFFD}}{new_idx}\\u{{FFFD}}\"}}:INTERPOLATION:"
+                ));
+                rest = &after_open[end + 2..];
+                continue;
+            }
+        }
+        if substitute_hash {
+            if let Some(after_hash) = rest.strip_prefix('#') {
+                body.push_str(&format!(
+                    "${{\"\\u{{FFFD}}{switch_idx}\\u{{FFFD}}\"}}:INTERPOLATION:"
+                ));
+                rest = after_hash;
+                continue;
+            }
+        }
+        let ch = rest.chars().next().unwrap();
+        escape_template_char(ch, body);
+        rest = &rest[ch.len_utf8()..];
     }
 }
 

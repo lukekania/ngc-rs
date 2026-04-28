@@ -5015,6 +5015,72 @@ mod tests {
     }
 
     #[test]
+    fn test_icu_plural_case_body_hash_emits_switch_placeholder() {
+        // `#` inside a `plural` case body references the switch binding —
+        // it should round-trip through `$localize` as the same indexed
+        // marker the switch position uses, so the runtime substitutes the
+        // count value where `#` appears. Reusing the switch's interpolation
+        // index also means no extra `ɵɵi18nExp` call: the existing one for
+        // the switch already feeds the case-body substitution.
+        let output = compile_template(
+            "<span i18n>{ count, plural, =0 {none} =1 {one} other {# items} }</span>",
+        );
+        let dc = &output.static_fields[0];
+        assert!(
+            dc.contains("other {${\"\\u{FFFD}0\\u{FFFD}\"}:INTERPOLATION: items}"),
+            "`#` in plural case body should emit \\uFFFD0\\uFFFD INTERPOLATION marker: {dc}"
+        );
+        assert_eq!(
+            dc.matches("\u{0275}\u{0275}i18nExp(ctx.count);").count(),
+            1,
+            "should emit exactly one ɵɵi18nExp(ctx.count) — the switch's call covers the `#` substitution: {dc}"
+        );
+    }
+
+    #[test]
+    fn test_icu_plural_case_body_interpolation_emits_new_placeholder() {
+        // `{{name}}` inside a plural case body is its own binding — it must
+        // allocate a fresh interpolation index and emit a matching
+        // `ɵɵi18nExp(ctx.name)` in the update block alongside the switch's
+        // call.
+        let output = compile_template(
+            "<span i18n>{ count, plural, =0 {none} other {{{name}} items} }</span>",
+        );
+        let dc = &output.static_fields[0];
+        assert!(
+            dc.contains("other {${\"\\u{FFFD}1\\u{FFFD}\"}:INTERPOLATION: items}"),
+            "`{{{{name}}}}` in case body should emit a new \\uFFFD1\\uFFFD INTERPOLATION marker: {dc}"
+        );
+        assert!(
+            dc.contains("\u{0275}\u{0275}i18nExp(ctx.count);"),
+            "switch's ɵɵi18nExp(ctx.count) should still be present: {dc}"
+        );
+        assert!(
+            dc.contains("\u{0275}\u{0275}i18nExp(ctx.name);"),
+            "nested interpolation should add ɵɵi18nExp(ctx.name): {dc}"
+        );
+    }
+
+    #[test]
+    fn test_icu_select_case_body_hash_stays_literal() {
+        // `select` cases do not interpret `#` — it must reach the runtime as
+        // literal text, not a placeholder. Regression guard for the
+        // category check inside `compile_message`'s ICU arm.
+        let output = compile_template(
+            "<span i18n>{ gender, select, male {he #1} female {she} other {they} }</span>",
+        );
+        let dc = &output.static_fields[0];
+        assert!(
+            dc.contains("male {he #1}"),
+            "`#` inside a `select` case body must remain literal: {dc}"
+        );
+        assert!(
+            !dc.contains("male {he ${\"\\u{FFFD}0\\u{FFFD}\"}:INTERPOLATION:"),
+            "`select` case body must not emit a `#` substitution placeholder: {dc}"
+        );
+    }
+
+    #[test]
     fn test_scope_component_styles_single_element_array() {
         let scoped = scope_component_styles("[`.a { color: red; }`]");
         assert_eq!(scoped, "[`.a[_ngcontent-%COMP%]{ color: red; }`]");
