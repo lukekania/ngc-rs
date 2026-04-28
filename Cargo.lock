@@ -713,6 +713,8 @@ version = "0.7.42"
 dependencies = [
  "ngc-diagnostics",
  "oxc_allocator",
+ "oxc_ast",
+ "oxc_ast_visit",
  "oxc_codegen",
  "oxc_parser",
  "oxc_semantic",
