@@ -1,0 +1,16 @@
+[package]
+name = "ngc-dev-server"
+description = "HTTP dev server with live reload for ngc-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ngc-diagnostics = { path = "../diagnostics" }
+tiny_http = "0.12"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

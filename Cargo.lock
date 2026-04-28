@@ -80,6 +80,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "ascii"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d92bec98840b8f03a5ff5413de5293bfcd8bf96467cf5452609f939ec6f5de16"
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -146,6 +152,12 @@ name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+
+[[package]]
+name = "chunked_transfer"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e4de3bc4ea267985becf712dc6d9eed8b04c953b3fcfb339ebc87acd9804901"
 
 [[package]]
 name = "clap"
@@ -486,6 +498,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "httpdate"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
 name = "id-arena"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -674,7 +692,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-bundler"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "dashmap",
  "ngc-diagnostics",
@@ -696,8 +714,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ngc-dev-server"
+version = "0.8.1"
+dependencies = [
+ "ngc-diagnostics",
+ "tempfile",
+ "tiny_http",
+ "tracing",
+]
+
+[[package]]
 name = "ngc-diagnostics"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "serde_json",
  "thiserror",
@@ -705,7 +733,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-linker"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "insta",
  "ngc-diagnostics",
@@ -721,7 +749,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-npm-resolver"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "dashmap",
  "ngc-diagnostics",
@@ -736,7 +764,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-project-resolver"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "glob",
  "ngc-diagnostics",
@@ -751,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-rs"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "base64",
  "clap",
@@ -780,7 +808,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-template-compiler"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "insta",
  "ngc-diagnostics",
@@ -800,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-ts-transform"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "ngc-diagnostics",
  "oxc_allocator",
@@ -818,7 +846,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-watch"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "ngc-diagnostics",
  "notify",
@@ -1755,6 +1783,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "tiny_http"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "389915df6413a2e74fb181895f933386023c71110878cd0825588928e64cdc82"
+dependencies = [
+ "ascii",
+ "chunked_transfer",
+ "httpdate",
+ "log",
 ]
 
 [[package]]
