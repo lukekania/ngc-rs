@@ -146,17 +146,32 @@ fn walk_children(children: &[TemplateNode], body: &mut String, interpolations: &
                 ));
             }
             TemplateNode::IcuExpression(icu) => {
-                // Inline the raw ICU message — Angular's translator pipeline
-                // understands the `{expr, plural, ...}` shape verbatim inside
-                // a `$localize` literal.
+                // Angular's runtime ICU parser (`ICU_BLOCK_REGEXP` in
+                // `@angular/core`'s `i18n_parse`) matches the switch position
+                // against `\uFFFD<idx>:?\d*\uFFFD` — the same indexed
+                // placeholder marker used for regular interpolations. The
+                // translator-facing placeholder name (`VAR_PLURAL`,
+                // `VAR_SELECT`, `VAR_SELECTORDINAL`) is carried as the
+                // `${...}:NAME:` block label, which `$localize` strips when
+                // building the runtime message. Pushing the user-authored
+                // switch expression into `interpolations` makes the caller
+                // emit the matching `ɵɵi18nExp(ctx.<expr>)` in the update
+                // block.
+                let idx = interpolations.len();
+                interpolations.push(icu.switch_expression.clone());
+                let (placeholder_name, category_kw) = match icu.category {
+                    crate::ast::IcuCategory::Plural => ("VAR_PLURAL", "plural"),
+                    crate::ast::IcuCategory::Select => ("VAR_SELECT", "select"),
+                    crate::ast::IcuCategory::SelectOrdinal => {
+                        ("VAR_SELECTORDINAL", "selectordinal")
+                    }
+                };
                 body.push('{');
-                append_template_text(body, &icu.switch_expression);
+                body.push_str(&format!(
+                    "${{\"\\u{{FFFD}}{idx}\\u{{FFFD}}\"}}:{placeholder_name}:"
+                ));
                 body.push_str(", ");
-                body.push_str(match icu.category {
-                    crate::ast::IcuCategory::Plural => "plural",
-                    crate::ast::IcuCategory::Select => "select",
-                    crate::ast::IcuCategory::SelectOrdinal => "selectordinal",
-                });
+                body.push_str(category_kw);
                 body.push_str(", ");
                 for case in &icu.cases {
                     append_template_text(body, &case.key);
