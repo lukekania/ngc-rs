@@ -2034,8 +2034,18 @@ impl IvyCodegen {
         }
 
         // Trigger instructions — emit for each trigger, prefetch variants last.
-        for trig in &block.triggers {
-            self.emit_defer_trigger(trig, defer_slot, false, placeholder_refs.as_ref());
+        // `@defer { … }` with no explicit trigger defaults to `on idle`; ng
+        // build emits the same `ɵɵdeferOnIdle()` and the runtime expects a
+        // trigger to be registered or the block stays in the placeholder
+        // state forever (with no error path back to the primary view).
+        if block.triggers.is_empty() {
+            let sym = "\u{0275}\u{0275}deferOnIdle";
+            self.ivy_imports.insert(sym.to_string());
+            self.creation.push(format!("{sym}();"));
+        } else {
+            for trig in &block.triggers {
+                self.emit_defer_trigger(trig, defer_slot, false, placeholder_refs.as_ref());
+            }
         }
         for trig in &block.prefetch_triggers {
             self.emit_defer_trigger(trig, defer_slot, true, placeholder_refs.as_ref());
