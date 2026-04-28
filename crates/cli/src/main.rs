@@ -12,9 +12,11 @@ use ngc_project_resolver::angular_json::{
 };
 use ngc_template_compiler::{StyleContext, StyleLanguage};
 
+mod incremental;
 mod localize;
 mod ngsw;
 mod polyfills;
+mod watch_cmd;
 
 /// Result of the bundled build pipeline.
 #[derive(serde::Serialize)]
@@ -64,6 +66,26 @@ enum Commands {
         #[arg(long)]
         localize: bool,
     },
+    /// Watch the project's input files and rebuild incrementally on every
+    /// save. The first rebuild does a full pipeline run; subsequent rebuilds
+    /// reuse cached template-compile and ts-transform outputs for any file
+    /// whose bytes haven't changed, so unchanged chunks keep their
+    /// content-hash filename.
+    Watch {
+        /// Path to tsconfig.json
+        #[arg(long, default_value = "tsconfig.json")]
+        project: PathBuf,
+        /// Output directory (overrides tsconfig/angular.json outDir).
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+        /// Build configuration name (e.g. "production", "development").
+        #[arg(long, short = 'c')]
+        configuration: Option<String>,
+        /// Emit one `<out_dir>/<locale>/` tree per locale defined in
+        /// `angular.json`'s `i18n.locales` block.
+        #[arg(long)]
+        localize: bool,
+    },
     /// Extract translatable messages from every component template in the
     /// project and emit a `messages.xlf` (XLIFF 1.2) file.
     ExtractI18n {
@@ -107,6 +129,24 @@ fn main() {
                 process::exit(1);
             }
         },
+        Commands::Watch {
+            project,
+            out_dir,
+            configuration,
+            localize,
+        } => {
+            if let Err(e) = watch_cmd::run(
+                &project,
+                out_dir.as_deref(),
+                configuration.as_deref(),
+                localize,
+                Vec::new(),
+                |_| false,
+            ) {
+                eprintln!("{} {e}", "Error:".red().bold());
+                process::exit(1);
+            }
+        }
         Commands::ExtractI18n {
             project,
             out_file,
@@ -188,6 +228,20 @@ fn run_build(
     configuration: Option<&str>,
     localize: bool,
 ) -> NgcResult<BuildResult> {
+    run_build_with_cache(project, out_dir_override, configuration, localize, None)
+}
+
+/// Variant of [`run_build`] that consults a [`incremental::BuildCache`] to
+/// skip template compilation and TypeScript transformation for source files
+/// whose bytes haven't changed since the last successful build. Used by the
+/// `watch` subcommand; one-shot `build` callers pass `None`.
+pub(crate) fn run_build_with_cache(
+    project: &Path,
+    out_dir_override: Option<&Path>,
+    configuration: Option<&str>,
+    localize: bool,
+    mut cache: Option<&mut incremental::BuildCache>,
+) -> NgcResult<BuildResult> {
     // Step 1: Try to find angular.json
     let angular_project = find_and_resolve_angular_json(project, configuration)?;
 
@@ -245,7 +299,16 @@ fn run_build(
     let templates_span = tracing::info_span!("template_compile").entered();
     let files: Vec<PathBuf> = file_graph.graph.node_weights().cloned().collect();
     let style_ctx = build_style_context(angular_project.as_ref(), &config_dir);
-    let compiled = ngc_template_compiler::compile_all_decorators_with_styles(&files, &style_ctx)?;
+    // Pre-hash every project source so we can answer cache lookups without
+    // an extra disk read in the per-file compile path. `compile_one` falls
+    // back to a fresh read when hashing fails (e.g. file deleted between
+    // resolve and compile).
+    let file_hashes: HashMap<PathBuf, [u8; 32]> = files
+        .iter()
+        .filter_map(|p| incremental::BuildCache::hash_file(p).map(|h| (p.clone(), h)))
+        .collect();
+    let (compiled, transform_cache_seed) =
+        compile_decorators_cached(&files, &style_ctx, cache.as_deref_mut(), &file_hashes)?;
     drop(templates_span);
 
     // Report any JIT fallbacks
@@ -273,7 +336,13 @@ fn run_build(
     // Step 6: Transform TS → JS
     let bundle_options = build_options(configuration);
     let transform_span = tracing::info_span!("ts_transform").entered();
-    let transformed = transform_with_fallback(&sources, bundle_options.source_maps)?;
+    let transformed = transform_with_fallback_cached(
+        &sources,
+        bundle_options.source_maps,
+        cache,
+        &file_hashes,
+        &transform_cache_seed,
+    )?;
 
     // Build modules map (canonical source path → JS code) and collect source maps
     let mut modules: HashMap<PathBuf, String> = HashMap::new();
@@ -1762,46 +1831,143 @@ fn format_bytes(bytes: u64) -> String {
 
 /// Transform sources with fallback: if a compiled source fails oxc parsing,
 /// re-read the original file and transform that instead.
-fn transform_with_fallback(
+/// Cache-aware wrapper around `compile_all_decorators_with_styles`.
+///
+/// For each file, hashes its disk bytes and consults the `BuildCache`. On a
+/// hit, reuses the cached `CompiledFile`; on a miss, calls
+/// `compile_file_with_styles` directly, then writes the result back. Also
+/// pre-stages the post-compile bytes for the transform step so the
+/// transform pass can hash without re-reading the file.
+type CompileWithHashes = (
+    Vec<ngc_template_compiler::CompiledFile>,
+    HashMap<PathBuf, [u8; 32]>,
+);
+
+fn compile_decorators_cached(
+    files: &[PathBuf],
+    style_ctx: &ngc_template_compiler::StyleContext,
+    mut cache: Option<&mut incremental::BuildCache>,
+    file_hashes: &HashMap<PathBuf, [u8; 32]>,
+) -> NgcResult<CompileWithHashes> {
+    let mut compiled: Vec<ngc_template_compiler::CompiledFile> = Vec::with_capacity(files.len());
+    let mut compile_hashes: HashMap<PathBuf, [u8; 32]> = HashMap::new();
+    let cache_present = cache.is_some();
+    for file in files {
+        let hash = file_hashes.get(file).copied();
+        let cached_hit = match (cache.as_deref(), hash) {
+            (Some(c), Some(h)) => c.get_fresh(file, &h).cloned(),
+            _ => None,
+        };
+        if let Some(hit) = cached_hit {
+            compile_hashes.insert(file.clone(), hit.source_hash);
+            compiled.push(ngc_template_compiler::CompiledFile {
+                source_path: file.clone(),
+                source: hit.compiled_source,
+                compiled: true,
+                jit_fallback: hit.jit_fallback,
+            });
+            continue;
+        }
+        let source = std::fs::read_to_string(file).map_err(|e| NgcError::Io {
+            path: file.clone(),
+            source: e,
+        })?;
+        let cf = ngc_template_compiler::compile_file_with_styles(&source, file, style_ctx)?;
+        if cache_present {
+            // Recompute hash if pre-hashing missed (file changed under us).
+            let h = hash.unwrap_or_else(|| incremental::BuildCache::hash_bytes(source.as_bytes()));
+            compile_hashes.insert(file.clone(), h);
+            if let Some(c) = cache.as_deref_mut() {
+                c.insert(
+                    file.clone(),
+                    incremental::CachedModule {
+                        source_hash: h,
+                        compiled_source: cf.source.clone(),
+                        jit_fallback: cf.jit_fallback,
+                        // Filled in by the transform step.
+                        transformed_code: String::new(),
+                        transformed_map: None,
+                    },
+                );
+            }
+        }
+        compiled.push(cf);
+    }
+    Ok((compiled, compile_hashes))
+}
+
+/// Cache-aware wrapper around `transform_with_fallback`. Reuses cached
+/// transformed JS when the source hash matches what the template-compile
+/// pass observed; otherwise transforms fresh and writes back.
+fn transform_with_fallback_cached(
     sources: &[(PathBuf, String)],
     generate_source_maps: bool,
+    mut cache: Option<&mut incremental::BuildCache>,
+    file_hashes: &HashMap<PathBuf, [u8; 32]>,
+    compile_hashes: &HashMap<PathBuf, [u8; 32]>,
 ) -> NgcResult<Vec<ngc_ts_transform::TransformedModule>> {
-    let results: Vec<NgcResult<ngc_ts_transform::TransformedModule>> = sources
-        .iter()
-        .map(|(path, source)| {
-            let file_name = path.to_string_lossy();
-            match ngc_ts_transform::transform_source_with_map(
-                source,
-                &file_name,
-                generate_source_maps,
-            ) {
-                Ok((code, source_map)) => Ok(ngc_ts_transform::TransformedModule {
+    let mut transformed: Vec<ngc_ts_transform::TransformedModule> =
+        Vec::with_capacity(sources.len());
+    for (path, source) in sources {
+        let hash = compile_hashes
+            .get(path)
+            .copied()
+            .or_else(|| file_hashes.get(path).copied());
+        let cached_hit = match (cache.as_deref(), hash) {
+            (Some(c), Some(h)) => c.get_fresh(path, &h).cloned(),
+            _ => None,
+        };
+        if let Some(hit) = cached_hit {
+            if !hit.transformed_code.is_empty() {
+                transformed.push(ngc_ts_transform::TransformedModule {
                     source_path: path.clone(),
-                    code,
-                    source_map,
-                }),
-                Err(e) => {
-                    eprintln!(
-                        "{} transform fallback for {} ({})",
-                        "Warning:".yellow().bold(),
-                        path.display(),
-                        e
-                    );
-                    // The compiled source (with AOT ɵcmp metadata) failed to
-                    // transform. Emit it as-is — the bundler uses SourceType::tsx()
-                    // and can handle remaining TS annotations. Preserving the AOT
-                    // metadata is critical to avoid JIT compilation at runtime.
-                    Ok(ngc_ts_transform::TransformedModule {
-                        source_path: path.clone(),
-                        code: source.clone(),
-                        source_map: None,
-                    })
-                }
+                    code: hit.transformed_code,
+                    source_map: hit.transformed_map,
+                });
+                continue;
             }
-        })
-        .collect();
+        }
+        let module = transform_one(path, source, generate_source_maps);
+        if let (Some(c), Some(h)) = (cache.as_deref_mut(), hash) {
+            if let Some(existing) = c.entries_get_mut(path) {
+                existing.transformed_code = module.code.clone();
+                existing.transformed_map = module.source_map.clone();
+                existing.source_hash = h;
+            }
+        }
+        transformed.push(module);
+    }
+    Ok(transformed)
+}
 
-    results.into_iter().collect()
+/// Single-file transform with the same fallback behaviour as
+/// `transform_with_fallback`.
+fn transform_one(
+    path: &Path,
+    source: &str,
+    generate_source_maps: bool,
+) -> ngc_ts_transform::TransformedModule {
+    let file_name = path.to_string_lossy();
+    match ngc_ts_transform::transform_source_with_map(source, &file_name, generate_source_maps) {
+        Ok((code, source_map)) => ngc_ts_transform::TransformedModule {
+            source_path: path.to_path_buf(),
+            code,
+            source_map,
+        },
+        Err(e) => {
+            eprintln!(
+                "{} transform fallback for {} ({})",
+                "Warning:".yellow().bold(),
+                path.display(),
+                e
+            );
+            ngc_ts_transform::TransformedModule {
+                source_path: path.to_path_buf(),
+                code: source.to_string(),
+                source_map: None,
+            }
+        }
+    }
 }
 
 /// Vendored oxc runtime helpers.

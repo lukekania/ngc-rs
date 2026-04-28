@@ -195,6 +195,13 @@ pub enum NgcError {
         /// Description of the misconfiguration.
         message: String,
     },
+
+    /// A filesystem watcher error (notify backend failure, missing path, etc.).
+    #[error("watch error: {message}")]
+    WatchError {
+        /// Description of what went wrong while watching files.
+        message: String,
+    },
 }
 
 /// A type alias for Results using NgcError.
