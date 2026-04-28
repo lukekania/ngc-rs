@@ -284,6 +284,22 @@ pub fn compile_templates(files: &[PathBuf]) -> NgcResult<Vec<CompiledFile>> {
 /// Tries `@Component` first, then falls through to `@Injectable`, `@Directive`,
 /// `@Pipe`, and `@NgModule`. Returns the source unchanged if no Angular decorator
 /// is found.
+///
+/// Public so incremental rebuilders (the `watch` subcommand) can drive a
+/// single-file recompile without re-reading the entire project.
+pub fn compile_file_with_styles(
+    source: &str,
+    file_path: &Path,
+    style_ctx: &StyleContext,
+) -> NgcResult<CompiledFile> {
+    compile_file(source, file_path, style_ctx)
+}
+
+/// Compile a single TypeScript source file, handling all Angular decorator types.
+///
+/// Tries `@Component` first, then falls through to `@Injectable`, `@Directive`,
+/// `@Pipe`, and `@NgModule`. Returns the source unchanged if no Angular decorator
+/// is found.
 fn compile_file(
     source: &str,
     file_path: &Path,
