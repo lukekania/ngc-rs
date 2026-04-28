@@ -339,7 +339,8 @@ fn collect_module_decl_edits(
     }
 }
 
-/// Walk a statement recursively to find dynamic `import()` expressions.
+/// Walk a statement recursively to find dynamic `import()` expressions and
+/// `new Worker(new URL(...))` constructions.
 fn collect_dynamic_import_edits(
     stmt: &Statement,
     rewrites: &HashMap<String, String>,
@@ -368,15 +369,23 @@ fn collect_dynamic_import_edits(
                 collect_dynamic_import_edits_from_decl(decl, rewrites, edits, dynamic_imports);
             }
         }
-        Statement::ExportDefaultDeclaration(export) => {
-            if let ExportDefaultDeclarationKind::FunctionDeclaration(f) = &export.declaration {
+        Statement::ExportDefaultDeclaration(export) => match &export.declaration {
+            ExportDefaultDeclarationKind::FunctionDeclaration(f) => {
                 if let Some(body) = &f.body {
                     for s in &body.statements {
                         collect_dynamic_import_edits(s, rewrites, edits, dynamic_imports);
                     }
                 }
             }
-        }
+            ExportDefaultDeclarationKind::ClassDeclaration(c) => {
+                walk_class_for_dynamic_imports(c, rewrites, edits, dynamic_imports);
+            }
+            other => {
+                if let Some(expr) = other.as_expression() {
+                    walk_expr_for_dynamic_imports(expr, rewrites, edits, dynamic_imports);
+                }
+            }
+        },
         // Top-level `function foo() { ... return import('./x'); }` — e.g. the
         // dependency-resolver helpers emitted by the template-compiler for
         // `@defer` blocks. Without this arm, `import()` calls inside the body
@@ -388,6 +397,81 @@ fn collect_dynamic_import_edits(
                     collect_dynamic_import_edits(s, rewrites, edits, dynamic_imports);
                 }
             }
+        }
+        // Top-level class declarations: Angular components/services live here.
+        // Their constructors and method bodies hold the `new Worker(new URL(...))`
+        // call sites that need rewriting (issue #93).
+        Statement::ClassDeclaration(class) => {
+            walk_class_for_dynamic_imports(class, rewrites, edits, dynamic_imports);
+        }
+        Statement::BlockStatement(block) => {
+            for s in &block.body {
+                collect_dynamic_import_edits(s, rewrites, edits, dynamic_imports);
+            }
+        }
+        Statement::IfStatement(if_stmt) => {
+            walk_expr_for_dynamic_imports(&if_stmt.test, rewrites, edits, dynamic_imports);
+            collect_dynamic_import_edits(&if_stmt.consequent, rewrites, edits, dynamic_imports);
+            if let Some(alt) = &if_stmt.alternate {
+                collect_dynamic_import_edits(alt, rewrites, edits, dynamic_imports);
+            }
+        }
+        Statement::ForStatement(for_stmt) => {
+            if let Some(test) = &for_stmt.test {
+                walk_expr_for_dynamic_imports(test, rewrites, edits, dynamic_imports);
+            }
+            if let Some(update) = &for_stmt.update {
+                walk_expr_for_dynamic_imports(update, rewrites, edits, dynamic_imports);
+            }
+            collect_dynamic_import_edits(&for_stmt.body, rewrites, edits, dynamic_imports);
+        }
+        Statement::ForInStatement(stmt) => {
+            walk_expr_for_dynamic_imports(&stmt.right, rewrites, edits, dynamic_imports);
+            collect_dynamic_import_edits(&stmt.body, rewrites, edits, dynamic_imports);
+        }
+        Statement::ForOfStatement(stmt) => {
+            walk_expr_for_dynamic_imports(&stmt.right, rewrites, edits, dynamic_imports);
+            collect_dynamic_import_edits(&stmt.body, rewrites, edits, dynamic_imports);
+        }
+        Statement::WhileStatement(stmt) => {
+            walk_expr_for_dynamic_imports(&stmt.test, rewrites, edits, dynamic_imports);
+            collect_dynamic_import_edits(&stmt.body, rewrites, edits, dynamic_imports);
+        }
+        Statement::DoWhileStatement(stmt) => {
+            walk_expr_for_dynamic_imports(&stmt.test, rewrites, edits, dynamic_imports);
+            collect_dynamic_import_edits(&stmt.body, rewrites, edits, dynamic_imports);
+        }
+        Statement::TryStatement(stmt) => {
+            for s in &stmt.block.body {
+                collect_dynamic_import_edits(s, rewrites, edits, dynamic_imports);
+            }
+            if let Some(handler) = &stmt.handler {
+                for s in &handler.body.body {
+                    collect_dynamic_import_edits(s, rewrites, edits, dynamic_imports);
+                }
+            }
+            if let Some(finalizer) = &stmt.finalizer {
+                for s in &finalizer.body {
+                    collect_dynamic_import_edits(s, rewrites, edits, dynamic_imports);
+                }
+            }
+        }
+        Statement::SwitchStatement(stmt) => {
+            walk_expr_for_dynamic_imports(&stmt.discriminant, rewrites, edits, dynamic_imports);
+            for case in &stmt.cases {
+                if let Some(test) = &case.test {
+                    walk_expr_for_dynamic_imports(test, rewrites, edits, dynamic_imports);
+                }
+                for s in &case.consequent {
+                    collect_dynamic_import_edits(s, rewrites, edits, dynamic_imports);
+                }
+            }
+        }
+        Statement::ThrowStatement(stmt) => {
+            walk_expr_for_dynamic_imports(&stmt.argument, rewrites, edits, dynamic_imports);
+        }
+        Statement::LabeledStatement(stmt) => {
+            collect_dynamic_import_edits(&stmt.body, rewrites, edits, dynamic_imports);
         }
         _ => {}
     }
@@ -415,7 +499,47 @@ fn collect_dynamic_import_edits_from_decl(
                 }
             }
         }
+        oxc_ast::ast::Declaration::ClassDeclaration(class) => {
+            walk_class_for_dynamic_imports(class, rewrites, edits, dynamic_imports);
+        }
         _ => {}
+    }
+}
+
+/// Walk a class body — constructors, methods, property initializers, and
+/// static blocks — for dynamic imports and worker URL constructions.
+fn walk_class_for_dynamic_imports(
+    class: &oxc_ast::ast::Class,
+    rewrites: &HashMap<String, String>,
+    edits: &mut Vec<TextEdit>,
+    dynamic_imports: &mut Vec<DynamicImportInfo>,
+) {
+    for element in &class.body.body {
+        match element {
+            oxc_ast::ast::ClassElement::MethodDefinition(method) => {
+                if let Some(body) = &method.value.body {
+                    for s in &body.statements {
+                        collect_dynamic_import_edits(s, rewrites, edits, dynamic_imports);
+                    }
+                }
+            }
+            oxc_ast::ast::ClassElement::PropertyDefinition(prop) => {
+                if let Some(value) = &prop.value {
+                    walk_expr_for_dynamic_imports(value, rewrites, edits, dynamic_imports);
+                }
+            }
+            oxc_ast::ast::ClassElement::AccessorProperty(prop) => {
+                if let Some(value) = &prop.value {
+                    walk_expr_for_dynamic_imports(value, rewrites, edits, dynamic_imports);
+                }
+            }
+            oxc_ast::ast::ClassElement::StaticBlock(block) => {
+                for s in &block.body {
+                    collect_dynamic_import_edits(s, rewrites, edits, dynamic_imports);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -513,6 +637,16 @@ fn walk_expr_for_dynamic_imports(
                     collect_dynamic_import_edits(s, rewrites, edits, dynamic_imports);
                 }
             }
+        }
+        Expression::FunctionExpression(func) => {
+            if let Some(body) = &func.body {
+                for s in &body.statements {
+                    collect_dynamic_import_edits(s, rewrites, edits, dynamic_imports);
+                }
+            }
+        }
+        Expression::ClassExpression(class) => {
+            walk_class_for_dynamic_imports(class, rewrites, edits, dynamic_imports);
         }
         // Handle member expressions (StaticMember, ComputedMember, PrivateField)
         _ if expr.as_member_expression().is_some() => {
@@ -883,6 +1017,44 @@ mod tests {
         let result = rewrite_module(code, "test.js", &["."], &rewrites).expect("should rewrite");
         assert!(result.code.contains("'./worker-shared.js'"));
         assert!(!result.code.contains("./shared.worker"));
+    }
+
+    #[test]
+    fn test_worker_url_in_class_constructor_rewritten() {
+        // Repro for issue #93: Angular components are classes, and the
+        // `new Worker(new URL(...))` call lives inside the constructor body.
+        // The walker must descend through class declarations and method
+        // bodies for the rewrite to land.
+        let code = "class WebWorkerComponent {\n\
+                    constructor() {\n\
+                      this.worker = new Worker(new URL('./hash.worker', import.meta.url), { type: 'module' });\n\
+                    }\n\
+                  }\n";
+        let mut rewrites = HashMap::new();
+        rewrites.insert("./hash.worker".to_string(), "worker-hash.js".to_string());
+        let result = rewrite_module(code, "test.js", &["."], &rewrites).expect("should rewrite");
+        assert!(
+            result.code.contains("'./worker-hash.js'"),
+            "expected the URL specifier to be rewritten in a class constructor; got:\n{}",
+            result.code
+        );
+        assert!(!result.code.contains("./hash.worker"));
+    }
+
+    #[test]
+    fn test_dynamic_import_in_class_method_rewritten() {
+        let code = "class Loader {\n\
+                    load() { return import('./lazy').then(m => m.X); }\n\
+                  }\n";
+        let mut rewrites = HashMap::new();
+        rewrites.insert("./lazy".to_string(), "chunk-lazy.js".to_string());
+        let result = rewrite_module(code, "test.js", &["."], &rewrites).expect("should rewrite");
+        assert!(
+            result.code.contains("'./chunk-lazy.js'"),
+            "expected the import() specifier to be rewritten inside a class method; got:\n{}",
+            result.code
+        );
+        assert!(!result.code.contains("import('./lazy')"));
     }
 
     #[test]
