@@ -534,33 +534,25 @@ fn scc_emit_deps_first(
 
 /// Derive a worker chunk filename from a worker entry's file path.
 ///
-/// Strips a trailing `.worker` segment so `foo.worker.ts` produces
-/// `worker-foo.js` rather than the redundant `worker-foo-worker.js`.
-/// Example: `/root/src/app/compute.worker.ts` → `"worker-compute.js"`
-fn worker_chunk_filename_from_path(path: &Path, root_dir: &Path) -> String {
-    let relative = path.strip_prefix(root_dir).unwrap_or(path);
-    let stem = relative.with_extension("");
-    let stem_str = stem.to_string_lossy();
-
-    let name = stem_str
-        .replace(['/', '\\'], "-")
-        .replace('.', "-")
-        .to_lowercase();
-
-    let mut parts: Vec<&str> = name.split('-').filter(|s| !s.is_empty()).collect();
-    if parts.last().is_some_and(|s| *s == "worker") {
-        parts.pop();
-    }
-    let short_name = if parts.len() > 2 {
-        parts[parts.len() - 2..].join("-")
-    } else {
-        parts.join("-")
+/// Uses just the basename so a parent directory containing the word `worker`
+/// (e.g. `web-worker/`) doesn't get folded into the output name. Strips the
+/// final extension and a trailing `.worker` segment so `hash.worker.ts`
+/// produces `worker-hash.js` rather than `worker-worker-hash.js`.
+fn worker_chunk_filename_from_path(path: &Path, _root_dir: &Path) -> String {
+    let basename = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let stem = match basename.rsplit_once('.') {
+        Some((stem, _ext)) => stem,
+        None => basename,
     };
-
-    if short_name.is_empty() {
+    let trimmed = stem.strip_suffix(".worker").unwrap_or(stem);
+    let name = trimmed.replace('.', "-").to_lowercase();
+    if name.is_empty() {
         "worker.js".to_string()
     } else {
-        format!("worker-{short_name}.js")
+        format!("worker-{name}.js")
     }
 }
 
@@ -822,14 +814,30 @@ mod tests {
             worker_chunk_filename_from_path(Path::new("/root/src/compute.worker.ts"), root),
             "worker-compute.js"
         );
+        // The parent dir is dropped — only the basename contributes.
         assert_eq!(
             worker_chunk_filename_from_path(Path::new("/root/src/workers/compute.worker.ts"), root),
-            "worker-workers-compute.js"
+            "worker-compute.js"
         );
         // No trailing .worker segment — no strip.
         assert_eq!(
             worker_chunk_filename_from_path(Path::new("/root/src/foo.ts"), root),
             "worker-foo.js"
+        );
+    }
+
+    /// Regression for issue #93: a parent directory whose name contains
+    /// `worker` (e.g. `web-worker/`) used to get folded into the output
+    /// name, producing `worker-worker-hash.js` for `hash.worker.ts`.
+    #[test]
+    fn test_worker_chunk_filename_does_not_double_worker_prefix() {
+        let root = Path::new("/root/src");
+        assert_eq!(
+            worker_chunk_filename_from_path(
+                Path::new("/root/src/app/features/web-worker/hash.worker.ts"),
+                root,
+            ),
+            "worker-hash.js"
         );
     }
 
