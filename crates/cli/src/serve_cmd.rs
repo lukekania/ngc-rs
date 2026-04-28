@@ -52,13 +52,8 @@ pub(crate) fn run_with_stop(
     let out_dir = crate::resolve_out_dir(project, None, configuration)?;
     let mut cache = BuildCache::new();
 
-    let initial = crate::run_build_with_cache(
-        project,
-        None,
-        configuration,
-        false,
-        Some(&mut cache),
-    )?;
+    let initial =
+        crate::run_build_with_cache(project, None, configuration, false, Some(&mut cache))?;
     eprintln!(
         "{} {} module(s), {} file(s)",
         "ngc-rs build complete".bold().green(),
@@ -142,11 +137,9 @@ fn install_ctrlc(flag: Arc<AtomicBool>) {
 pub(crate) fn open_browser(url: &str) -> NgcResult<()> {
     let mut cmd = browser_command();
     cmd.arg(url);
-    cmd.spawn()
-        .map(|_| ())
-        .map_err(|e| NgcError::ServeError {
-            message: format!("could not spawn browser opener: {e}"),
-        })
+    cmd.spawn().map(|_| ()).map_err(|e| NgcError::ServeError {
+        message: format!("could not spawn browser opener: {e}"),
+    })
 }
 
 #[cfg(target_os = "macos")]
