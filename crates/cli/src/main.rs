@@ -11,6 +11,7 @@ use ngc_project_resolver::angular_json::{
     ResolvedAsset, ResolvedStyle,
 };
 use ngc_template_compiler::{StyleContext, StyleLanguage};
+use rayon::prelude::*;
 
 mod incremental;
 mod localize;
@@ -640,41 +641,53 @@ pub(crate) fn run_build_with_cache(
 
     let mut output_files: Vec<PathBuf> = Vec::new();
 
-    // Write all chunk files (main.js + chunk-*.js) with optional source maps
-    for (filename, code) in &bundle_output.chunks {
-        let mut final_code = code.clone();
+    // Write all chunk files (main.js + chunk-*.js) with optional source maps.
+    // Per-chunk work is independent — each call writes a distinct path with
+    // no shared state — so fan out across rayon workers and fold the path
+    // lists back afterwards.
+    let written: Vec<Vec<PathBuf>> = bundle_output
+        .chunks
+        .par_iter()
+        .map(|(filename, code)| -> NgcResult<Vec<PathBuf>> {
+            let mut written_paths: Vec<PathBuf> = Vec::with_capacity(2);
+            let mut final_code = code.clone();
 
-        // Append source map reference if we have a map for this chunk
-        if let Some(source_map) = bundle_output.chunk_source_maps.get(filename) {
-            if bundle_options.source_maps {
-                if configuration == Some("production") {
-                    // External source map file
-                    let map_filename = format!("{filename}.map");
-                    final_code.push_str(&format!("//# sourceMappingURL={map_filename}\n"));
-                    let map_path = out_dir.join(&map_filename);
-                    std::fs::write(&map_path, source_map.to_json_string()).map_err(|e| {
-                        NgcError::Io {
-                            path: map_path.clone(),
-                            source: e,
-                        }
-                    })?;
-                    output_files.push(map_path);
-                } else {
-                    // Inline source map (data URL)
-                    final_code.push_str(&format!(
-                        "//# sourceMappingURL={}\n",
-                        source_map.to_data_url()
-                    ));
+            // Append source map reference if we have a map for this chunk
+            if let Some(source_map) = bundle_output.chunk_source_maps.get(filename) {
+                if bundle_options.source_maps {
+                    if configuration == Some("production") {
+                        // External source map file
+                        let map_filename = format!("{filename}.map");
+                        final_code.push_str(&format!("//# sourceMappingURL={map_filename}\n"));
+                        let map_path = out_dir.join(&map_filename);
+                        std::fs::write(&map_path, source_map.to_json_string()).map_err(|e| {
+                            NgcError::Io {
+                                path: map_path.clone(),
+                                source: e,
+                            }
+                        })?;
+                        written_paths.push(map_path);
+                    } else {
+                        // Inline source map (data URL)
+                        final_code.push_str(&format!(
+                            "//# sourceMappingURL={}\n",
+                            source_map.to_data_url()
+                        ));
+                    }
                 }
             }
-        }
 
-        let path = out_dir.join(filename);
-        std::fs::write(&path, &final_code).map_err(|e| NgcError::Io {
-            path: path.clone(),
-            source: e,
-        })?;
-        output_files.push(path);
+            let path = out_dir.join(filename);
+            std::fs::write(&path, &final_code).map_err(|e| NgcError::Io {
+                path: path.clone(),
+                source: e,
+            })?;
+            written_paths.push(path);
+            Ok(written_paths)
+        })
+        .collect::<NgcResult<Vec<_>>>()?;
+    for paths in written {
+        output_files.extend(paths);
     }
 
     // Step 8: Generate polyfills.js — resolve each entry through the npm

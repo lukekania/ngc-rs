@@ -839,6 +839,7 @@ dependencies = [
  "ngc-watch",
  "oxc_sourcemap",
  "petgraph",
+ "rayon",
  "regex",
  "serde",
  "serde_json",
