@@ -4,8 +4,8 @@ import { EventEmitter } from 'node:events';
 import { parseDiagnostics, ParsedDiagnostic, stripAnsi, summarizeDiagnostics } from './errors';
 
 const READY_PATTERN = /listening on\s+http(?:s)?:\/\/([^\s]+)/i;
-const REBUILD_OK_PATTERN = /ngc-rs rebuild\b/i;
-const BUILD_FAILED_PATTERN = /ngc-rs (?:rebuild )?(?:build )?(?:failed|error)/i;
+const REBUILD_OK_PATTERN = /ngc-rs rebuild\s+\d+\s+module/i;
+const BUILD_FAILED_PATTERN = /ngc-rs (?:rebuild|build)\s+failed\b/i;
 
 export interface NgcRsRunnerOptions {
   binary: string;
