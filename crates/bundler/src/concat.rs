@@ -936,7 +936,13 @@ fn generate_cross_chunk_exports(
     let mut all_symbols: BTreeSet<String> = BTreeSet::new();
     let mut var_lines: Vec<String> = Vec::new();
 
-    for (specifier, symbols) in needed_npm {
+    // Iterate `needed_npm` in sorted-key order; otherwise the resulting
+    // `var X = ns.X;` lines (and therefore main.js's content hash) flap from
+    // build to build because `HashMap` iteration order is randomized.
+    let mut npm_keys: Vec<&String> = needed_npm.keys().collect();
+    npm_keys.sort();
+    for specifier in npm_keys {
+        let symbols = &needed_npm[specifier];
         // Look up namespace: first by specifier, then by resolved namespace key
         let resolved_ns_key = specifier.strip_prefix("__resolved_ns__").map(String::from);
         let ns = specifier_to_ns.get(specifier).or(resolved_ns_key.as_ref());
