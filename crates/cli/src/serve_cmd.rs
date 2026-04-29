@@ -135,35 +135,45 @@ pub(crate) fn run_with_stop(
 /// payload that ships to the browser overlay.
 ///
 /// Reuses `Display` for the `message` so the overlay shows the same text
-/// the terminal already prints. Most build-pipeline error variants carry
-/// the offending file path; line/column information is not yet plumbed
-/// through `NgcError`, so the overlay gets `None` for those today.
+/// the terminal already prints, and lifts the offending file path plus
+/// (when the underlying parser surfaced them) line/column coordinates.
 pub(crate) fn build_failure_event(err: &NgcError) -> DevServerEvent {
+    let (file, line, column) = error_location(err);
     DevServerEvent::BuildFailed {
         message: err.to_string(),
-        file: error_file_path(err),
-        line: None,
-        column: None,
+        file,
+        line,
+        column,
     }
 }
 
-fn error_file_path(err: &NgcError) -> Option<PathBuf> {
+fn error_location(err: &NgcError) -> (Option<PathBuf>, Option<u32>, Option<u32>) {
     match err {
+        NgcError::ParseError {
+            path, line, column, ..
+        }
+        | NgcError::TransformError {
+            path, line, column, ..
+        }
+        | NgcError::TemplateParseError {
+            path, line, column, ..
+        }
+        | NgcError::TemplateCompileError {
+            path, line, column, ..
+        }
+        | NgcError::LinkerError {
+            path, line, column, ..
+        } => (Some(path.clone()), *line, *column),
         NgcError::Io { path, .. }
         | NgcError::TsConfigParse { path, .. }
         | NgcError::TsConfigExtendsNotFound { path }
-        | NgcError::ParseError { path, .. }
-        | NgcError::TransformError { path, .. }
-        | NgcError::TemplateParseError { path, .. }
-        | NgcError::TemplateCompileError { path, .. }
         | NgcError::AngularJsonParse { path, .. }
         | NgcError::AssetError { path, .. }
         | NgcError::StyleError { path, .. }
         | NgcError::SourceMapError { path, .. }
-        | NgcError::MinifyError { path, .. }
-        | NgcError::LinkerError { path, .. } => Some(path.clone()),
-        NgcError::UnresolvedImport { from_file, .. } => Some(from_file.clone()),
-        _ => None,
+        | NgcError::MinifyError { path, .. } => (Some(path.clone()), None, None),
+        NgcError::UnresolvedImport { from_file, .. } => (Some(from_file.clone()), None, None),
+        _ => (None, None, None),
     }
 }
 
@@ -234,10 +244,12 @@ mod tests {
     }
 
     #[test]
-    fn build_failure_event_extracts_path_from_parse_error() {
+    fn build_failure_event_extracts_location_from_parse_error() {
         let err = NgcError::ParseError {
             path: PathBuf::from("/proj/src/app.ts"),
             message: "unexpected token".to_string(),
+            line: Some(12),
+            column: Some(3),
         };
         let DevServerEvent::BuildFailed {
             message,
@@ -250,6 +262,21 @@ mod tests {
         };
         assert!(message.contains("unexpected token"));
         assert_eq!(file.as_deref(), Some(Path::new("/proj/src/app.ts")));
+        assert_eq!(line, Some(12));
+        assert_eq!(column, Some(3));
+    }
+
+    #[test]
+    fn build_failure_event_omits_location_when_parser_did_not_supply_one() {
+        let err = NgcError::ParseError {
+            path: PathBuf::from("/proj/src/app.ts"),
+            message: "unsupported file extension".to_string(),
+            line: None,
+            column: None,
+        };
+        let DevServerEvent::BuildFailed { line, column, .. } = build_failure_event(&err) else {
+            panic!("expected BuildFailed variant");
+        };
         assert!(line.is_none());
         assert!(column.is_none());
     }
