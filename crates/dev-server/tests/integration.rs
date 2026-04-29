@@ -238,6 +238,142 @@ fn trigger_reload_pushes_event_to_sse_client() {
 }
 
 #[test]
+fn build_failed_event_is_fanned_out_as_named_sse_frame() {
+    let fx = Fixture::new();
+    let mut stream = TcpStream::connect(fx.server.addr()).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    let req = "GET /__ngc_reload HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/event-stream\r\n\r\n";
+    stream.write_all(req.as_bytes()).expect("write");
+    stream.flush().expect("flush");
+
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line).expect("status line");
+    assert!(status_line.contains("200"), "status was {status_line}");
+
+    // Drain headers up to and including the blank separator line.
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).expect("header");
+        if n == 0 || line == "\r\n" {
+            break;
+        }
+    }
+
+    // Drain the initial `: connected` SSE comment + blank line.
+    let mut connected = String::new();
+    reader.read_line(&mut connected).expect("connected");
+    assert!(connected.starts_with(": connected"), "got {connected:?}");
+    let mut blank = String::new();
+    reader.read_line(&mut blank).expect("blank");
+
+    std::thread::sleep(Duration::from_millis(100));
+    fx.server
+        .send_event(ngc_dev_server::DevServerEvent::BuildFailed {
+            message: "syntax error: unexpected }".to_string(),
+            file: Some(PathBuf::from("/tmp/proj/src/app.ts")),
+            line: Some(7),
+            column: Some(2),
+        })
+        .expect("send build-failed");
+
+    let mut event_line = String::new();
+    reader.read_line(&mut event_line).expect("event line");
+    assert_eq!(event_line, "event: build-failed\n");
+
+    let mut data_line = String::new();
+    reader.read_line(&mut data_line).expect("data line");
+    let data = data_line
+        .trim_end_matches('\n')
+        .strip_prefix("data: ")
+        .expect("data: prefix");
+    let parsed: serde_json::Value =
+        serde_json::from_str(data).expect("json data payload");
+    assert_eq!(parsed["message"], "syntax error: unexpected }");
+    assert_eq!(parsed["file"], "/tmp/proj/src/app.ts");
+    assert_eq!(parsed["line"], 7);
+    assert_eq!(parsed["column"], 2);
+}
+
+#[test]
+fn build_failed_followed_by_reload_clears_overlay_path() {
+    let fx = Fixture::new();
+    let mut stream = TcpStream::connect(fx.server.addr()).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    let req = "GET /__ngc_reload HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/event-stream\r\n\r\n";
+    stream.write_all(req.as_bytes()).expect("write");
+    stream.flush().expect("flush");
+
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line).expect("status line");
+    assert!(status_line.contains("200"));
+
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).expect("header");
+        if n == 0 || line == "\r\n" {
+            break;
+        }
+    }
+    let mut connected = String::new();
+    reader.read_line(&mut connected).expect("connected");
+    let mut blank = String::new();
+    reader.read_line(&mut blank).expect("blank");
+
+    std::thread::sleep(Duration::from_millis(100));
+    fx.server
+        .send_event(ngc_dev_server::DevServerEvent::BuildFailed {
+            message: "boom".to_string(),
+            file: None,
+            line: None,
+            column: None,
+        })
+        .expect("send build-failed");
+
+    let mut ev1 = String::new();
+    reader.read_line(&mut ev1).expect("ev1");
+    assert_eq!(ev1, "event: build-failed\n");
+    let mut data1 = String::new();
+    reader.read_line(&mut data1).expect("data1");
+    let mut sep1 = String::new();
+    reader.read_line(&mut sep1).expect("sep1");
+
+    fx.server.trigger_reload().expect("trigger reload");
+
+    let mut ev2 = String::new();
+    reader.read_line(&mut ev2).expect("ev2");
+    assert_eq!(ev2, "event: reload\n");
+    let mut data2 = String::new();
+    reader.read_line(&mut data2).expect("data2");
+    assert_eq!(data2, "data: rebuild\n");
+}
+
+#[test]
+fn injected_overlay_client_listens_for_build_failed_event() {
+    let fx = Fixture::new();
+    let resp = http_get(fx.server.addr(), "/");
+    assert_eq!(resp.status, 200);
+    let body = std::str::from_utf8(&resp.body).expect("utf8 body");
+    assert!(
+        body.contains("addEventListener('build-failed'"),
+        "overlay listener not injected: {body}"
+    );
+    assert!(
+        body.contains("addEventListener('reload'"),
+        "reload listener missing: {body}"
+    );
+    assert!(
+        body.contains("__ngcRsOverlay"),
+        "overlay window handle missing: {body}"
+    );
+}
+
+#[test]
 fn unknown_extension_serves_octet_stream() {
     let root = TempDir::new().expect("tempdir");
     write_file(root.path(), "index.html", b"<html><body></body></html>");
