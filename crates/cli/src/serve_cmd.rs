@@ -92,23 +92,31 @@ pub(crate) fn run_with_stop(
         } else {
             cache.invalidate(dirty);
         }
-        let result = crate::run_build_with_cache(
+        let outcome = crate::run_build_with_cache(
             &project_path,
             None,
             configuration_owned.as_deref(),
             false,
             Some(&mut cache),
-        )?;
-        eprintln!(
-            "{} {} module(s), {} dirty",
-            "ngc-rs rebuild".bold().green(),
-            result.modules_bundled,
-            dirty.len()
         );
-        if reload_tx.send(ReloadEvent).is_err() {
-            tracing::debug!("dev server reload channel closed");
+        match outcome {
+            Ok(result) => {
+                eprintln!(
+                    "{} {} module(s), {} dirty",
+                    "ngc-rs rebuild".bold().green(),
+                    result.modules_bundled,
+                    dirty.len()
+                );
+                if reload_tx.send(ReloadEvent).is_err() {
+                    tracing::debug!("dev server reload channel closed");
+                }
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("{} {e}", "ngc-rs rebuild failed:".bold().red());
+                Err(e)
+            }
         }
-        Ok(())
     };
 
     let stop_flag = Arc::clone(&shutdown);
