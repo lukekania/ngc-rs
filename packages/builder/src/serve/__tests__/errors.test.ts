@@ -35,6 +35,25 @@ describe('parseDiagnostics', () => {
     expect(first?.message).toContain('failed to resolve');
   });
 
+  it('extracts the file path from ngc-rs rebuild-failed lines', () => {
+    const out = parseDiagnostics(
+      'ngc-rs rebuild failed: template compile error in /a/b/app.ts: parser panicked: Unterminated string',
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0]?.file).toBe('/a/b/app.ts');
+    expect(out[0]?.message).toContain('Unterminated string');
+  });
+
+  it('captures line/col when present in rebuild-failed messages', () => {
+    const out = parseDiagnostics(
+      'ngc-rs rebuild failed: error in /a/b/app.ts:42:7 unexpected token',
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0]?.file).toBe('/a/b/app.ts');
+    expect(out[0]?.line).toBe(42);
+    expect(out[0]?.column).toBe(7);
+  });
+
   it('returns nothing for purely informational output', () => {
     expect(parseDiagnostics('ngc-rs build complete 12 modules')).toHaveLength(0);
   });

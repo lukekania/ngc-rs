@@ -64,6 +64,40 @@ describe('createNgcRsRunner', () => {
     }
   });
 
+  it('treats "ngc-rs rebuild failed" as failure, not success', async () => {
+    const { dir, bin } = writeFakeBin(
+      'echo "ngc-rs rebuild failed: parser panicked at /a/b.ts" >&2; exit 0',
+    );
+    try {
+      const runner = createNgcRsRunner({ binary: bin, args: [], cwd: dir });
+      const { events, done } = collect(runner);
+      runner.start();
+      await done;
+      const failure = events.find((e) => e.type === 'rebuild-failure');
+      const ok = events.find((e) => e.type === 'rebuild-success');
+      expect(failure).toBeDefined();
+      expect(ok).toBeUndefined();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('treats "ngc-rs rebuild N module(s)" as success', async () => {
+    const { dir, bin } = writeFakeBin(
+      'echo "ngc-rs rebuild 42 module(s), 1 dirty" >&2; exit 0',
+    );
+    try {
+      const runner = createNgcRsRunner({ binary: bin, args: [], cwd: dir });
+      const { events, done } = collect(runner);
+      runner.start();
+      await done;
+      const ok = events.find((e) => e.type === 'rebuild-success');
+      expect(ok).toBeDefined();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('stop() terminates the child cleanly', async () => {
     const { dir, bin } = writeFakeBin(
       'trap "exit 0" INT; echo "ngc-rs serve listening on http://127.0.0.1:0"; while true; do sleep 0.1; done',
