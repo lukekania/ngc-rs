@@ -503,12 +503,27 @@ pub fn mime_for(path: &Path) -> &'static str {
     }
 }
 
-/// The live-reload client script that gets injected into served `index.html`.
+/// The live-reload + error-overlay client script that gets injected into
+/// served `index.html`.
 ///
-/// Subscribes to `/__ngc_reload` via `EventSource`, listens for `reload`
-/// events, and triggers a full page refresh. Wrapped in a script tag so it
-/// can be inserted directly into HTML.
-pub const LIVE_RELOAD_SCRIPT: &str = r#"<script>(function(){try{var s=new EventSource('/__ngc_reload');s.addEventListener('reload',function(){location.reload();});}catch(e){console.warn('[ngc-rs] live reload unavailable',e);}})();</script>"#;
+/// Subscribes to `/__ngc_reload` via `EventSource` and:
+///
+/// * on `reload` events, removes any existing overlay and calls
+///   `location.reload()`;
+/// * on `build-failed` events, parses the JSON payload and mounts a
+///   full-page error overlay (fixed position, dark translucent backdrop,
+///   monospace red text, `Esc` to dismiss).
+///
+/// The overlay HTML is fully self-contained — no external CSS, no external
+/// JS, no fetches — so it works even when the broken build left the app
+/// completely unable to bootstrap. A reference to the overlay element is
+/// stashed on `window.__ngcRsOverlay` so end-to-end tests can introspect
+/// it without scraping the DOM.
+///
+/// Malformed `data:` payloads (non-JSON, missing keys) are tolerated and
+/// fall back to a generic "build failed" message rather than crashing the
+/// listener.
+pub const LIVE_RELOAD_SCRIPT: &str = r#"<script>(function(){try{var ID='__ngc_rs_overlay__';function dismiss(){var n=document.getElementById(ID);if(n){n.remove();}window.__ngcRsOverlay=null;}function show(payload){dismiss();var data={};try{data=JSON.parse(payload)||{};}catch(_){}var msg=typeof data.message==='string'&&data.message?data.message:'ngc-rs rebuild failed';var loc='';if(typeof data.file==='string'&&data.file){loc=data.file;if(typeof data.line==='number'){loc+=':'+data.line;if(typeof data.column==='number'){loc+=':'+data.column;}}}var overlay=document.createElement('div');overlay.id=ID;overlay.setAttribute('role','alert');overlay.style.cssText='position:fixed;inset:0;z-index:2147483647;background:rgba(20,20,20,0.92);color:#ff6b6b;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:14px;line-height:1.5;padding:32px;overflow:auto;white-space:pre-wrap;word-break:break-word;';var header=document.createElement('div');header.textContent='ngc-rs build failed';header.style.cssText='font-weight:bold;font-size:16px;margin-bottom:16px;color:#ff8a8a;';overlay.appendChild(header);if(loc){var locEl=document.createElement('div');locEl.textContent=loc;locEl.style.cssText='color:#ffd166;margin-bottom:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';overlay.appendChild(locEl);}var body=document.createElement('pre');body.textContent=msg;body.style.cssText='margin:0;color:#ff6b6b;white-space:pre-wrap;word-break:break-word;';overlay.appendChild(body);var hint=document.createElement('div');hint.textContent='Press Esc to dismiss · overlay reappears on next failed rebuild';hint.style.cssText='margin-top:24px;color:#888;font-size:12px;';overlay.appendChild(hint);(document.body||document.documentElement).appendChild(overlay);window.__ngcRsOverlay=overlay;}function onKey(e){if(e.key==='Escape'){dismiss();}}document.addEventListener('keydown',onKey);var s=new EventSource('/__ngc_reload');s.addEventListener('reload',function(){dismiss();location.reload();});s.addEventListener('build-failed',function(e){show(e.data);});}catch(e){console.warn('[ngc-rs] live reload unavailable',e);}})();</script>"#;
 
 /// Insert the live-reload client script into an HTML byte buffer.
 ///
@@ -712,5 +727,47 @@ mod tests {
     fn legacy_reload_event_converts_to_dev_server_event_reload() {
         let ev: DevServerEvent = ReloadEvent.into();
         assert!(matches!(ev, DevServerEvent::Reload));
+    }
+
+    #[test]
+    fn live_reload_script_subscribes_to_both_event_names() {
+        assert!(LIVE_RELOAD_SCRIPT.contains("addEventListener('reload'"));
+        assert!(LIVE_RELOAD_SCRIPT.contains("addEventListener('build-failed'"));
+    }
+
+    #[test]
+    fn live_reload_script_dismisses_on_reload_and_escape() {
+        // Reload removes any overlay and triggers a refresh.
+        assert!(LIVE_RELOAD_SCRIPT.contains("location.reload()"));
+        // Esc keypress is the keyboard dismiss path.
+        assert!(LIVE_RELOAD_SCRIPT.contains("'Escape'"));
+        assert!(LIVE_RELOAD_SCRIPT.contains("addEventListener('keydown'"));
+    }
+
+    #[test]
+    fn live_reload_script_exposes_overlay_handle_for_tests() {
+        assert!(LIVE_RELOAD_SCRIPT.contains("window.__ngcRsOverlay"));
+    }
+
+    #[test]
+    fn live_reload_script_uses_try_catch_around_json_parse() {
+        // Malformed data: payloads must not crash the listener.
+        assert!(LIVE_RELOAD_SCRIPT.contains("JSON.parse"));
+        assert!(LIVE_RELOAD_SCRIPT.contains("try{data=JSON.parse"));
+    }
+
+    #[test]
+    fn live_reload_script_uses_text_overflow_ellipsis_for_long_locations() {
+        assert!(LIVE_RELOAD_SCRIPT.contains("text-overflow:ellipsis"));
+    }
+
+    #[test]
+    fn live_reload_script_is_self_contained_in_a_script_tag() {
+        assert!(LIVE_RELOAD_SCRIPT.starts_with("<script>"));
+        assert!(LIVE_RELOAD_SCRIPT.ends_with("</script>"));
+        // No external resource references — overlay must work offline.
+        assert!(!LIVE_RELOAD_SCRIPT.contains("http://"));
+        assert!(!LIVE_RELOAD_SCRIPT.contains("https://"));
+        assert!(!LIVE_RELOAD_SCRIPT.contains("<link"));
     }
 }
