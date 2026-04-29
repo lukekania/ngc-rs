@@ -243,6 +243,8 @@ fn scan_one(source: &str, path: &Path, registry: &ModuleRegistry) -> NgcResult<u
         return Err(NgcError::LinkerError {
             path: path.to_path_buf(),
             message: format!("parse error: {}", parsed.errors[0]),
+            line: None,
+            column: None,
         });
     }
     let mut count = 0;

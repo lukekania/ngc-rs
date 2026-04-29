@@ -17,9 +17,15 @@ pub fn parse_template(template: &str, file_path: &Path) -> NgcResult<Vec<Templat
     use pest::Parser;
 
     let pairs = AngularTemplateParser::parse(Rule::template, template).map_err(|e| {
+        let (line, column) = match e.line_col {
+            pest::error::LineColLocation::Pos((l, c)) => (Some(l as u32), Some(c as u32)),
+            pest::error::LineColLocation::Span((l, c), _) => (Some(l as u32), Some(c as u32)),
+        };
         NgcError::TemplateParseError {
             path: file_path.to_path_buf(),
             message: e.to_string(),
+            line,
+            column,
         }
     })?;
 

@@ -1,14 +1,32 @@
 use std::path::{Path, PathBuf};
 
-use ngc_diagnostics::{NgcError, NgcResult};
+use ngc_diagnostics::{byte_offset_to_line_col, NgcError, NgcResult};
 use oxc_allocator::Allocator;
 use oxc_codegen::{Codegen, CodegenOptions};
+use oxc_diagnostics::OxcDiagnostic;
 use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
 use oxc_span::SourceType;
 use oxc_transformer::{TransformOptions, Transformer};
 use rayon::prelude::*;
 use tracing::debug;
+
+/// Pull `(line, column)` from the first labeled span on the first diagnostic
+/// in `errors`, mapping byte offsets through `source`.
+fn first_diagnostic_location(source: &str, errors: &[OxcDiagnostic]) -> (Option<u32>, Option<u32>) {
+    let offset = errors
+        .first()
+        .and_then(|e| e.labels.as_ref())
+        .and_then(|labels| labels.first())
+        .map(|label| label.offset());
+    match offset {
+        Some(off) => {
+            let (l, c) = byte_offset_to_line_col(source, off as u32);
+            (Some(l), Some(c))
+        }
+        None => (None, None),
+    }
+}
 
 /// Result of transforming an entire project.
 #[derive(Debug)]
@@ -64,22 +82,30 @@ fn transform_source_impl(
     let source_type = SourceType::from_path(path).map_err(|_| NgcError::ParseError {
         path: path.to_path_buf(),
         message: format!("unsupported file extension: {file_name}"),
+        line: None,
+        column: None,
     })?;
 
     let mut parsed = Parser::new(&allocator, source, source_type).parse();
 
     if parsed.panicked {
+        let (line, column) = first_diagnostic_location(source, &parsed.errors);
         return Err(NgcError::ParseError {
             path: path.to_path_buf(),
             message: "parser panicked".to_string(),
+            line,
+            column,
         });
     }
 
     if !parsed.errors.is_empty() {
         let messages: Vec<String> = parsed.errors.iter().map(|e| e.to_string()).collect();
+        let (line, column) = first_diagnostic_location(source, &parsed.errors);
         return Err(NgcError::ParseError {
             path: path.to_path_buf(),
             message: messages.join("; "),
+            line,
+            column,
         });
     }
 
@@ -95,9 +121,12 @@ fn transform_source_impl(
 
     if !transform_ret.errors.is_empty() {
         let messages: Vec<String> = transform_ret.errors.iter().map(|e| e.to_string()).collect();
+        let (line, column) = first_diagnostic_location(source, &transform_ret.errors);
         return Err(NgcError::TransformError {
             path: path.to_path_buf(),
             message: messages.join("; "),
+            line,
+            column,
         });
     }
 

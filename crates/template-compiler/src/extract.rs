@@ -1,14 +1,32 @@
 use std::path::Path;
 
-use ngc_diagnostics::{NgcError, NgcResult};
+use ngc_diagnostics::{byte_offset_to_line_col, NgcError, NgcResult};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, Class, ClassElement, Decorator, Expression, FormalParameter,
     FormalParameters, MethodDefinitionKind, ObjectPropertyKind, PropertyKey, Statement,
     TSTypeAnnotation,
 };
+use oxc_diagnostics::OxcDiagnostic;
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
+
+/// Pull `(line, column)` from the first labeled span on the first
+/// diagnostic in `errors`, mapping byte offsets through `source`.
+fn first_diagnostic_location(source: &str, errors: &[OxcDiagnostic]) -> (Option<u32>, Option<u32>) {
+    let offset = errors
+        .first()
+        .and_then(|e| e.labels.as_ref())
+        .and_then(|labels| labels.first())
+        .map(|label| label.offset());
+    match offset {
+        Some(off) => {
+            let (l, c) = byte_offset_to_line_col(source, off as u32);
+            (Some(l), Some(c))
+        }
+        None => (None, None),
+    }
+}
 
 /// Metadata extracted from an `@Component` decorator.
 #[derive(Debug, Clone)]
@@ -252,6 +270,8 @@ pub fn extract_component(source: &str, file_path: &Path) -> NgcResult<Option<Ext
         SourceType::from_path(file_path).map_err(|_| NgcError::TemplateCompileError {
             path: file_path.to_path_buf(),
             message: "unsupported file extension".to_string(),
+            line: None,
+            column: None,
         })?;
 
     let parsed = Parser::new(&allocator, source, source_type).parse();
@@ -262,9 +282,12 @@ pub fn extract_component(source: &str, file_path: &Path) -> NgcResult<Option<Ext
         } else {
             format!("parser panicked: {}", error_msgs.join("; "))
         };
+        let (line, column) = first_diagnostic_location(source, &parsed.errors);
         return Err(NgcError::TemplateCompileError {
             path: file_path.to_path_buf(),
             message: detail,
+            line,
+            column,
         });
     }
 
@@ -544,13 +567,18 @@ pub fn extract_injectable(
         SourceType::from_path(file_path).map_err(|_| NgcError::TemplateCompileError {
             path: file_path.to_path_buf(),
             message: "unsupported file extension".to_string(),
+            line: None,
+            column: None,
         })?;
 
     let parsed = Parser::new(&allocator, source, source_type).parse();
     if parsed.panicked {
+        let (line, column) = first_diagnostic_location(source, &parsed.errors);
         return Err(NgcError::TemplateCompileError {
             path: file_path.to_path_buf(),
             message: "parser panicked".to_string(),
+            line,
+            column,
         });
     }
 
@@ -637,13 +665,18 @@ pub fn extract_directive(source: &str, file_path: &Path) -> NgcResult<Option<Ext
         SourceType::from_path(file_path).map_err(|_| NgcError::TemplateCompileError {
             path: file_path.to_path_buf(),
             message: "unsupported file extension".to_string(),
+            line: None,
+            column: None,
         })?;
 
     let parsed = Parser::new(&allocator, source, source_type).parse();
     if parsed.panicked {
+        let (line, column) = first_diagnostic_location(source, &parsed.errors);
         return Err(NgcError::TemplateCompileError {
             path: file_path.to_path_buf(),
             message: "parser panicked".to_string(),
+            line,
+            column,
         });
     }
 
@@ -759,13 +792,18 @@ pub fn extract_pipe(source: &str, file_path: &Path) -> NgcResult<Option<Extracte
         SourceType::from_path(file_path).map_err(|_| NgcError::TemplateCompileError {
             path: file_path.to_path_buf(),
             message: "unsupported file extension".to_string(),
+            line: None,
+            column: None,
         })?;
 
     let parsed = Parser::new(&allocator, source, source_type).parse();
     if parsed.panicked {
+        let (line, column) = first_diagnostic_location(source, &parsed.errors);
         return Err(NgcError::TemplateCompileError {
             path: file_path.to_path_buf(),
             message: "parser panicked".to_string(),
+            line,
+            column,
         });
     }
 
@@ -855,13 +893,18 @@ pub fn extract_ng_module(source: &str, file_path: &Path) -> NgcResult<Option<Ext
         SourceType::from_path(file_path).map_err(|_| NgcError::TemplateCompileError {
             path: file_path.to_path_buf(),
             message: "unsupported file extension".to_string(),
+            line: None,
+            column: None,
         })?;
 
     let parsed = Parser::new(&allocator, source, source_type).parse();
     if parsed.panicked {
+        let (line, column) = first_diagnostic_location(source, &parsed.errors);
         return Err(NgcError::TemplateCompileError {
             path: file_path.to_path_buf(),
             message: "parser panicked".to_string(),
+            line,
+            column,
         });
     }
 

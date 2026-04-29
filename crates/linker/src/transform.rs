@@ -6,14 +6,32 @@
 
 use std::path::Path;
 
-use ngc_diagnostics::{NgcError, NgcResult};
+use ngc_diagnostics::{byte_offset_to_line_col, NgcError, NgcResult};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{CallExpression, Expression, Program, Statement};
+use oxc_diagnostics::OxcDiagnostic;
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
 
 use crate::module_registry::ModuleRegistry;
 use crate::{class_metadata, component, directive, factory, injectable, injector, ng_module, pipe};
+
+/// Pull `(line, column)` from the first labeled span on the first
+/// diagnostic in `errors`, mapping byte offsets through `source`.
+fn first_diagnostic_location(source: &str, errors: &[OxcDiagnostic]) -> (Option<u32>, Option<u32>) {
+    let offset = errors
+        .first()
+        .and_then(|e| e.labels.as_ref())
+        .and_then(|labels| labels.first())
+        .map(|label| label.offset());
+    match offset {
+        Some(off) => {
+            let (l, c) = byte_offset_to_line_col(source, off as u32);
+            (Some(l), Some(c))
+        }
+        None => (None, None),
+    }
+}
 
 /// A single text replacement to apply to the source.
 #[derive(Debug)]
@@ -102,9 +120,12 @@ pub fn link_source(
     let parsed = Parser::new(&alloc, source, SourceType::mjs()).parse();
 
     if !parsed.errors.is_empty() {
+        let (line, column) = first_diagnostic_location(source, &parsed.errors);
         return Err(NgcError::LinkerError {
             path: file_path.to_path_buf(),
             message: format!("parse error: {}", parsed.errors[0]),
+            line,
+            column,
         });
     }
 
@@ -290,6 +311,8 @@ fn try_transform_declare_call(
                 return Err(NgcError::LinkerError {
                     path: file_path.to_path_buf(),
                     message: format!("{callee_name}: expected object literal argument"),
+                    line: None,
+                    column: None,
                 });
             }
         },
@@ -297,6 +320,8 @@ fn try_transform_declare_call(
             return Err(NgcError::LinkerError {
                 path: file_path.to_path_buf(),
                 message: format!("{callee_name}: missing argument"),
+                line: None,
+                column: None,
             });
         }
     };
