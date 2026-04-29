@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 ngc-diagnostics = { path = "../diagnostics" }
+serde_json = "1.0"
 tiny_http = "0.12"
 tracing = "0.1"
 

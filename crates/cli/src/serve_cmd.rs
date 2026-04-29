@@ -18,7 +18,7 @@ use std::sync::mpsc::channel;
 use std::sync::Arc;
 
 use colored::Colorize;
-use ngc_dev_server::{DevServer, DevServerConfig, ReloadEvent};
+use ngc_dev_server::{DevServer, DevServerConfig, DevServerEvent};
 use ngc_diagnostics::{NgcError, NgcResult};
 use ngc_watch::{Watcher, WatcherConfig};
 
@@ -61,11 +61,11 @@ pub(crate) fn run_with_stop(
         initial.output_files.len(),
     );
 
-    let (reload_tx, reload_rx) = channel::<ReloadEvent>();
+    let (event_tx, event_rx) = channel::<DevServerEvent>();
     let cfg = DevServerConfig::new(&out_dir)
         .with_host(host.to_string())
         .with_port(port);
-    let server = DevServer::start(cfg, reload_rx)?;
+    let server = DevServer::start(cfg, event_rx)?;
     let url = format!("http://{}", server.addr());
     eprintln!(
         "{} {}",
@@ -107,7 +107,7 @@ pub(crate) fn run_with_stop(
                     result.modules_bundled,
                     dirty.len()
                 );
-                if reload_tx.send(ReloadEvent).is_err() {
+                if event_tx.send(DevServerEvent::Reload).is_err() {
                     tracing::debug!("dev server reload channel closed");
                 }
                 Ok(())

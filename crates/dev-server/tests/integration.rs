@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::channel;
 use std::time::Duration;
 
-use ngc_dev_server::{DevServer, DevServerConfig, ReloadEvent, LIVE_RELOAD_SCRIPT};
+use ngc_dev_server::{DevServer, DevServerConfig, DevServerEvent, LIVE_RELOAD_SCRIPT};
 use tempfile::TempDir;
 
 struct Fixture {
@@ -32,7 +32,7 @@ impl Fixture {
         write_file(root.path(), "assets/logo.svg", b"<svg/>");
 
         let cfg = DevServerConfig::new(root.path()).with_port(0);
-        let (_tx, rx) = channel::<ReloadEvent>();
+        let (_tx, rx) = channel::<DevServerEvent>();
         let server = DevServer::start(cfg, rx).expect("start dev server");
         Self {
             server,
@@ -243,7 +243,7 @@ fn unknown_extension_serves_octet_stream() {
     write_file(root.path(), "index.html", b"<html><body></body></html>");
     write_file(root.path(), "blob.weird", b"\x00\x01\x02blob");
     let cfg = DevServerConfig::new(root.path()).with_port(0);
-    let (_tx, rx) = channel::<ReloadEvent>();
+    let (_tx, rx) = channel::<DevServerEvent>();
     let server = DevServer::start(cfg, rx).expect("start");
     let resp = http_get(server.addr(), "/blob.weird");
     assert_eq!(resp.status, 200);
