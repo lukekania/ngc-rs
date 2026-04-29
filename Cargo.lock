@@ -827,6 +827,7 @@ dependencies = [
  "clap",
  "colored",
  "ctrlc",
+ "dashmap",
  "glob",
  "insta",
  "ngc-bundler",
@@ -849,6 +850,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "walkdir",
 ]
 
 [[package]]
