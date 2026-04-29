@@ -108,12 +108,15 @@ pub(crate) fn run_with_stop(
                     dirty.len()
                 );
                 if event_tx.send(DevServerEvent::Reload).is_err() {
-                    tracing::debug!("dev server reload channel closed");
+                    tracing::debug!("dev server event channel closed");
                 }
                 Ok(())
             }
             Err(e) => {
                 eprintln!("{} {e}", "ngc-rs rebuild failed:".bold().red());
+                if event_tx.send(build_failure_event(&e)).is_err() {
+                    tracing::debug!("dev server event channel closed");
+                }
                 Err(e)
             }
         }
@@ -126,6 +129,42 @@ pub(crate) fn run_with_stop(
     eprintln!("{}", "ngc-rs serve shutting down".dimmed());
     drop(server);
     result
+}
+
+/// Translate an [`NgcError`] into the [`DevServerEvent::BuildFailed`]
+/// payload that ships to the browser overlay.
+///
+/// Reuses `Display` for the `message` so the overlay shows the same text
+/// the terminal already prints. Most build-pipeline error variants carry
+/// the offending file path; line/column information is not yet plumbed
+/// through `NgcError`, so the overlay gets `None` for those today.
+pub(crate) fn build_failure_event(err: &NgcError) -> DevServerEvent {
+    DevServerEvent::BuildFailed {
+        message: err.to_string(),
+        file: error_file_path(err),
+        line: None,
+        column: None,
+    }
+}
+
+fn error_file_path(err: &NgcError) -> Option<PathBuf> {
+    match err {
+        NgcError::Io { path, .. }
+        | NgcError::TsConfigParse { path, .. }
+        | NgcError::TsConfigExtendsNotFound { path }
+        | NgcError::ParseError { path, .. }
+        | NgcError::TransformError { path, .. }
+        | NgcError::TemplateParseError { path, .. }
+        | NgcError::TemplateCompileError { path, .. }
+        | NgcError::AngularJsonParse { path, .. }
+        | NgcError::AssetError { path, .. }
+        | NgcError::StyleError { path, .. }
+        | NgcError::SourceMapError { path, .. }
+        | NgcError::MinifyError { path, .. }
+        | NgcError::LinkerError { path, .. } => Some(path.clone()),
+        NgcError::UnresolvedImport { from_file, .. } => Some(from_file.clone()),
+        _ => None,
+    }
 }
 
 fn install_ctrlc(flag: Arc<AtomicBool>) {
@@ -192,5 +231,58 @@ mod tests {
         // We don't run it; just confirm the constructor returned a Command
         // with a non-empty program name on the host platform.
         assert!(!cmd.get_program().is_empty());
+    }
+
+    #[test]
+    fn build_failure_event_extracts_path_from_parse_error() {
+        let err = NgcError::ParseError {
+            path: PathBuf::from("/proj/src/app.ts"),
+            message: "unexpected token".to_string(),
+        };
+        let DevServerEvent::BuildFailed {
+            message,
+            file,
+            line,
+            column,
+        } = build_failure_event(&err)
+        else {
+            panic!("expected BuildFailed variant");
+        };
+        assert!(message.contains("unexpected token"));
+        assert_eq!(file.as_deref(), Some(Path::new("/proj/src/app.ts")));
+        assert!(line.is_none());
+        assert!(column.is_none());
+    }
+
+    #[test]
+    fn build_failure_event_extracts_from_file_for_unresolved_import() {
+        let err = NgcError::UnresolvedImport {
+            specifier: "./missing".to_string(),
+            from_file: PathBuf::from("/proj/src/app.ts"),
+        };
+        let DevServerEvent::BuildFailed { file, .. } = build_failure_event(&err) else {
+            panic!("expected BuildFailed variant");
+        };
+        assert_eq!(file.as_deref(), Some(Path::new("/proj/src/app.ts")));
+    }
+
+    #[test]
+    fn build_failure_event_omits_path_for_pathless_errors() {
+        let err = NgcError::ServeError {
+            message: "boom".to_string(),
+        };
+        let DevServerEvent::BuildFailed {
+            message,
+            file,
+            line,
+            column,
+        } = build_failure_event(&err)
+        else {
+            panic!("expected BuildFailed variant");
+        };
+        assert!(message.contains("boom"));
+        assert!(file.is_none());
+        assert!(line.is_none());
+        assert!(column.is_none());
     }
 }
