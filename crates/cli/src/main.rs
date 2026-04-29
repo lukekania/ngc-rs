@@ -1184,6 +1184,27 @@ fn apply_file_replacements(
         .collect()
 }
 
+/// Cache of canonicalised CSS file path → file contents.
+///
+/// CSS `@import` resolution can read the same upstream file multiple times when
+/// several entry stylesheets import the same package (e.g. Tailwind v4
+/// `@import "tailwindcss"` from both `styles.scss` and a component override).
+/// Keyed by `Path::canonicalize` so that distinct symlink-relative spellings
+/// of one file collapse to a single entry.
+type CssReadCache = dashmap::DashMap<PathBuf, String>;
+
+/// Read a CSS file through `cache`, returning `None` on any I/O failure to
+/// match the existing `.ok()` callers in [`resolve_npm_css`].
+fn read_css_cached(cache: &CssReadCache, path: &Path) -> Option<String> {
+    let key = path.canonicalize().ok()?;
+    if let Some(existing) = cache.get(&key) {
+        return Some(existing.clone());
+    }
+    let content = std::fs::read_to_string(&key).ok()?;
+    cache.insert(key, content.clone());
+    Some(content)
+}
+
 /// Read and concatenate global style files, writing dist/styles.css.
 ///
 /// Accepts `.css`, `.scss`, `.sass`, `.less`, and `.styl`/`.stylus` files.
@@ -1198,6 +1219,7 @@ fn extract_global_styles(
     project_root: &Path,
 ) -> NgcResult<PathBuf> {
     let mut css = String::new();
+    let css_cache = CssReadCache::new();
     for style in styles {
         if !style.inject {
             continue;
@@ -1219,7 +1241,7 @@ fn extract_global_styles(
         if !css.is_empty() {
             css.push('\n');
         }
-        let resolved = resolve_css_imports(&content, project_root);
+        let resolved = resolve_css_imports(&content, project_root, &css_cache);
         css.push_str(&resolved);
     }
     let path = out_dir.join("styles.css");
@@ -1236,7 +1258,7 @@ fn extract_global_styles(
 /// contents of the resolved CSS file from `node_modules`. Lines that reference
 /// local files or URLs are left unchanged. Non-CSS `@import` directives
 /// (e.g. `@import "tailwindcss"`) that resolve to a CSS file are also inlined.
-fn resolve_css_imports(css: &str, project_root: &Path) -> String {
+fn resolve_css_imports(css: &str, project_root: &Path, cache: &CssReadCache) -> String {
     let node_modules = project_root.join("node_modules");
     let mut result = String::new();
 
@@ -1254,7 +1276,8 @@ fn resolve_css_imports(css: &str, project_root: &Path) -> String {
             }
 
             // Try to resolve from node_modules
-            if let Some(resolved_content) = resolve_npm_css(&node_modules, &specifier, project_root)
+            if let Some(resolved_content) =
+                resolve_npm_css(&node_modules, &specifier, project_root, cache)
             {
                 result.push_str(&format!("/* @import \"{specifier}\" (resolved) */\n"));
                 result.push_str(&resolved_content);
@@ -1301,7 +1324,12 @@ fn extract_css_import_specifier(line: &str) -> Option<String> {
 }
 
 /// Try to resolve a CSS file from node_modules.
-fn resolve_npm_css(node_modules: &Path, specifier: &str, project_root: &Path) -> Option<String> {
+fn resolve_npm_css(
+    node_modules: &Path,
+    specifier: &str,
+    project_root: &Path,
+    cache: &CssReadCache,
+) -> Option<String> {
     // Try direct path: node_modules/{specifier}
     let direct = node_modules.join(specifier);
 
@@ -1314,7 +1342,7 @@ fn resolve_npm_css(node_modules: &Path, specifier: &str, project_root: &Path) ->
 
     for candidate in &candidates {
         if candidate.is_file() {
-            return std::fs::read_to_string(candidate).ok();
+            return read_css_cached(cache, candidate);
         }
     }
 
@@ -1337,7 +1365,7 @@ fn resolve_npm_css(node_modules: &Path, specifier: &str, project_root: &Path) ->
             if let Some(style) = pkg.get("style").and_then(|v| v.as_str()) {
                 let style_path = node_modules.join(&pkg_name).join(style);
                 if style_path.is_file() {
-                    return std::fs::read_to_string(&style_path).ok();
+                    return read_css_cached(cache, &style_path);
                 }
             }
 
@@ -1346,7 +1374,7 @@ fn resolve_npm_css(node_modules: &Path, specifier: &str, project_root: &Path) ->
                 if let Some(css_path) = find_css_in_exports(exports, specifier, &pkg_name) {
                     let full_path = node_modules.join(&pkg_name).join(css_path);
                     if full_path.is_file() {
-                        return std::fs::read_to_string(&full_path).ok();
+                        return read_css_cached(cache, &full_path);
                     }
                 }
             }
@@ -1357,7 +1385,7 @@ fn resolve_npm_css(node_modules: &Path, specifier: &str, project_root: &Path) ->
     // (e.g. "tailwindcss" ships a preflight/base CSS)
     let base_css = node_modules.join(&pkg_name).join("theme.css");
     if base_css.is_file() {
-        return std::fs::read_to_string(&base_css).ok();
+        return read_css_cached(cache, &base_css);
     }
 
     // For packages like tailwindcss that are build-time only, return an empty comment
@@ -1377,14 +1405,14 @@ fn resolve_npm_css(node_modules: &Path, specifier: &str, project_root: &Path) ->
     let subpath = node_modules.join(specifier.replace('/', std::path::MAIN_SEPARATOR_STR));
     let subpath_css = subpath.with_extension("css");
     if subpath_css.is_file() {
-        return std::fs::read_to_string(&subpath_css).ok();
+        return read_css_cached(cache, &subpath_css);
     }
 
     // Also try node_modules relative from project root
     let alt = project_root.join("node_modules").join(specifier);
     let alt_css = alt.with_extension("css");
     if alt_css.is_file() {
-        return std::fs::read_to_string(&alt_css).ok();
+        return read_css_cached(cache, &alt_css);
     }
 
     None
@@ -1419,32 +1447,49 @@ fn copy_assets(assets: &[ResolvedAsset], out_dir: &Path) -> NgcResult<Vec<PathBu
                 ignore: _,
             } => {
                 let glob_pattern = format!("{}/{pattern}", input.display());
-                let entries = glob::glob(&glob_pattern).map_err(|e| NgcError::AssetError {
-                    path: input.clone(),
-                    message: format!("invalid glob pattern: {e}"),
-                })?;
-                let output_base = out_dir.join(output.trim_start_matches('/'));
-                for entry in entries {
-                    let entry = entry.map_err(|e| NgcError::AssetError {
+                let entries: Vec<PathBuf> = glob::glob(&glob_pattern)
+                    .map_err(|e| NgcError::AssetError {
+                        path: input.clone(),
+                        message: format!("invalid glob pattern: {e}"),
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| NgcError::AssetError {
                         path: input.clone(),
                         message: format!("glob error: {e}"),
                     })?;
-                    if entry.is_file() {
-                        let relative = entry.strip_prefix(input).unwrap_or(&entry).to_path_buf();
+                let output_base = out_dir.join(output.trim_start_matches('/'));
+
+                // Collect file targets (mirroring the original is_file() filter)
+                // and pre-create their parent directories sequentially before
+                // fanning out the byte-copies across rayon workers.
+                let targets: Vec<(PathBuf, PathBuf)> = entries
+                    .iter()
+                    .filter(|e| e.is_file())
+                    .map(|e| {
+                        let relative = e.strip_prefix(input).unwrap_or(e).to_path_buf();
                         let dst = output_base.join(&relative);
-                        if let Some(parent) = dst.parent() {
-                            std::fs::create_dir_all(parent).map_err(|e| NgcError::Io {
-                                path: parent.to_path_buf(),
-                                source: e,
-                            })?;
-                        }
-                        std::fs::copy(&entry, &dst).map_err(|e| NgcError::AssetError {
-                            path: entry.clone(),
-                            message: format!("failed to copy: {e}"),
+                        (e.clone(), dst)
+                    })
+                    .collect();
+                for (_, dst) in &targets {
+                    if let Some(parent) = dst.parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| NgcError::Io {
+                            path: parent.to_path_buf(),
+                            source: e,
                         })?;
-                        output_paths.push(dst);
                     }
                 }
+                let copied: NgcResult<Vec<PathBuf>> = targets
+                    .par_iter()
+                    .map(|(src, dst)| {
+                        std::fs::copy(src, dst).map_err(|e| NgcError::AssetError {
+                            path: src.clone(),
+                            message: format!("failed to copy: {e}"),
+                        })?;
+                        Ok(dst.clone())
+                    })
+                    .collect();
+                output_paths.extend(copied?);
             }
         }
     }
@@ -1452,35 +1497,55 @@ fn copy_assets(assets: &[ResolvedAsset], out_dir: &Path) -> NgcResult<Vec<PathBu
 }
 
 /// Recursively copy a directory tree.
+///
+/// Walks `src` once with `WalkDir` (`follow_links(true)` matches the previous
+/// `is_dir()`/`std::fs::copy` semantics — symlinked directories are descended
+/// into and symlinked files are copied by content), pre-creates every output
+/// directory sequentially, then fans the per-file `std::fs::copy` calls out
+/// across rayon workers. Output ordering is no longer source-walk order; the
+/// caller (`copy_assets`) only forwards these into `output_files`, which is
+/// consumed unordered downstream.
 fn copy_dir_recursive(src: &Path, dst: &Path) -> NgcResult<Vec<PathBuf>> {
-    let mut output_paths = Vec::new();
-    std::fs::create_dir_all(dst).map_err(|e| NgcError::Io {
-        path: dst.to_path_buf(),
-        source: e,
-    })?;
-    let entries = std::fs::read_dir(src).map_err(|e| NgcError::Io {
-        path: src.to_path_buf(),
-        source: e,
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|e| NgcError::Io {
+    let entries: Vec<walkdir::DirEntry> = walkdir::WalkDir::new(src)
+        .follow_links(true)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| NgcError::Io {
             path: src.to_path_buf(),
-            source: e,
+            source: e
+                .into_io_error()
+                .unwrap_or_else(|| std::io::Error::other("walkdir error")),
         })?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        if src_path.is_dir() {
-            let paths = copy_dir_recursive(&src_path, &dst_path)?;
-            output_paths.extend(paths);
-        } else {
-            std::fs::copy(&src_path, &dst_path).map_err(|e| NgcError::AssetError {
-                path: src_path,
-                message: format!("failed to copy: {e}"),
+
+    // Pre-create every destination directory in walk order so the parallel
+    // file copies never race on `create_dir_all`.
+    for entry in &entries {
+        if entry.file_type().is_dir() {
+            let rel = entry
+                .path()
+                .strip_prefix(src)
+                .unwrap_or_else(|_| Path::new(""));
+            let dst_path = dst.join(rel);
+            std::fs::create_dir_all(&dst_path).map_err(|e| NgcError::Io {
+                path: dst_path,
+                source: e,
             })?;
-            output_paths.push(dst_path);
         }
     }
-    Ok(output_paths)
+
+    entries
+        .par_iter()
+        .filter(|e| e.file_type().is_file())
+        .map(|entry| {
+            let rel = entry.path().strip_prefix(src).unwrap_or(entry.path());
+            let dst_path = dst.join(rel);
+            std::fs::copy(entry.path(), &dst_path).map_err(|e| NgcError::AssetError {
+                path: entry.path().to_path_buf(),
+                message: format!("failed to copy: {e}"),
+            })?;
+            Ok(dst_path)
+        })
+        .collect()
 }
 
 /// Options controlling how `index.html` is rewritten during injection.
