@@ -1,0 +1,56 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema",
+  "title": "ngc-rs dev-server target",
+  "description": "Dev-server builder options for @ngc-rs/builder. Mirrors a subset of @angular/build:dev-server so projects can swap one line in angular.json. Anything not listed under properties is intentionally not yet supported and is rejected at validation time.",
+  "type": "object",
+  "properties": {
+    "buildTarget": {
+      "type": "string",
+      "description": "Build builder target to derive options from in the format `project:target[:configuration]`. Currently used only to resolve the build configuration name.",
+      "pattern": "^[^:\\s]*:[^:\\s]*(:[^\\s]+)?$"
+    },
+    "port": {
+      "type": "number",
+      "description": "Port the dev server listens on.",
+      "default": 4200
+    },
+    "host": {
+      "type": "string",
+      "description": "Host the dev server binds to.",
+      "default": "localhost"
+    },
+    "open": {
+      "type": "boolean",
+      "description": "Open the configured URL in the default browser once the server is ready.",
+      "default": false,
+      "alias": "o"
+    },
+    "ssl": {
+      "type": "boolean",
+      "description": "Serve over HTTPS. Currently unsupported by ngc-rs serve. Setting this to true fails the build with an explanatory error.",
+      "default": false
+    },
+    "sslKey": {
+      "type": "string",
+      "description": "SSL key path. Currently unsupported."
+    },
+    "sslCert": {
+      "type": "string",
+      "description": "SSL certificate path. Currently unsupported."
+    },
+    "proxyConfig": {
+      "type": "string",
+      "description": "Path to a JSON proxy configuration file. The shim hosts an in-process reverse proxy and forwards matching requests to the configured target. See https://angular.dev/tools/cli/serve#proxying-to-a-backend-server."
+    },
+    "project": {
+      "type": "string",
+      "description": "Path to the project's tsconfig.json passed to ngc-rs serve. Defaults to `tsconfig.json` in the workspace root.",
+      "default": "tsconfig.json"
+    },
+    "ngcRsBinary": {
+      "type": "string",
+      "description": "Optional override for the ngc-rs binary path. If unset, the shim looks at the NGC_RS_BINARY env var, then a workspace-relative target/release/ngc-rs, and finally PATH."
+    }
+  },
+  "additionalProperties": false
+}
