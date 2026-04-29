@@ -865,6 +865,7 @@ dependencies = [
  "pest",
  "pest_derive",
  "rayon",
+ "serde_json",
  "tempfile",
  "tracing",
  "which",
