@@ -26,10 +26,10 @@
 //! the import against that package. Identifiers with no public export are
 //! dropped from the flattened dependency list.
 
-use std::collections::HashMap;
 use std::path::Path;
-use std::sync::RwLock;
 
+use dashmap::mapref::entry::Entry;
+use dashmap::DashMap;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{ExportSpecifier, ModuleExportName, Statement};
 use oxc_parser::Parser;
@@ -44,7 +44,7 @@ pub struct PublicExports {
     /// Preferred = first seen with a *canonical* specifier (see
     /// [`derive_specifier`]). Internal chunk files like
     /// `_router_module-chunk.mjs` are ignored.
-    name_to_specifier: RwLock<HashMap<String, String>>,
+    name_to_specifier: DashMap<String, String>,
 }
 
 impl PublicExports {
@@ -55,18 +55,12 @@ impl PublicExports {
 
     /// Is this identifier publicly exported from any tracked npm file?
     pub fn has(&self, name: &str) -> bool {
-        match self.name_to_specifier.read() {
-            Ok(g) => g.contains_key(name),
-            Err(p) => p.into_inner().contains_key(name),
-        }
+        self.name_to_specifier.contains_key(name)
     }
 
     /// Npm specifier that publicly exports `name`, or `None` if unknown.
     pub fn specifier_for(&self, name: &str) -> Option<String> {
-        match self.name_to_specifier.read() {
-            Ok(g) => g.get(name).cloned(),
-            Err(p) => p.into_inner().get(name).cloned(),
-        }
+        self.name_to_specifier.get(name).map(|r| r.value().clone())
     }
 
     /// Scan a single npm file's source for its top-level `export { … }` and
@@ -98,16 +92,10 @@ impl PublicExports {
             }
         }
         let mut added = 0;
-        if !exported.is_empty() {
-            let mut map = match self.name_to_specifier.write() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            for name in exported {
-                map.entry(name).or_insert_with(|| {
-                    added += 1;
-                    specifier.clone()
-                });
+        for name in exported {
+            if let Entry::Vacant(v) = self.name_to_specifier.entry(name) {
+                v.insert(specifier.clone());
+                added += 1;
             }
         }
         added
@@ -115,15 +103,12 @@ impl PublicExports {
 
     /// Number of registered identifiers.
     pub fn len(&self) -> usize {
-        match self.name_to_specifier.read() {
-            Ok(g) => g.len(),
-            Err(p) => p.into_inner().len(),
-        }
+        self.name_to_specifier.len()
     }
 
     /// Whether the registry is empty.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.name_to_specifier.is_empty()
     }
 }
 

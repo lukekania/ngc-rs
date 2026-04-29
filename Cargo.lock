@@ -774,6 +774,7 @@ dependencies = [
 name = "ngc-linker"
 version = "0.9.0"
 dependencies = [
+ "dashmap",
  "insta",
  "ngc-diagnostics",
  "ngc-template-compiler",
