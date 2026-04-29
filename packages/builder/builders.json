@@ -1,0 +1,10 @@
+{
+  "$schema": "../../node_modules/@angular-devkit/architect/src/builders-schema.json",
+  "builders": {
+    "dev-server": {
+      "implementation": "./dist/serve/builder",
+      "schema": "./schemas/dev-server.json",
+      "description": "Dev server backed by ngc-rs."
+    }
+  }
+}

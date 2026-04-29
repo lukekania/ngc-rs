@@ -1,0 +1,40 @@
+{
+  "name": "@ngc-rs/builder",
+  "version": "0.8.3",
+  "description": "Angular @angular-devkit/architect builders backed by ngc-rs.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lukekania/ngc-rs",
+    "directory": "packages/builder"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "builders": "./builders.json",
+  "files": [
+    "dist",
+    "schemas",
+    "builders.json",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@angular-devkit/architect": "~0.2102.0",
+    "@angular-devkit/core": "^21.2.0",
+    "rxjs": "^7.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "~5.9.3",
+    "vitest": "^4.0.0"
+  },
+  "engines": {
+    "node": ">=20.11.0"
+  }
+}
