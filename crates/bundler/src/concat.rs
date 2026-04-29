@@ -117,87 +117,77 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
     let mut chunk_source_maps: HashMap<String, SourceMap> = HashMap::new();
     let canon_cache: CanonCache = DashMap::new();
 
-    // Process main chunk first to get specifier→namespace mapping
     let main_chunk = &chunk_graph.chunks[0];
+    let main_module_set: HashSet<PathBuf> = main_chunk.modules.iter().cloned().collect();
     let subpath_ctx = Some(shake::SubpathImportContext {
         root_dir: &input.root_dir,
         export_conditions: &condition_refs,
     });
-    let main_unused = if input.options.tree_shake {
-        // Lazy chunks consume symbols from main cross-chunk; those consumptions
-        // are invisible to the per-chunk shake analysis below. Precompute them
-        // so the analyzer won't mark them unused and strip their declarations.
+
+    // Pre-compute the main chunk's npm namespace map up front so lazy chunks
+    // no longer have to wait for the main chunk's bundle_chunk pass to finish
+    // before they can resolve cross-chunk npm references. With this break in
+    // the data dependency, every chunk can be fanned out into one par_iter
+    // instead of running main as a serial tail.
+    let (main_file_to_ns, main_spec_to_ns) = compute_main_namespace_maps(
+        &main_chunk.modules,
+        &input.bundled_specifiers,
+        &input.root_dir,
+        &condition_refs,
+        &canon_cache,
+    );
+
+    // Lazy chunks consume symbols from main cross-chunk; those consumptions
+    // are invisible to the per-chunk shake analysis. Precompute the union
+    // before fan-out so the main chunk's analyze_unused_exports preserves
+    // them.
+    let externally_used: Option<HashSet<String>> = if input.options.tree_shake {
         let mut lazy_consumers: Vec<PathBuf> = Vec::new();
         for chunk in &chunk_graph.chunks[1..] {
             lazy_consumers.extend(chunk.modules.iter().cloned());
         }
-        let externally_used = shake::collect_cross_chunk_used_names(
+        Some(shake::collect_cross_chunk_used_names(
             &lazy_consumers,
             &main_chunk.modules,
             &input.modules,
             &prefix_refs,
             subpath_ctx,
-        )?;
-
-        shake::analyze_unused_exports(
-            &main_chunk.modules,
-            &input.modules,
-            &main_chunk.entry,
-            &prefix_refs,
-            Some(&externally_used),
-            subpath_ctx,
-        )?
+        )?)
     } else {
-        HashMap::new()
+        None
     };
 
-    let main_module_set: HashSet<PathBuf> = main_chunk.modules.iter().cloned().collect();
-    let main_result = bundle_chunk(&ChunkBundleParams {
-        module_paths: &main_chunk.modules,
-        all_modules: &input.modules,
-        root_dir: &input.root_dir,
-        prefix_refs: &prefix_refs,
-        specifier_rewrites: &specifier_rewrites,
-        per_module_maps: &input.per_module_maps,
-        generate_source_maps: input.options.source_maps,
-        unused_exports: &main_unused,
-        bundled_specifiers: &input.bundled_specifiers,
-        chunk_entry: &main_chunk.entry,
-        chunk_kind: &main_chunk.kind,
-        chunk_module_set: &main_module_set,
-        main_file_to_ns: &HashMap::new(),
-        main_chunk_module_set: &main_module_set,
-        canon_cache: &canon_cache,
-        export_conditions: &condition_refs,
-    })?;
-    let main_spec_to_ns = main_result.specifier_to_namespace;
-    let main_file_to_ns = main_result.file_to_namespace;
-    output_chunks.insert(main_chunk.filename.clone(), main_result.code);
-    if let Some(map) = main_result.source_map {
-        chunk_source_maps.insert(main_chunk.filename.clone(), map);
-    }
-
-    // Process lazy/shared chunks in parallel. Each chunk only reads shared
-    // state (module map, rewrite map, main-chunk namespaces) so per-chunk
-    // work is independent; we fan out with rayon and fold the results
-    // afterwards to preserve the original aggregation semantics.
-    let lazy_outputs: Vec<(String, ChunkBundleResult)> = chunk_graph.chunks[1..]
+    // Process every chunk (main + lazy/shared) in a single rayon fan-out.
+    // Each chunk only reads shared, immutable state — module map, rewrite
+    // map, the pre-computed main-chunk namespaces — so per-chunk work is
+    // independent. `par_iter()` over the original `chunks` slice preserves
+    // the chunks-in-order indexing, so index 0 is still the main chunk
+    // when we fold the results back.
+    let chunk_outputs: Vec<(String, ChunkBundleResult)> = chunk_graph
+        .chunks
         .par_iter()
-        .map(|chunk| -> NgcResult<(String, ChunkBundleResult)> {
+        .enumerate()
+        .map(|(idx, chunk)| -> NgcResult<(String, ChunkBundleResult)> {
+            let is_main = idx == 0;
             let unused_exports = if input.options.tree_shake {
+                let externally_used_ref = if is_main {
+                    externally_used.as_ref()
+                } else {
+                    None
+                };
                 shake::analyze_unused_exports(
                     &chunk.modules,
                     &input.modules,
                     &chunk.entry,
                     &prefix_refs,
-                    None,
+                    externally_used_ref,
                     subpath_ctx,
                 )?
             } else {
                 HashMap::new()
             };
 
-            let lazy_module_set: HashSet<PathBuf> = chunk.modules.iter().cloned().collect();
+            let chunk_module_set: HashSet<PathBuf> = chunk.modules.iter().cloned().collect();
             let result = bundle_chunk(&ChunkBundleParams {
                 module_paths: &chunk.modules,
                 all_modules: &input.modules,
@@ -210,7 +200,7 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
                 bundled_specifiers: &input.bundled_specifiers,
                 chunk_entry: &chunk.entry,
                 chunk_kind: &chunk.kind,
-                chunk_module_set: &lazy_module_set,
+                chunk_module_set: &chunk_module_set,
                 main_file_to_ns: &main_file_to_ns,
                 main_chunk_module_set: &main_module_set,
                 canon_cache: &canon_cache,
@@ -220,9 +210,18 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
         })
         .collect::<NgcResult<Vec<_>>>()?;
 
+    // Fold chunk outputs back into the aggregation maps. Index 0 is the main
+    // chunk (it produces no cross-chunk needs); the rest are lazy/shared.
     let mut all_needed_npm: HashMap<String, BTreeSet<String>> = HashMap::new();
     let mut all_needed_project: BTreeSet<String> = BTreeSet::new();
-    for (filename, result) in lazy_outputs {
+    let mut chunk_outputs_iter = chunk_outputs.into_iter();
+    if let Some((main_filename, main_result)) = chunk_outputs_iter.next() {
+        output_chunks.insert(main_filename.clone(), main_result.code);
+        if let Some(map) = main_result.source_map {
+            chunk_source_maps.insert(main_filename, map);
+        }
+    }
+    for (filename, result) in chunk_outputs_iter {
         // Collect npm symbols this chunk needs.
         // Namespace imports ("* as X") are stored with the local name only.
         for ext in &result.npm_externals {
@@ -303,6 +302,63 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
         main_filename,
         chunk_source_maps,
     })
+}
+
+/// Pre-compute the main chunk's npm namespace maps.
+///
+/// Mirrors the logic that `bundle_chunk` runs internally for the main chunk,
+/// but extracted so it can run before the per-chunk fan-out. Lazy chunks
+/// reach into these maps via `classify_lazy_externals` to resolve cross-chunk
+/// npm references; cross-chunk export generation reads `specifier_to_namespace`
+/// after every chunk has been bundled. Computing them up front breaks the
+/// data dependency from main → lazy and lets all chunks fan out together.
+fn compute_main_namespace_maps(
+    main_module_paths: &[PathBuf],
+    bundled_specifiers: &HashSet<String>,
+    root_dir: &Path,
+    export_conditions: &[&str],
+    canon_cache: &CanonCache,
+) -> (HashMap<PathBuf, String>, HashMap<String, String>) {
+    let node_modules_dir = root_dir.join("node_modules");
+    let mut file_to_namespace: HashMap<PathBuf, String> = HashMap::new();
+    let mut specifier_to_namespace: HashMap<String, String> = HashMap::new();
+
+    for module_path in main_module_paths {
+        let is_npm = module_path
+            .components()
+            .any(|c| c.as_os_str() == "node_modules");
+        if is_npm {
+            let ns = crate::npm_wrap::namespace_from_path(module_path, &node_modules_dir);
+            file_to_namespace.insert(module_path.clone(), ns);
+        }
+    }
+
+    for spec in bundled_specifiers {
+        if let Ok(entry_path) = ngc_npm_resolver::resolve::resolve_bare_specifier(
+            spec,
+            node_modules_dir.parent().unwrap_or(&node_modules_dir),
+            export_conditions,
+        ) {
+            let canonical = cached_canonicalize(canon_cache, &entry_path).unwrap_or(entry_path);
+            if let Some(ns) = file_to_namespace.get(&canonical) {
+                specifier_to_namespace.insert(spec.clone(), ns.clone());
+                continue;
+            }
+        }
+        // Fallback: for vendored/synthetic modules (e.g.
+        // @oxc-project/runtime/helpers/decorate) that don't have a
+        // package.json, match by path suffix in the file_to_namespace map.
+        let spec_path_suffix = spec.replace('/', std::path::MAIN_SEPARATOR_STR);
+        for (path, ns) in &file_to_namespace {
+            let path_str = path.to_string_lossy();
+            if path_str.contains(&spec_path_suffix) {
+                specifier_to_namespace.insert(spec.clone(), ns.clone());
+                break;
+            }
+        }
+    }
+
+    (file_to_namespace, specifier_to_namespace)
 }
 
 /// Build a mapping from raw import specifiers (as they appear in source) to chunk filenames.
@@ -427,10 +483,6 @@ struct ChunkBundleResult {
     npm_externals: Vec<ExternalImport>,
     /// For lazy/shared chunks: project symbols imported from main chunk modules.
     project_cross_chunk_symbols: BTreeSet<String>,
-    /// For main chunk: bare specifier → namespace variable name mapping.
-    specifier_to_namespace: HashMap<String, String>,
-    /// For main chunk: canonical file path → namespace variable name mapping.
-    file_to_namespace: HashMap<PathBuf, String>,
 }
 
 /// Bundle a single chunk's modules into an ESM string, optionally with a source map.
@@ -726,8 +778,6 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<ChunkBundleResult> {
         source_map: combined_map,
         npm_externals,
         project_cross_chunk_symbols,
-        specifier_to_namespace,
-        file_to_namespace,
     })
 }
 
@@ -886,7 +936,13 @@ fn generate_cross_chunk_exports(
     let mut all_symbols: BTreeSet<String> = BTreeSet::new();
     let mut var_lines: Vec<String> = Vec::new();
 
-    for (specifier, symbols) in needed_npm {
+    // Iterate `needed_npm` in sorted-key order; otherwise the resulting
+    // `var X = ns.X;` lines (and therefore main.js's content hash) flap from
+    // build to build because `HashMap` iteration order is randomized.
+    let mut npm_keys: Vec<&String> = needed_npm.keys().collect();
+    npm_keys.sort();
+    for specifier in npm_keys {
+        let symbols = &needed_npm[specifier];
         // Look up namespace: first by specifier, then by resolved namespace key
         let resolved_ns_key = specifier.strip_prefix("__resolved_ns__").map(String::from);
         let ns = specifier_to_ns.get(specifier).or(resolved_ns_key.as_ref());
