@@ -289,8 +289,7 @@ fn build_failed_event_is_fanned_out_as_named_sse_frame() {
         .trim_end_matches('\n')
         .strip_prefix("data: ")
         .expect("data: prefix");
-    let parsed: serde_json::Value =
-        serde_json::from_str(data).expect("json data payload");
+    let parsed: serde_json::Value = serde_json::from_str(data).expect("json data payload");
     assert_eq!(parsed["message"], "syntax error: unexpected }");
     assert_eq!(parsed["file"], "/tmp/proj/src/app.ts");
     assert_eq!(parsed["line"], 7);

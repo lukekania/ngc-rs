@@ -132,10 +132,7 @@ impl DevServer {
     /// Pass [`DevServerEvent`]s to the matching sender returned by
     /// [`channel`](std::sync::mpsc::channel) elsewhere — typically from a
     /// file watcher.
-    pub fn start(
-        config: DevServerConfig,
-        event_rx: Receiver<DevServerEvent>,
-    ) -> NgcResult<Self> {
+    pub fn start(config: DevServerConfig, event_rx: Receiver<DevServerEvent>) -> NgcResult<Self> {
         let bind = (config.host.as_str(), config.port);
         let addr = bind
             .to_socket_addrs()
@@ -205,11 +202,9 @@ impl DevServer {
     /// Used by tests to drive the SSE wire directly without standing up a
     /// separate watcher producer.
     pub fn send_event(&self, event: DevServerEvent) -> NgcResult<()> {
-        self.event_tx
-            .send(event)
-            .map_err(|e| NgcError::ServeError {
-                message: format!("could not enqueue dev server event: {e}"),
-            })
+        self.event_tx.send(event).map_err(|e| NgcError::ServeError {
+            message: format!("could not enqueue dev server event: {e}"),
+        })
     }
 }
 
@@ -225,10 +220,7 @@ impl Drop for DevServer {
 type SseWriter = Box<dyn Write + Send>;
 type SseClients = Arc<Mutex<Vec<SseWriter>>>;
 
-fn spawn_bridge(
-    rx: Receiver<DevServerEvent>,
-    tx: Sender<DevServerEvent>,
-) -> NgcResult<()> {
+fn spawn_bridge(rx: Receiver<DevServerEvent>, tx: Sender<DevServerEvent>) -> NgcResult<()> {
     thread::Builder::new()
         .name("ngc-dev-server-bridge".into())
         .spawn(move || {
@@ -717,9 +709,8 @@ mod tests {
         };
         let frame = sse_frame(&event);
         let data_line = frame.lines().nth(1).expect("data line");
-        let json: serde_json::Value =
-            serde_json::from_str(data_line.trim_start_matches("data: "))
-                .expect("payload remains parseable when message has quotes");
+        let json: serde_json::Value = serde_json::from_str(data_line.trim_start_matches("data: "))
+            .expect("payload remains parseable when message has quotes");
         assert_eq!(json["message"], "saw \"quotes\" and \\backslashes\\");
     }
 
