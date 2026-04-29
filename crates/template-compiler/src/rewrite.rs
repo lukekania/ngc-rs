@@ -45,6 +45,8 @@ pub fn rewrite_source_generic(
                 "span out of bounds: decorator_end={decorator_end}, class_body_start={class_body_start}, source_len={}",
                 source.len()
             ),
+            line: None,
+            column: None,
         });
     }
     if decorator_start >= decorator_end || decorator_end > class_body_start {
@@ -53,6 +55,8 @@ pub fn rewrite_source_generic(
             message: format!(
                 "invalid span order: decorator=({decorator_start},{decorator_end}), class_body_start={class_body_start}"
             ),
+            line: None,
+            column: None,
         });
     }
 

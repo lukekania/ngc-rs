@@ -1,6 +1,37 @@
 use std::path::PathBuf;
 use thiserror::Error;
 
+/// Convert a 0-based UTF-8 byte offset into `source` to a 1-based
+/// (line, column) pair.
+///
+/// Columns count by Unicode code points (`char`s), not bytes — this matches
+/// how editors locate cursors on multibyte characters. If `offset` lies past
+/// the end of `source`, returns the position of the last byte in the file.
+///
+/// Used by build-pipeline crates to attach precise error locations to
+/// `NgcError` variants that carry `line` / `column` fields (e.g.
+/// [`NgcError::TemplateCompileError`]). The overlay client surfaces those
+/// fields verbatim.
+pub fn byte_offset_to_line_col(source: &str, offset: u32) -> (u32, u32) {
+    let target = (offset as usize).min(source.len());
+    let mut line: u32 = 1;
+    let mut col: u32 = 1;
+    let mut consumed = 0usize;
+    for ch in source.chars() {
+        if consumed >= target {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+        consumed += ch.len_utf8();
+    }
+    (line, col)
+}
+
 /// The unified error type for all ngc-rs operations.
 #[derive(Debug, Error)]
 pub enum NgcError {
@@ -53,21 +84,29 @@ pub enum NgcError {
     },
 
     /// A TypeScript file could not be parsed.
-    #[error("parse error in {path}: {message}")]
+    #[error("parse error in {path}{}: {message}", fmt_loc(*line, *column))]
     ParseError {
         /// The path to the file that failed to parse.
         path: PathBuf,
         /// The error message from the parser.
         message: String,
+        /// 1-based line number of the first parser error, when available.
+        line: Option<u32>,
+        /// 1-based column number of the first parser error, when available.
+        column: Option<u32>,
     },
 
     /// A TypeScript transform failed.
-    #[error("transform error in {path}: {message}")]
+    #[error("transform error in {path}{}: {message}", fmt_loc(*line, *column))]
     TransformError {
         /// The path to the file that failed to transform.
         path: PathBuf,
         /// The error message from the transformer.
         message: String,
+        /// 1-based line number of the first transformer error, when available.
+        line: Option<u32>,
+        /// 1-based column number of the first transformer error, when available.
+        column: Option<u32>,
     },
 
     /// A bundling operation failed.
@@ -85,21 +124,29 @@ pub enum NgcError {
     },
 
     /// An Angular template could not be parsed.
-    #[error("template parse error in {path}: {message}")]
+    #[error("template parse error in {path}{}: {message}", fmt_loc(*line, *column))]
     TemplateParseError {
         /// The path to the file containing the template.
         path: PathBuf,
         /// The error message from the template parser.
         message: String,
+        /// 1-based line number of the first parser error, when available.
+        line: Option<u32>,
+        /// 1-based column number of the first parser error, when available.
+        column: Option<u32>,
     },
 
     /// Angular template compilation (Ivy codegen) failed.
-    #[error("template compile error in {path}: {message}")]
+    #[error("template compile error in {path}{}: {message}", fmt_loc(*line, *column))]
     TemplateCompileError {
         /// The path to the file that failed to compile.
         path: PathBuf,
         /// The error message from the compiler.
         message: String,
+        /// 1-based line number where compilation failed, when available.
+        line: Option<u32>,
+        /// 1-based column number where compilation failed, when available.
+        column: Option<u32>,
     },
 
     /// An angular.json file could not be parsed.
@@ -180,12 +227,16 @@ pub enum NgcError {
     },
 
     /// The Angular linker failed to process a partially compiled file.
-    #[error("linker error in {path}: {message}")]
+    #[error("linker error in {path}{}: {message}", fmt_loc(*line, *column))]
     LinkerError {
         /// The path to the file that failed to link.
         path: PathBuf,
         /// Description of what went wrong.
         message: String,
+        /// 1-based line number where the linker failure occurred, when available.
+        line: Option<u32>,
+        /// 1-based column number where the linker failure occurred, when available.
+        column: Option<u32>,
     },
 
     /// A user-facing configuration error not tied to a specific file
@@ -213,3 +264,67 @@ pub enum NgcError {
 
 /// A type alias for Results using NgcError.
 pub type NgcResult<T> = Result<T, NgcError>;
+
+/// Format an optional `(line, column)` pair as `:line:col` (or `:line` when
+/// only the line is known) for embedding in `Display` output. Returns an
+/// empty string when neither is known.
+fn fmt_loc(line: Option<u32>, column: Option<u32>) -> String {
+    match (line, column) {
+        (Some(l), Some(c)) => format!(":{l}:{c}"),
+        (Some(l), None) => format!(":{l}"),
+        _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_offset_at_start_returns_line_one_col_one() {
+        assert_eq!(byte_offset_to_line_col("hello\nworld", 0), (1, 1));
+    }
+
+    #[test]
+    fn byte_offset_advances_columns_within_a_line() {
+        assert_eq!(byte_offset_to_line_col("hello", 3), (1, 4));
+    }
+
+    #[test]
+    fn byte_offset_advances_lines_after_newline() {
+        assert_eq!(byte_offset_to_line_col("a\nbcd", 2), (2, 1));
+        assert_eq!(byte_offset_to_line_col("a\nbcd", 4), (2, 3));
+    }
+
+    #[test]
+    fn byte_offset_counts_columns_by_chars_not_bytes() {
+        // 'é' is two UTF-8 bytes; column should advance by 1.
+        let s = "é-x";
+        assert_eq!(byte_offset_to_line_col(s, 0), (1, 1));
+        assert_eq!(byte_offset_to_line_col(s, 2), (1, 2));
+    }
+
+    #[test]
+    fn byte_offset_past_end_clamps_to_last_position() {
+        let s = "abc";
+        let (l, c) = byte_offset_to_line_col(s, 999);
+        assert_eq!(l, 1);
+        assert_eq!(c, 4);
+    }
+
+    #[test]
+    fn fmt_loc_renders_line_col_when_both_present() {
+        assert_eq!(fmt_loc(Some(12), Some(3)), ":12:3");
+    }
+
+    #[test]
+    fn fmt_loc_renders_just_line_when_no_column() {
+        assert_eq!(fmt_loc(Some(12), None), ":12");
+    }
+
+    #[test]
+    fn fmt_loc_renders_empty_when_missing() {
+        assert_eq!(fmt_loc(None, None), "");
+        assert_eq!(fmt_loc(None, Some(5)), "");
+    }
+}

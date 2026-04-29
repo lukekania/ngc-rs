@@ -18,7 +18,7 @@ use std::sync::mpsc::channel;
 use std::sync::Arc;
 
 use colored::Colorize;
-use ngc_dev_server::{DevServer, DevServerConfig, ReloadEvent};
+use ngc_dev_server::{DevServer, DevServerConfig, DevServerEvent};
 use ngc_diagnostics::{NgcError, NgcResult};
 use ngc_watch::{Watcher, WatcherConfig};
 
@@ -61,11 +61,11 @@ pub(crate) fn run_with_stop(
         initial.output_files.len(),
     );
 
-    let (reload_tx, reload_rx) = channel::<ReloadEvent>();
+    let (event_tx, event_rx) = channel::<DevServerEvent>();
     let cfg = DevServerConfig::new(&out_dir)
         .with_host(host.to_string())
         .with_port(port);
-    let server = DevServer::start(cfg, reload_rx)?;
+    let server = DevServer::start(cfg, event_rx)?;
     let url = format!("http://{}", server.addr());
     eprintln!(
         "{} {}",
@@ -107,13 +107,16 @@ pub(crate) fn run_with_stop(
                     result.modules_bundled,
                     dirty.len()
                 );
-                if reload_tx.send(ReloadEvent).is_err() {
-                    tracing::debug!("dev server reload channel closed");
+                if event_tx.send(DevServerEvent::Reload).is_err() {
+                    tracing::debug!("dev server event channel closed");
                 }
                 Ok(())
             }
             Err(e) => {
                 eprintln!("{} {e}", "ngc-rs rebuild failed:".bold().red());
+                if event_tx.send(build_failure_event(&e)).is_err() {
+                    tracing::debug!("dev server event channel closed");
+                }
                 Err(e)
             }
         }
@@ -126,6 +129,52 @@ pub(crate) fn run_with_stop(
     eprintln!("{}", "ngc-rs serve shutting down".dimmed());
     drop(server);
     result
+}
+
+/// Translate an [`NgcError`] into the [`DevServerEvent::BuildFailed`]
+/// payload that ships to the browser overlay.
+///
+/// Reuses `Display` for the `message` so the overlay shows the same text
+/// the terminal already prints, and lifts the offending file path plus
+/// (when the underlying parser surfaced them) line/column coordinates.
+pub(crate) fn build_failure_event(err: &NgcError) -> DevServerEvent {
+    let (file, line, column) = error_location(err);
+    DevServerEvent::BuildFailed {
+        message: err.to_string(),
+        file,
+        line,
+        column,
+    }
+}
+
+fn error_location(err: &NgcError) -> (Option<PathBuf>, Option<u32>, Option<u32>) {
+    match err {
+        NgcError::ParseError {
+            path, line, column, ..
+        }
+        | NgcError::TransformError {
+            path, line, column, ..
+        }
+        | NgcError::TemplateParseError {
+            path, line, column, ..
+        }
+        | NgcError::TemplateCompileError {
+            path, line, column, ..
+        }
+        | NgcError::LinkerError {
+            path, line, column, ..
+        } => (Some(path.clone()), *line, *column),
+        NgcError::Io { path, .. }
+        | NgcError::TsConfigParse { path, .. }
+        | NgcError::TsConfigExtendsNotFound { path }
+        | NgcError::AngularJsonParse { path, .. }
+        | NgcError::AssetError { path, .. }
+        | NgcError::StyleError { path, .. }
+        | NgcError::SourceMapError { path, .. }
+        | NgcError::MinifyError { path, .. } => (Some(path.clone()), None, None),
+        NgcError::UnresolvedImport { from_file, .. } => (Some(from_file.clone()), None, None),
+        _ => (None, None, None),
+    }
 }
 
 fn install_ctrlc(flag: Arc<AtomicBool>) {
@@ -192,5 +241,75 @@ mod tests {
         // We don't run it; just confirm the constructor returned a Command
         // with a non-empty program name on the host platform.
         assert!(!cmd.get_program().is_empty());
+    }
+
+    #[test]
+    fn build_failure_event_extracts_location_from_parse_error() {
+        let err = NgcError::ParseError {
+            path: PathBuf::from("/proj/src/app.ts"),
+            message: "unexpected token".to_string(),
+            line: Some(12),
+            column: Some(3),
+        };
+        let DevServerEvent::BuildFailed {
+            message,
+            file,
+            line,
+            column,
+        } = build_failure_event(&err)
+        else {
+            panic!("expected BuildFailed variant");
+        };
+        assert!(message.contains("unexpected token"));
+        assert_eq!(file.as_deref(), Some(Path::new("/proj/src/app.ts")));
+        assert_eq!(line, Some(12));
+        assert_eq!(column, Some(3));
+    }
+
+    #[test]
+    fn build_failure_event_omits_location_when_parser_did_not_supply_one() {
+        let err = NgcError::ParseError {
+            path: PathBuf::from("/proj/src/app.ts"),
+            message: "unsupported file extension".to_string(),
+            line: None,
+            column: None,
+        };
+        let DevServerEvent::BuildFailed { line, column, .. } = build_failure_event(&err) else {
+            panic!("expected BuildFailed variant");
+        };
+        assert!(line.is_none());
+        assert!(column.is_none());
+    }
+
+    #[test]
+    fn build_failure_event_extracts_from_file_for_unresolved_import() {
+        let err = NgcError::UnresolvedImport {
+            specifier: "./missing".to_string(),
+            from_file: PathBuf::from("/proj/src/app.ts"),
+        };
+        let DevServerEvent::BuildFailed { file, .. } = build_failure_event(&err) else {
+            panic!("expected BuildFailed variant");
+        };
+        assert_eq!(file.as_deref(), Some(Path::new("/proj/src/app.ts")));
+    }
+
+    #[test]
+    fn build_failure_event_omits_path_for_pathless_errors() {
+        let err = NgcError::ServeError {
+            message: "boom".to_string(),
+        };
+        let DevServerEvent::BuildFailed {
+            message,
+            file,
+            line,
+            column,
+        } = build_failure_event(&err)
+        else {
+            panic!("expected BuildFailed variant");
+        };
+        assert!(message.contains("boom"));
+        assert!(file.is_none());
+        assert!(line.is_none());
+        assert!(column.is_none());
     }
 }
