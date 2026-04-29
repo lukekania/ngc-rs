@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use dashmap::DashMap;
 use ngc_diagnostics::{NgcError, NgcResult};
 use petgraph::graph::{DiGraph, NodeIndex};
 use rayon::prelude::*;
@@ -57,6 +58,24 @@ struct ResolverConfig {
     base_url: Option<PathBuf>,
     /// Path alias mappings.
     path_aliases: HashMap<String, Vec<String>>,
+}
+
+/// Shared, concurrent cache of `canonicalize()` results. Each import probes
+/// up to ~5 candidate paths (extensions + `index.*` fallbacks), and the same
+/// path resolves repeatedly across rayon workers (e.g. every component in a
+/// directory probes the same `index.ts`). Caching collapses duplicates to one
+/// syscall per unique input path.
+type CanonCache = DashMap<PathBuf, Option<PathBuf>>;
+
+/// Look up `p` in the cache, otherwise call `canonicalize()` and store the
+/// result (successful resolution as `Some`, failure as `None`).
+fn cached_canonicalize(cache: &CanonCache, p: &Path) -> Option<PathBuf> {
+    if let Some(hit) = cache.get(p) {
+        return hit.clone();
+    }
+    let canonical = p.canonicalize().ok();
+    cache.insert(p.to_path_buf(), canonical.clone());
+    canonical
 }
 
 impl ResolverConfig {
@@ -134,16 +153,23 @@ pub fn build_file_graph(config: &ResolvedTsConfig) -> NgcResult<FileGraph> {
         External,
     }
 
+    let canon_cache: CanonCache = DashMap::new();
     let outcomes: Vec<ResolutionOutcome> = scan_results
         .par_iter()
         .flat_map_iter(|(from_file, scanned_imports)| {
             let from_idx = path_index[from_file];
             let resolver_config = &resolver_config;
             let path_index = &path_index;
+            let canon_cache = &canon_cache;
             scanned_imports
                 .iter()
                 .map(move |scanned| {
-                    match resolve_specifier(&scanned.specifier, from_file, resolver_config) {
+                    match resolve_specifier(
+                        &scanned.specifier,
+                        from_file,
+                        resolver_config,
+                        canon_cache,
+                    ) {
                         Some(resolved_path) => {
                             if let Some(&to_idx) = path_index.get(&resolved_path) {
                                 ResolutionOutcome::Edge(from_idx, to_idx, scanned.kind)
@@ -324,11 +350,12 @@ fn resolve_specifier(
     specifier: &str,
     from_file: &Path,
     config: &ResolverConfig,
+    canon_cache: &CanonCache,
 ) -> Option<PathBuf> {
     // Relative imports
     if specifier.starts_with('.') {
         let from_dir = from_file.parent()?;
-        return resolve_with_extensions(&from_dir.join(specifier));
+        return resolve_with_extensions(&from_dir.join(specifier), canon_cache);
     }
 
     // Path alias imports
@@ -339,7 +366,7 @@ fn resolve_specifier(
                     if let Some(rep_prefix) = replacement.strip_suffix('*') {
                         let base = config.base_url.as_ref().unwrap_or(&config.root_dir);
                         let candidate = base.join(rep_prefix).join(rest);
-                        if let Some(resolved) = resolve_with_extensions(&candidate) {
+                        if let Some(resolved) = resolve_with_extensions(&candidate, canon_cache) {
                             return Some(resolved);
                         }
                     }
@@ -350,7 +377,7 @@ fn resolve_specifier(
             for replacement in replacements {
                 let base = config.base_url.as_ref().unwrap_or(&config.root_dir);
                 let candidate = base.join(replacement);
-                if let Some(resolved) = resolve_with_extensions(&candidate) {
+                if let Some(resolved) = resolve_with_extensions(&candidate, canon_cache) {
                     return Some(resolved);
                 }
             }
@@ -366,10 +393,10 @@ fn resolve_specifier(
 /// Tries in order: exact path, `{base}.ts`, `{base}.tsx`, `{base}/index.ts`,
 /// `{base}/index.tsx`. Uses string appending rather than `Path::with_extension`
 /// to correctly handle dotted filenames like `app.component`.
-fn resolve_with_extensions(base: &Path) -> Option<PathBuf> {
+fn resolve_with_extensions(base: &Path, canon_cache: &CanonCache) -> Option<PathBuf> {
     // Exact path
     if base.is_file() {
-        return base.canonicalize().ok();
+        return cached_canonicalize(canon_cache, base);
     }
 
     let base_str = base.as_os_str().to_str()?;
@@ -377,25 +404,25 @@ fn resolve_with_extensions(base: &Path) -> Option<PathBuf> {
     // Try .ts extension (append, don't replace)
     let with_ts = PathBuf::from(format!("{base_str}.ts"));
     if with_ts.is_file() {
-        return with_ts.canonicalize().ok();
+        return cached_canonicalize(canon_cache, &with_ts);
     }
 
     // Try .tsx extension
     let with_tsx = PathBuf::from(format!("{base_str}.tsx"));
     if with_tsx.is_file() {
-        return with_tsx.canonicalize().ok();
+        return cached_canonicalize(canon_cache, &with_tsx);
     }
 
     // Try /index.ts
     let index_ts = base.join("index.ts");
     if index_ts.is_file() {
-        return index_ts.canonicalize().ok();
+        return cached_canonicalize(canon_cache, &index_ts);
     }
 
     // Try /index.tsx
     let index_tsx = base.join("index.tsx");
     if index_tsx.is_file() {
-        return index_tsx.canonicalize().ok();
+        return cached_canonicalize(canon_cache, &index_tsx);
     }
 
     None
