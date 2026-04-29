@@ -26,8 +26,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
 
+use dashmap::mapref::entry::Entry;
+use dashmap::{DashMap, DashSet};
 use rayon::prelude::*;
 
 use ngc_diagnostics::{NgcError, NgcResult};
@@ -51,12 +52,12 @@ use crate::metadata;
 pub struct ModuleRegistry {
     /// Class name -> direct exports (in source order, possibly containing other
     /// module names that need transitive expansion).
-    raw_exports: RwLock<HashMap<String, Vec<String>>>,
+    raw_exports: DashMap<String, Vec<String>>,
     /// Set of class names known to be NgModules (i.e., have been registered).
-    is_module: RwLock<HashSet<String>>,
+    is_module: DashSet<String>,
     /// Memoized result of [`flatten`]. Cleared implicitly between builds since
     /// each build constructs a fresh registry.
-    flat_cache: RwLock<HashMap<String, Vec<String>>>,
+    flat_cache: DashMap<String, Vec<String>>,
 }
 
 impl ModuleRegistry {
@@ -74,60 +75,41 @@ impl ModuleRegistry {
     /// project file shadows an npm package's NgModule.
     pub fn register(&self, name: &str, exports: Vec<String>) {
         let mut changed = true;
-        {
-            let mut raw = match self.raw_exports.write() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            match raw.get(name) {
-                Some(existing) if existing == &exports => {
+        match self.raw_exports.entry(name.to_string()) {
+            Entry::Occupied(mut e) => {
+                if e.get() == &exports {
                     changed = false;
-                }
-                Some(_) => {
+                } else {
                     tracing::warn!(
                         module = name,
                         "NgModule registered with conflicting exports; later registration wins"
                     );
-                    raw.insert(name.to_string(), exports);
-                }
-                None => {
-                    raw.insert(name.to_string(), exports);
+                    e.insert(exports);
                 }
             }
+            Entry::Vacant(v) => {
+                v.insert(exports);
+            }
         }
-        {
-            let mut set = match self.is_module.write() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            set.insert(name.to_string());
-        }
+        self.is_module.insert(name.to_string());
         if changed {
-            if let Ok(mut cache) = self.flat_cache.write() {
-                cache.clear();
-            }
+            self.flat_cache.clear();
         }
     }
 
     /// Whether the given class name is a known NgModule.
     pub fn is_module(&self, name: &str) -> bool {
-        match self.is_module.read() {
-            Ok(g) => g.contains(name),
-            Err(p) => p.into_inner().contains(name),
-        }
+        self.is_module.contains(name)
     }
 
     /// Number of registered NgModules.
     pub fn len(&self) -> usize {
-        match self.is_module.read() {
-            Ok(g) => g.len(),
-            Err(p) => p.into_inner().len(),
-        }
+        self.is_module.len()
     }
 
     /// Whether the registry is empty.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.is_module.is_empty()
     }
 
     /// Return the transitively flattened directive/pipe class list for `name`.
@@ -141,17 +123,13 @@ impl ModuleRegistry {
     /// Order-preserving: depth-first source order with O(n) dedup. The lists
     /// are small (typically <30) so the linear contains-check is fine.
     pub fn flatten(&self, name: &str) -> Vec<String> {
-        if let Ok(cache) = self.flat_cache.read() {
-            if let Some(hit) = cache.get(name) {
-                return hit.clone();
-            }
+        if let Some(hit) = self.flat_cache.get(name) {
+            return hit.value().clone();
         }
         let mut visited = HashSet::new();
         let mut out = Vec::new();
         self.walk(name, &mut visited, &mut out);
-        if let Ok(mut cache) = self.flat_cache.write() {
-            cache.insert(name.to_string(), out.clone());
-        }
+        self.flat_cache.insert(name.to_string(), out.clone());
         out
     }
 
@@ -159,10 +137,7 @@ impl ModuleRegistry {
         if !visited.insert(name.to_string()) {
             return;
         }
-        let direct = match self.raw_exports.read() {
-            Ok(g) => g.get(name).cloned(),
-            Err(p) => p.into_inner().get(name).cloned(),
-        };
+        let direct = self.raw_exports.get(name).map(|r| r.value().clone());
         match direct {
             Some(exports) => {
                 for e in exports {
@@ -227,7 +202,7 @@ pub fn scan_define_ng_modules(
     modules: &HashMap<PathBuf, String>,
     registry: &ModuleRegistry,
 ) -> NgcResult<usize> {
-    // `ModuleRegistry` is RwLock-protected, so `scan_one` is thread-safe.
+    // `ModuleRegistry` is DashMap-backed, so `scan_one` is thread-safe.
     // Each file's parse + AST walk is independent, so fan out across rayon.
     modules
         .par_iter()
