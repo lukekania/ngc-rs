@@ -111,6 +111,76 @@ pub fn flatten_component_dependencies(
     Ok(rewritten)
 }
 
+/// Dry-run flatten: walk every `ɵɵdefineComponent` call in `modules` and
+/// return the sorted, de-duplicated list of npm specifiers that
+/// [`flatten_component_dependencies`] would inject as **brand-new** import
+/// statements (i.e. specifiers not already present in any existing
+/// named-import in the file).
+///
+/// Used by the CLI as a pre-scan so the first npm-resolve call can pull in
+/// transitive Angular subpaths before flatten actually rewrites the project,
+/// eliminating the post-flatten resolution pass on the happy path. Specifiers
+/// that flatten would resolve by *extending an existing* same-source import
+/// are intentionally excluded — those are already in `bare_specifiers`.
+pub fn scan_introduced_specifiers(
+    modules: &HashMap<PathBuf, String>,
+    registry: &ModuleRegistry,
+    public_exports: &PublicExports,
+) -> Vec<String> {
+    if registry.is_empty() {
+        return Vec::new();
+    }
+
+    let work: Vec<(&PathBuf, &String)> = modules
+        .iter()
+        .filter(|(_, source)| source.contains("\u{0275}\u{0275}defineComponent"))
+        .collect();
+
+    let lists: Vec<Vec<String>> = work
+        .par_iter()
+        .map(|(_path, source)| collect_introduced_in_file(source, registry, public_exports))
+        .collect();
+
+    let mut seen = std::collections::BTreeSet::new();
+    for list in lists {
+        for spec in list {
+            seen.insert(spec);
+        }
+    }
+    seen.into_iter().collect()
+}
+
+/// Single-file dry-run helper for [`scan_introduced_specifiers`].
+///
+/// Mirrors the AST walk that [`flatten_one`] performs but discards the
+/// generated `dependencies`-array replacements — only the keys of
+/// `new_imports` are returned, since those are the specifiers that flatten
+/// would emit a fresh `import { … } from '<spec>';` for.
+fn collect_introduced_in_file(
+    source: &str,
+    registry: &ModuleRegistry,
+    public_exports: &PublicExports,
+) -> Vec<String> {
+    let alloc = Allocator::default();
+    let parsed = Parser::new(&alloc, source, SourceType::mjs()).parse();
+    if parsed.panicked || !parsed.errors.is_empty() {
+        return Vec::new();
+    }
+    let mut imports = collect_named_imports(&parsed.program);
+    let mut new_imports: HashMap<String, NewImport> = HashMap::new();
+    let mut deps_replacements = Vec::new();
+    visit_program_deps(
+        &parsed.program,
+        source,
+        registry,
+        public_exports,
+        &mut imports,
+        &mut new_imports,
+        &mut deps_replacements,
+    );
+    new_imports.into_keys().collect()
+}
+
 fn flatten_one(
     source: &str,
     path: &Path,
