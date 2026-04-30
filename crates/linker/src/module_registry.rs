@@ -112,6 +112,21 @@ impl ModuleRegistry {
         self.is_module.is_empty()
     }
 
+    /// Whether `source` plausibly references any registered NgModule by name.
+    ///
+    /// Returns `true` if the substring of any registered class name appears in
+    /// `source`. False positives are fine (the caller will then parse and
+    /// confirm); false negatives must not happen, so this MUST be a superset
+    /// of "can flatten possibly modify this file?". Used by the `ast-reuse`
+    /// fast-path in [`crate::flatten`] to skip the oxc parse on component
+    /// files whose dependencies array can't reference any known module.
+    #[cfg(feature = "ast-reuse")]
+    pub fn any_name_in(&self, source: &str) -> bool {
+        self.is_module
+            .iter()
+            .any(|name| source.contains(name.as_str()))
+    }
+
     /// Return the transitively flattened directive/pipe class list for `name`.
     ///
     /// If `name` is not a known NgModule, returns `vec![name]` (pass-through —

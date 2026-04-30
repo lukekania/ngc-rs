@@ -300,7 +300,28 @@ pub fn compile_file_with_styles(
 /// Tries `@Component` first, then falls through to `@Injectable`, `@Directive`,
 /// `@Pipe`, and `@NgModule`. Returns the source unchanged if no Angular decorator
 /// is found.
+///
+/// With the `ast-reuse` feature, a substring pre-scan picks the matching
+/// extractor directly, avoiding the legacy chain of up to four wasted oxc
+/// parses on files that don't have `@Component`. Files with no decorator
+/// marker at all are short-circuited without any parse.
 fn compile_file(
+    source: &str,
+    file_path: &Path,
+    style_ctx: &StyleContext,
+) -> NgcResult<CompiledFile> {
+    #[cfg(feature = "ast-reuse")]
+    {
+        compile_file_dispatch(source, file_path, style_ctx)
+    }
+    #[cfg(not(feature = "ast-reuse"))]
+    {
+        compile_file_fallthrough(source, file_path, style_ctx)
+    }
+}
+
+#[cfg(not(feature = "ast-reuse"))]
+fn compile_file_fallthrough(
     source: &str,
     file_path: &Path,
     style_ctx: &StyleContext,
@@ -313,54 +334,22 @@ fn compile_file(
 
     // Try @Injectable
     if let Some(extracted) = extract::extract_injectable(source, file_path)? {
-        let ivy_output = injectable_codegen::generate_injectable_ivy(&extracted)?;
-        let rewritten = rewrite::rewrite_source_generic(source, &extracted.common, &ivy_output)?;
-        debug!(path = %file_path.display(), "compiled @Injectable to Ivy");
-        return Ok(CompiledFile {
-            source_path: file_path.to_path_buf(),
-            source: rewritten,
-            compiled: true,
-            jit_fallback: false,
-        });
+        return finalize_injectable(source, file_path, extracted);
     }
 
     // Try @Directive
     if let Some(extracted) = extract::extract_directive(source, file_path)? {
-        let ivy_output = directive_codegen::generate_directive_ivy(&extracted)?;
-        let rewritten = rewrite::rewrite_source_generic(source, &extracted.common, &ivy_output)?;
-        debug!(path = %file_path.display(), "compiled @Directive to Ivy");
-        return Ok(CompiledFile {
-            source_path: file_path.to_path_buf(),
-            source: rewritten,
-            compiled: true,
-            jit_fallback: false,
-        });
+        return finalize_directive(source, file_path, extracted);
     }
 
     // Try @Pipe
     if let Some(extracted) = extract::extract_pipe(source, file_path)? {
-        let ivy_output = pipe_codegen::generate_pipe_ivy(&extracted)?;
-        let rewritten = rewrite::rewrite_source_generic(source, &extracted.common, &ivy_output)?;
-        debug!(path = %file_path.display(), "compiled @Pipe to Ivy");
-        return Ok(CompiledFile {
-            source_path: file_path.to_path_buf(),
-            source: rewritten,
-            compiled: true,
-            jit_fallback: false,
-        });
+        return finalize_pipe(source, file_path, extracted);
     }
 
     // Try @NgModule
     if let Some(extracted) = extract::extract_ng_module(source, file_path)? {
-        let ivy_output = ng_module_codegen::generate_ng_module_ivy(&extracted)?;
-        let rewritten = rewrite::rewrite_source_generic(source, &extracted.common, &ivy_output)?;
-        debug!(path = %file_path.display(), "compiled @NgModule to Ivy");
-        return Ok(CompiledFile {
-            source_path: file_path.to_path_buf(),
-            source: rewritten,
-            compiled: true,
-            jit_fallback: false,
-        });
+        return finalize_ng_module(source, file_path, extracted);
     }
 
     // No Angular decorator found
@@ -368,6 +357,131 @@ fn compile_file(
         source_path: file_path.to_path_buf(),
         source: source.to_string(),
         compiled: false,
+        jit_fallback: false,
+    })
+}
+
+/// `ast-reuse` path: substring-scan the source for decorator markers and call
+/// only the extractor whose marker is present, skipping the legacy 1-to-5
+/// parse fall-through. The `@` prefix is required so identifiers that happen
+/// to share a name with a decorator (e.g. a local `Component` import alias) do
+/// not trigger spurious parses.
+#[cfg(feature = "ast-reuse")]
+fn compile_file_dispatch(
+    source: &str,
+    file_path: &Path,
+    style_ctx: &StyleContext,
+) -> NgcResult<CompiledFile> {
+    let has_component = source.contains("@Component");
+    let has_injectable = source.contains("@Injectable");
+    let has_directive = source.contains("@Directive");
+    let has_pipe = source.contains("@Pipe");
+    let has_ng_module = source.contains("@NgModule");
+
+    if !(has_component || has_injectable || has_directive || has_pipe || has_ng_module) {
+        return Ok(CompiledFile {
+            source_path: file_path.to_path_buf(),
+            source: source.to_string(),
+            compiled: false,
+            jit_fallback: false,
+        });
+    }
+
+    if has_component {
+        let r = compile_component_with_styles(source, file_path, style_ctx)?;
+        if r.compiled || r.jit_fallback {
+            return Ok(r);
+        }
+    }
+    if has_injectable {
+        if let Some(extracted) = extract::extract_injectable(source, file_path)? {
+            return finalize_injectable(source, file_path, extracted);
+        }
+    }
+    if has_directive {
+        if let Some(extracted) = extract::extract_directive(source, file_path)? {
+            return finalize_directive(source, file_path, extracted);
+        }
+    }
+    if has_pipe {
+        if let Some(extracted) = extract::extract_pipe(source, file_path)? {
+            return finalize_pipe(source, file_path, extracted);
+        }
+    }
+    if has_ng_module {
+        if let Some(extracted) = extract::extract_ng_module(source, file_path)? {
+            return finalize_ng_module(source, file_path, extracted);
+        }
+    }
+
+    Ok(CompiledFile {
+        source_path: file_path.to_path_buf(),
+        source: source.to_string(),
+        compiled: false,
+        jit_fallback: false,
+    })
+}
+
+fn finalize_injectable(
+    source: &str,
+    file_path: &Path,
+    extracted: extract::ExtractedInjectable,
+) -> NgcResult<CompiledFile> {
+    let ivy_output = injectable_codegen::generate_injectable_ivy(&extracted)?;
+    let rewritten = rewrite::rewrite_source_generic(source, &extracted.common, &ivy_output)?;
+    debug!(path = %file_path.display(), "compiled @Injectable to Ivy");
+    Ok(CompiledFile {
+        source_path: file_path.to_path_buf(),
+        source: rewritten,
+        compiled: true,
+        jit_fallback: false,
+    })
+}
+
+fn finalize_directive(
+    source: &str,
+    file_path: &Path,
+    extracted: extract::ExtractedDirective,
+) -> NgcResult<CompiledFile> {
+    let ivy_output = directive_codegen::generate_directive_ivy(&extracted)?;
+    let rewritten = rewrite::rewrite_source_generic(source, &extracted.common, &ivy_output)?;
+    debug!(path = %file_path.display(), "compiled @Directive to Ivy");
+    Ok(CompiledFile {
+        source_path: file_path.to_path_buf(),
+        source: rewritten,
+        compiled: true,
+        jit_fallback: false,
+    })
+}
+
+fn finalize_pipe(
+    source: &str,
+    file_path: &Path,
+    extracted: extract::ExtractedPipe,
+) -> NgcResult<CompiledFile> {
+    let ivy_output = pipe_codegen::generate_pipe_ivy(&extracted)?;
+    let rewritten = rewrite::rewrite_source_generic(source, &extracted.common, &ivy_output)?;
+    debug!(path = %file_path.display(), "compiled @Pipe to Ivy");
+    Ok(CompiledFile {
+        source_path: file_path.to_path_buf(),
+        source: rewritten,
+        compiled: true,
+        jit_fallback: false,
+    })
+}
+
+fn finalize_ng_module(
+    source: &str,
+    file_path: &Path,
+    extracted: extract::ExtractedNgModule,
+) -> NgcResult<CompiledFile> {
+    let ivy_output = ng_module_codegen::generate_ng_module_ivy(&extracted)?;
+    let rewritten = rewrite::rewrite_source_generic(source, &extracted.common, &ivy_output)?;
+    debug!(path = %file_path.display(), "compiled @NgModule to Ivy");
+    Ok(CompiledFile {
+        source_path: file_path.to_path_buf(),
+        source: rewritten,
+        compiled: true,
         jit_fallback: false,
     })
 }

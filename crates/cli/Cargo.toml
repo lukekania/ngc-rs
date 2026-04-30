@@ -42,3 +42,12 @@ base64 = "0.22"
 [dev-dependencies]
 tempfile = "3"
 insta = { version = "1.46", features = ["glob"] }
+
+[features]
+# Propagates the per-crate `ast-reuse` feature to template-compiler and linker:
+# template-compiler dispatches single-extractor work via a substring pre-check
+# (avoiding the legacy 1-to-5 fall-through parses), and linker skips parses on
+# component files whose deps array can't reference any registered NgModule.
+# Combined with the legacy bundler/cache paths the dist output stays
+# byte-identical; the flag is a perf rollback switch only.
+ast-reuse = ["ngc-template-compiler/ast-reuse", "ngc-linker/ast-reuse"]

@@ -26,3 +26,11 @@ ngc-ts-transform = { path = "../ts-transform" }
 insta = { version = "1.46", features = ["glob"] }
 tempfile = "3"
 which = "8"
+
+[features]
+# Skip per-decorator-type re-parses in `compile_file` by using a substring
+# pre-check to dispatch only to the matching extractor. Saves up to four
+# wasted oxc parses per file at the cost of one quick scan.
+#
+# Default OFF — legacy fall-through is the safe rollback path.
+ast-reuse = []

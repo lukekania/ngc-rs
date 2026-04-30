@@ -22,3 +22,12 @@ tracing = "0.1"
 [dev-dependencies]
 insta = { version = "1.46", features = ["glob"] }
 tempfile = "3"
+
+[features]
+# Substring fast-path that lets `flatten_component_dependencies` and
+# `scan_introduced_specifiers` skip the oxc parse on component files whose
+# dependency arrays cannot reference any registered `NgModule`. Same observable
+# output, fewer parses per build.
+#
+# Default OFF — legacy parse-every-component path is the safe rollback.
+ast-reuse = []
