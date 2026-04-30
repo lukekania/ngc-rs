@@ -110,6 +110,22 @@ impl PublicExports {
     pub fn is_empty(&self) -> bool {
         self.name_to_specifier.is_empty()
     }
+
+    /// Whether *any* registered specifier is absent from `known`.
+    ///
+    /// Used by the CLI's pre-scan short-circuit: if every public-export
+    /// specifier already appears in the initial bare-specifiers set, the
+    /// flatten pass cannot introduce a brand-new import and the dry-run
+    /// AST walk is pure overhead.
+    pub fn has_specifier_outside<S: AsRef<str>>(
+        &self,
+        known: &std::collections::HashSet<S>,
+    ) -> bool {
+        let known: std::collections::HashSet<&str> = known.iter().map(|s| s.as_ref()).collect();
+        self.name_to_specifier
+            .iter()
+            .any(|r| !known.contains(r.value().as_str()))
+    }
 }
 
 /// Return the exported *local* name of an export specifier.

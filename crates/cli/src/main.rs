@@ -432,14 +432,122 @@ pub(crate) fn run_build_with_cache(
 
     // Step 6.6: Link partially compiled Angular npm packages and flatten
     // NgModule references in component dependencies arrays.
+    //
+    // This is the orchestrator-by-hand version of `ngc_linker::link_modules`,
+    // structured so a *pre-scan* can predict the bare specifiers that the
+    // flatten pass would otherwise inject. By resolving them up front (and
+    // before flatten actually rewrites project files), the post-flatten
+    // resolution pass collapses to zero specifiers on the happy path —
+    // saving ~10–20 ms on Angular Material apps where flatten transitively
+    // pulls in subpath packages like `@angular/cdk/portal`.
     let link_span = tracing::info_span!("link").entered();
-    let linker_stats = ngc_linker::link_modules(&mut modules, &config_dir)?;
+    let registry = ngc_linker::ModuleRegistry::new();
+    let public_exports = ngc_linker::PublicExports::new();
+
+    // Pass 1: rewrite npm `ɵɵngDeclare*` → `ɵɵdefine*` and populate registry.
+    let mut linker_stats = ngc_linker::link_npm_modules(&mut modules, &config_dir, &registry)?;
     if linker_stats.files_linked > 0 {
         tracing::info!(
             "linked {} Angular package file(s)",
             linker_stats.files_linked
         );
     }
+
+    // Build the public-exports index over every linked npm file. Mirrors
+    // what `link_modules` does internally; needed for both pre-scan and the
+    // final flatten pass to know which specifier exports each identifier.
+    modules
+        .par_iter()
+        .filter(|(path, _)| ngc_linker::is_npm_path(path))
+        .for_each(|(path, source)| {
+            public_exports.scan_file(source, path);
+        });
+
+    // Pass A: register any `ɵɵdefineNgModule` calls (project AOT output and
+    // pre-compiled npm bundles).
+    linker_stats.modules_registered =
+        ngc_linker::module_registry::scan_define_ng_modules(&modules, &registry)?;
+
+    // Pre-scan: dry-run the flatten walk to discover specifiers it would
+    // inject as brand-new project imports, then resolve them in a delta
+    // npm-resolve before the actual flatten pass runs.
+    //
+    // Short-circuit: if every public-export specifier is already in
+    // `bare_specifiers`, flatten cannot emit a brand-new `import { … }
+    // from '<spec>'` — every name it adds would extend an existing import.
+    // Skipping the dry-run AST walk saves ~3 ms on small projects with a
+    // populated registry but no cross-subpath flattens (test-ng-project).
+    let bare_set: std::collections::HashSet<String> = bare_specifiers.iter().cloned().collect();
+    let prescan_new: Vec<String> = if public_exports.has_specifier_outside(&bare_set) {
+        ngc_linker::flatten::scan_introduced_specifiers(&modules, &registry, &public_exports)
+            .into_iter()
+            .filter(|s| !bare_set.contains(s))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if !prescan_new.is_empty() {
+        tracing::info!(
+            "pre-scan: resolving {} predicted specifier(s) before flatten: {:?}",
+            prescan_new.len(),
+            prescan_new
+        );
+        bare_specifiers.extend(prescan_new.iter().cloned());
+        let extra = ngc_npm_resolver::resolve_npm_dependencies(
+            &prescan_new,
+            &config_dir,
+            export_conditions,
+        )?;
+        tracing::info!(
+            "pre-scan: pulled in {} additional file(s) before flatten",
+            extra.modules.len()
+        );
+        for (path, source) in &extra.modules {
+            modules
+                .entry(path.clone())
+                .or_insert_with(|| source.clone());
+            npm_resolution
+                .modules
+                .entry(path.clone())
+                .or_insert_with(|| source.clone());
+        }
+        for spec in &prescan_new {
+            npm_resolution.resolved_specifiers.insert(spec.clone());
+        }
+        for edge in extra.edges {
+            npm_resolution.edges.push(edge);
+        }
+        // Link the newly-resolved npm files. `link_npm_modules` skips files
+        // already rewritten in the first pass via a substring check, so this
+        // only does work for genuinely new files.
+        let extra_stats = ngc_linker::link_npm_modules(&mut modules, &config_dir, &registry)?;
+        linker_stats.files_linked += extra_stats.files_linked;
+        // Extend public-exports + register-NgModule indices over the *new*
+        // npm files only — re-scanning the full set is correct but burns ~2ms
+        // re-parsing files already indexed in the first pass.
+        let new_paths: Vec<&PathBuf> = extra.modules.keys().collect();
+        new_paths.par_iter().for_each(|path| {
+            if let Some(source) = modules.get(*path) {
+                public_exports.scan_file(source, path);
+            }
+        });
+        let new_modules: HashMap<PathBuf, String> = new_paths
+            .iter()
+            .filter_map(|p| modules.get(*p).map(|s| ((*p).clone(), s.clone())))
+            .collect();
+        linker_stats.modules_registered +=
+            ngc_linker::module_registry::scan_define_ng_modules(&new_modules, &registry)?;
+    }
+
+    // Pass B: flatten standalone-component `dependencies` arrays. With the
+    // pre-scan in place this runs once over a complete registry / public-
+    // exports view, so its injected imports never reference unresolved
+    // specifiers on the happy path.
+    linker_stats.components_flattened = ngc_linker::flatten::flatten_component_dependencies(
+        &mut modules,
+        &registry,
+        &public_exports,
+    )?;
     if linker_stats.components_flattened > 0 {
         tracing::info!(
             "flattened NgModule imports in {} component file(s) across {} registered module(s)",
@@ -448,12 +556,12 @@ pub(crate) fn run_build_with_cache(
         );
     }
 
-    // Step 6.7: Resolve any bare specifiers the flatten pass introduced. When
-    // it injects an `import { CdkPortal } from '@angular/cdk/portal'` into a
-    // project file, that specifier wasn't known to the initial npm resolution
-    // — so we re-scan and resolve the delta, folding the new modules +
-    // internal edges into `npm_resolution` so the graph-construction below
-    // picks them up.
+    // Step 6.7: Correctness fallback. The pre-scan covers the well-known
+    // partial-compilation marker shape, but if any project source still
+    // ends up referencing a bare specifier the resolver hasn't seen (rare
+    // edge case — e.g. flatten injecting a name whose public-export was
+    // unknown until after the delta resolve registered new NgModules), we
+    // still want to resolve it rather than fail in the bundler.
     //
     // Scope the scan to PROJECT files only. Scanning npm files pulls in
     // spurious specifiers from packages' embedded test/dev code (e.g.
@@ -503,8 +611,8 @@ pub(crate) fn run_build_with_cache(
         for edge in extra.edges {
             npm_resolution.edges.push(edge);
         }
-        // Re-run the linker on any newly-pulled-in npm files so their
-        // ɵɵngDeclare calls are transformed too.
+        // Re-run the linker on any newly-pulled-in npm files and re-flatten
+        // so the now-registered NgModules expand correctly.
         let _ = ngc_linker::link_modules(&mut modules, &config_dir)?;
     }
     drop(link_span);
