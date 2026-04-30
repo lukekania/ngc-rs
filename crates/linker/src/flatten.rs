@@ -161,6 +161,16 @@ fn collect_introduced_in_file(
     registry: &ModuleRegistry,
     public_exports: &PublicExports,
 ) -> Vec<String> {
+    // `ast-reuse` fast-path: if no registered NgModule name is even *mentioned*
+    // in this source, flatten cannot rewrite anything in it — skip the parse
+    // and return an empty introduced-specifiers list. Substring scan is a
+    // superset of "could flatten modify the dependencies array?", so any
+    // false-positive falls through to the normal parse + walk.
+    #[cfg(feature = "ast-reuse")]
+    if !registry.any_name_in(source) {
+        return Vec::new();
+    }
+
     let alloc = Allocator::default();
     let parsed = Parser::new(&alloc, source, SourceType::mjs()).parse();
     if parsed.panicked || !parsed.errors.is_empty() {
@@ -187,6 +197,17 @@ fn flatten_one(
     registry: &ModuleRegistry,
     public_exports: &PublicExports,
 ) -> NgcResult<Option<String>> {
+    // `ast-reuse` fast-path: skip the parse when no registered NgModule name
+    // appears in the file. The downstream `visit_program_deps` walk only
+    // emits replacements for identifiers that match `registry.is_module(...)`,
+    // so a substring miss is a guaranteed no-op. This is the dominant cost
+    // saver when most components import directives directly (standalone) and
+    // never name a module in their `dependencies: [...]` array.
+    #[cfg(feature = "ast-reuse")]
+    if !registry.any_name_in(source) {
+        return Ok(None);
+    }
+
     let alloc = Allocator::default();
     let parsed = Parser::new(&alloc, source, SourceType::mjs()).parse();
     if parsed.panicked || !parsed.errors.is_empty() {
