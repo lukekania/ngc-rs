@@ -1048,9 +1048,8 @@ export class HostDirective {
 
     #[test]
     fn test_component_with_host_listener_roundtrip() {
-        // Issue #58 mentions treasr-frontend's portfolio.component.ts uses
-        // @HostListener for window resize. AOT output for a component must
-        // emit the listener inside hostBindings just like directives do.
+        // A @Component using @HostListener for window:resize must emit
+        // the listener inside hostBindings just like a @Directive does.
         let source = r#"import { Component, HostListener } from '@angular/core';
 
 @Component({ selector: 'app-portfolio', standalone: true, template: '' })

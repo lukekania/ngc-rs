@@ -476,7 +476,7 @@ pub(crate) fn run_build_with_cache(
     // `bare_specifiers`, flatten cannot emit a brand-new `import { … }
     // from '<spec>'` — every name it adds would extend an existing import.
     // Skipping the dry-run AST walk saves ~3 ms on small projects with a
-    // populated registry but no cross-subpath flattens (test-ng-project).
+    // populated registry but no cross-subpath flattens.
     let bare_set: std::collections::HashSet<String> = bare_specifiers.iter().cloned().collect();
     let prescan_new: Vec<String> = if public_exports.has_specifier_outside(&bare_set) {
         ngc_linker::flatten::scan_introduced_specifiers(&modules, &registry, &public_exports)
