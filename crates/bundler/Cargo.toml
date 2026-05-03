@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+publish = false
 
 [dependencies]
 ngc-diagnostics = { path = "../diagnostics" }
@@ -16,6 +17,8 @@ oxc_parser = "0.122"
 oxc_span = "0.122"
 oxc_ast = "0.122"
 oxc_codegen = "0.122"
+oxc_mangler = "0.122"
+oxc_minifier = "0.122"
 oxc_semantic = "0.122"
 oxc_sourcemap = "6.1"
 dashmap = "6"

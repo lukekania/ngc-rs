@@ -1,0 +1,24 @@
+{
+  "name": "@ngc-rs/cli-win32-x64",
+  "version": "1.0.0",
+  "description": "Windows x86_64 (MSVC) binary for @ngc-rs/cli. Installed automatically via optionalDependencies — do not depend on this package directly.",
+  "license": "(MIT OR Apache-2.0)",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lukekania/ngc-rs",
+    "directory": "packages/cli-win32-x64"
+  },
+  "homepage": "https://github.com/lukekania/ngc-rs#readme",
+  "files": [
+    "bin/ngc-rs.exe"
+  ],
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "engines": {
+    "node": ">=20.11.0"
+  }
+}

@@ -6,6 +6,17 @@ on:
   pull_request:
     branches: [main]
 
+# Minimal token scope. CI never needs to write anything back to the repo;
+# this caps the blast radius if a step is compromised.
+permissions:
+  contents: read
+
+# Cancel in-flight CI runs for the same ref when a new push lands. Tag
+# pushes (release.yml) intentionally do not share this group.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
@@ -15,15 +26,20 @@ jobs:
     name: Check, Test, Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # Third-party actions are pinned to commit SHAs (not version tags) so a
+      # malicious force-push to a tag cannot inject code into our CI. Comments
+      # record the human-readable version that each SHA corresponds to.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy, rustfmt
 
       - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
       - name: Check formatting
         run: cargo fmt --all -- --check

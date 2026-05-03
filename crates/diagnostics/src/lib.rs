@@ -265,6 +265,71 @@ pub enum NgcError {
 /// A type alias for Results using NgcError.
 pub type NgcResult<T> = Result<T, NgcError>;
 
+impl NgcError {
+    /// Returns the source file associated with this error, when one exists.
+    /// Variants that describe a file or location problem expose their `path`
+    /// field; variants that describe a stage-level failure (e.g.
+    /// [`NgcError::BundleError`], [`NgcError::ConfigError`]) return `None`.
+    /// The architect builder shim consumes this to populate `Diagnostic.file`.
+    pub fn file(&self) -> Option<&std::path::Path> {
+        match self {
+            NgcError::Io { path, .. }
+            | NgcError::TsConfigParse { path, .. }
+            | NgcError::TsConfigExtendsNotFound { path }
+            | NgcError::ParseError { path, .. }
+            | NgcError::TransformError { path, .. }
+            | NgcError::TemplateParseError { path, .. }
+            | NgcError::TemplateCompileError { path, .. }
+            | NgcError::AngularJsonParse { path, .. }
+            | NgcError::ProjectNotFound { path, .. }
+            | NgcError::AssetError { path, .. }
+            | NgcError::StyleError { path, .. }
+            | NgcError::SourceMapError { path, .. }
+            | NgcError::MinifyError { path, .. }
+            | NgcError::LinkerError { path, .. } => Some(path),
+            NgcError::UnresolvedImport { from_file, .. } => Some(from_file),
+            NgcError::TsConfigCircularExtends { chain } => chain.first().map(PathBuf::as_path),
+            NgcError::CircularDependency { cycle } => cycle.first().map(PathBuf::as_path),
+            NgcError::InvalidPathAlias { .. }
+            | NgcError::BundleError { .. }
+            | NgcError::JsonOutputError { .. }
+            | NgcError::ChunkError { .. }
+            | NgcError::NpmResolutionError { .. }
+            | NgcError::ConfigError { .. }
+            | NgcError::WatchError { .. }
+            | NgcError::ServeError { .. } => None,
+        }
+    }
+
+    /// Returns the 1-based source line number associated with this error,
+    /// when one is available. Only variants that carry parser/compiler
+    /// location data populate this.
+    pub fn line(&self) -> Option<u32> {
+        match self {
+            NgcError::ParseError { line, .. }
+            | NgcError::TransformError { line, .. }
+            | NgcError::TemplateParseError { line, .. }
+            | NgcError::TemplateCompileError { line, .. }
+            | NgcError::LinkerError { line, .. } => *line,
+            _ => None,
+        }
+    }
+
+    /// Returns the 1-based source column number associated with this error,
+    /// when one is available. Only variants that carry parser/compiler
+    /// location data populate this.
+    pub fn column(&self) -> Option<u32> {
+        match self {
+            NgcError::ParseError { column, .. }
+            | NgcError::TransformError { column, .. }
+            | NgcError::TemplateParseError { column, .. }
+            | NgcError::TemplateCompileError { column, .. }
+            | NgcError::LinkerError { column, .. } => *column,
+            _ => None,
+        }
+    }
+}
+
 /// Format an optional `(line, column)` pair as `:line:col` (or `:line` when
 /// only the line is known) for embedding in `Display` output. Returns an
 /// empty string when neither is known.
@@ -326,5 +391,48 @@ mod tests {
     fn fmt_loc_renders_empty_when_missing() {
         assert_eq!(fmt_loc(None, None), "");
         assert_eq!(fmt_loc(None, Some(5)), "");
+    }
+
+    #[test]
+    fn file_accessor_returns_path_for_file_variants() {
+        let e = NgcError::ParseError {
+            path: PathBuf::from("/x/y.ts"),
+            message: "boom".into(),
+            line: Some(3),
+            column: Some(7),
+        };
+        assert_eq!(e.file(), Some(std::path::Path::new("/x/y.ts")));
+        assert_eq!(e.line(), Some(3));
+        assert_eq!(e.column(), Some(7));
+    }
+
+    #[test]
+    fn file_accessor_returns_from_file_for_unresolved_import() {
+        let e = NgcError::UnresolvedImport {
+            specifier: "./missing".into(),
+            from_file: PathBuf::from("/x/main.ts"),
+        };
+        assert_eq!(e.file(), Some(std::path::Path::new("/x/main.ts")));
+        assert_eq!(e.line(), None);
+        assert_eq!(e.column(), None);
+    }
+
+    #[test]
+    fn file_accessor_returns_none_for_stage_level_variants() {
+        let e = NgcError::BundleError {
+            message: "boom".into(),
+        };
+        assert_eq!(e.file(), None);
+        assert_eq!(e.line(), None);
+        assert_eq!(e.column(), None);
+    }
+
+    #[test]
+    fn file_accessor_returns_first_path_in_chain() {
+        let chain = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+        let e = NgcError::TsConfigCircularExtends {
+            chain: chain.clone(),
+        };
+        assert_eq!(e.file(), Some(chain[0].as_path()));
     }
 }
