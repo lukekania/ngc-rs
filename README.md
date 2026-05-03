@@ -42,7 +42,7 @@ Then run `ng build` (or `ng serve`) as normal. The builder shells out to the `ng
 ## Install (Rust users)
 
 ```sh
-cargo install ngc-rs
+cargo install --git https://github.com/lukekania/ngc-rs --tag v1.0.0
 ```
 
 Or build from source:
@@ -54,6 +54,10 @@ cargo build --release
 ```
 
 The binary will be at `target/release/ngc-rs`.
+
+ngc-rs is currently not published to crates.io — its workspace crates form
+a single tightly-coupled toolchain rather than reusable libraries, so the
+git-tag install above is the supported Rust path.
 
 ## Why is it faster?
 
