@@ -1,0 +1,46 @@
+name: Feature request
+description: Suggest an option, builder behavior, or workflow improvement.
+title: "[feat]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion. Please open this only after checking the
+        roadmap (see CLAUDE.md / milestones) — many improvements are already
+        scheduled.
+
+        For non-trivial features we will discuss the approach in this issue
+        before any PR is opened.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the user-facing problem, not the proposed implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should ngc-rs do? If this is an `angular.json` option ngc-rs doesn't yet honor, link to the upstream `@angular/build` docs.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you've tried, or other approaches you ruled out.
+  - type: dropdown
+    id: scope-check
+    attributes:
+      label: Scope check
+      description: |
+        ngc-rs is intentionally scoped — see CLAUDE.md "Out of scope". SSR,
+        ng-packagr, Angular < 17, and webpack-compatibility shims will not
+        be implemented. Confirm this request fits the project's scope.
+      options:
+        - "Yes, this fits the project scope"
+        - "Not sure"
+    validations:
+      required: true

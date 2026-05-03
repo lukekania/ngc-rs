@@ -1,8 +1,8 @@
 {
   "name": "@ngc-rs/cli",
-  "version": "0.8.3",
+  "version": "1.0.0",
   "description": "Native Rust replacement for `ng build`. Drop-in Angular CLI builder, ~10x faster.",
-  "license": "MIT",
+  "license": "(MIT OR Apache-2.0)",
   "repository": {
     "type": "git",
     "url": "https://github.com/lukekania/ngc-rs",
@@ -24,10 +24,10 @@
     "node": ">=20.11.0"
   },
   "optionalDependencies": {
-    "@ngc-rs/cli-darwin-arm64": "0.8.3",
-    "@ngc-rs/cli-darwin-x64": "0.8.3",
-    "@ngc-rs/cli-linux-arm64": "0.8.3",
-    "@ngc-rs/cli-linux-x64": "0.8.3",
-    "@ngc-rs/cli-win32-x64": "0.8.3"
+    "@ngc-rs/cli-darwin-arm64": "1.0.0",
+    "@ngc-rs/cli-darwin-x64": "1.0.0",
+    "@ngc-rs/cli-linux-arm64": "1.0.0",
+    "@ngc-rs/cli-linux-x64": "1.0.0",
+    "@ngc-rs/cli-win32-x64": "1.0.0"
   }
 }
