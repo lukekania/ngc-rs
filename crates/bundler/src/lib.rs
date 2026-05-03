@@ -4,6 +4,7 @@
 //! bundled ESM files with external imports hoisted and project-local imports
 //! inlined. Supports code splitting via dynamic `import()` detection.
 
+pub mod budgets;
 mod chunk;
 mod concat;
 mod minify;
