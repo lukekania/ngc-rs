@@ -148,6 +148,89 @@ pub struct RawBuildOptions {
     /// Path to the service-worker configuration file. Defaults to
     /// `ngsw-config.json` at the workspace root when omitted.
     pub ngsw_config_path: Option<String>,
+    /// Per-bundle and per-initial size budgets.
+    pub budgets: Option<Vec<RawBudget>>,
+}
+
+/// One entry in `architect.build.options.budgets` (or in a per-configuration
+/// override). Mirrors the schema accepted by `@angular/build:application`.
+/// Sizes accept either a raw byte count (number) or a string with a unit
+/// suffix (`"500kb"`, `"1.2mb"`, `"800b"`); the parser follows ng build's
+/// convention where `kb` means `kibibyte` (×1024) — confusing but compatible.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RawBudget {
+    /// Budget type. One of: `initial`, `anyComponentStyle`, `anyScript`,
+    /// `bundle`, `all`, `allScript`. Unknown types are ignored at resolve
+    /// time with a warning rather than failing the parse.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Required when `kind = "bundle"` — the bundle name to apply to.
+    pub name: Option<String>,
+    /// Baseline used for delta budgets (`"+10%"` etc.). Currently parsed
+    /// but not enforced; we treat absolute sizes only.
+    pub baseline: Option<RawBudgetSize>,
+    /// Threshold above which a warning is emitted.
+    pub maximum_warning: Option<RawBudgetSize>,
+    /// Threshold above which an error is emitted (build fails).
+    pub maximum_error: Option<RawBudgetSize>,
+    /// Shorthand alias for `maximum_warning` when no separate min/max
+    /// distinction is needed.
+    pub warning: Option<RawBudgetSize>,
+    /// Shorthand alias for `maximum_error`.
+    pub error: Option<RawBudgetSize>,
+}
+
+/// A budget threshold value: either a raw byte count or a size string with
+/// a unit suffix.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum RawBudgetSize {
+    /// Raw byte count (`"maximumError": 1048576`).
+    Number(u64),
+    /// Size string with optional unit suffix (`"1mb"`, `"500kb"`, `"800b"`).
+    /// Percentage strings (`"5%"`) are accepted by the parser but are not
+    /// honoured by the enforcer in v1.0 (treated as 0 → never trips).
+    String(String),
+}
+
+impl RawBudgetSize {
+    /// Parse the value into an absolute byte count. Returns `None` for
+    /// unparseable strings or percentage values (which would require a
+    /// baseline to resolve).
+    pub fn to_bytes(&self) -> Option<u64> {
+        match self {
+            RawBudgetSize::Number(n) => Some(*n),
+            RawBudgetSize::String(s) => parse_size_string(s),
+        }
+    }
+}
+
+/// Parse an Angular size string like `"500kb"`, `"1.2mb"`, `"800b"` into a
+/// byte count. Matches ng build's behaviour: `kb` and `mb` use multiples of
+/// 1024 (kibibyte/mebibyte) despite the misleading name. Percentage
+/// strings (`"10%"`) return `None` — delta budgets aren't supported in v1.0.
+fn parse_size_string(raw: &str) -> Option<u64> {
+    let s = raw.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+    if s.ends_with('%') {
+        return None;
+    }
+    let (num_part, multiplier) = if let Some(num) = s.strip_suffix("gb") {
+        (num.trim(), 1024u64 * 1024 * 1024)
+    } else if let Some(num) = s.strip_suffix("mb") {
+        (num.trim(), 1024u64 * 1024)
+    } else if let Some(num) = s.strip_suffix("kb") {
+        (num.trim(), 1024u64)
+    } else if let Some(num) = s.strip_suffix('b') {
+        (num.trim(), 1u64)
+    } else {
+        (s.as_str(), 1u64)
+    };
+    let value: f64 = num_part.parse().ok()?;
+    Some((value * multiplier as f64) as u64)
 }
 
 /// `serviceWorker` accepts either a bool (Angular 15+) or a string path
@@ -253,6 +336,9 @@ pub struct RawBuildConfiguration {
     pub cross_origin: Option<String>,
     /// Override for `subresourceIntegrity`.
     pub subresource_integrity: Option<bool>,
+    /// Override for `budgets` — typically only set in the `production`
+    /// configuration (development builds usually have no size limits).
+    pub budgets: Option<Vec<RawBudget>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -359,6 +445,64 @@ pub struct ResolvedAngularProject {
     /// Absolute path to the service-worker config file
     /// (defaults to `<base_dir>/ngsw-config.json`).
     pub ngsw_config_path: PathBuf,
+    /// Resolved size budgets — empty when angular.json declares none for
+    /// the active configuration. Honoured by the bundler in production
+    /// builds; ignored otherwise.
+    pub budgets: Vec<ResolvedBudget>,
+}
+
+/// Type of a resolved size budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetKind {
+    /// Combined size of the initial JS + CSS payload (`main`, `polyfills`,
+    /// global stylesheets — everything that loads before any lazy chunk).
+    Initial,
+    /// Per-component inline-style budget. We approximate this by checking
+    /// the global `styles.css` bundle since ngc-rs does not yet emit
+    /// per-component style bundles separately.
+    AnyComponentStyle,
+    /// Per-script-bundle budget. Each emitted JS chunk is checked
+    /// independently against this threshold.
+    AnyScript,
+    /// Budget for a specific named bundle. The `name` field selects the
+    /// target file (matched by basename without extension or content hash).
+    Bundle,
+    /// Combined size of every emitted script + stylesheet.
+    All,
+    /// Combined size of every emitted script.
+    AllScript,
+}
+
+impl BudgetKind {
+    /// Parse the angular.json `type` string. Returns `None` for unknown
+    /// values; the caller logs a tracing warning and drops the entry.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "initial" => Some(BudgetKind::Initial),
+            "anyComponentStyle" => Some(BudgetKind::AnyComponentStyle),
+            "anyScript" => Some(BudgetKind::AnyScript),
+            "bundle" => Some(BudgetKind::Bundle),
+            "all" => Some(BudgetKind::All),
+            "allScript" => Some(BudgetKind::AllScript),
+            _ => None,
+        }
+    }
+}
+
+/// A budget entry resolved into absolute byte counts. Sizes that could not
+/// be parsed (e.g. percentage strings for delta budgets, which require a
+/// baseline) are dropped at resolve time so the enforcer doesn't have to
+/// re-validate.
+#[derive(Debug, Clone)]
+pub struct ResolvedBudget {
+    /// What the budget applies to.
+    pub kind: BudgetKind,
+    /// Bundle name selector — required for `Bundle`, ignored otherwise.
+    pub name: Option<String>,
+    /// Threshold above which a warning is emitted.
+    pub maximum_warning: Option<u64>,
+    /// Threshold above which a build error is emitted.
+    pub maximum_error: Option<u64>,
 }
 
 /// Resolved i18n configuration with absolute paths.
@@ -581,6 +725,16 @@ pub fn resolve_angular_project(
         .as_ref()
         .map(|raw| resolve_i18n(raw, &base_dir));
 
+    // Resolve budgets — per-configuration overrides take precedence over
+    // base options (matches Angular CLI's merge order). When neither
+    // declares budgets the resolved list is empty.
+    let raw_budgets = build_config
+        .and_then(|bc| bc.budgets.as_ref())
+        .or_else(|| options.and_then(|o| o.budgets.as_ref()));
+    let budgets = raw_budgets
+        .map(|list| resolve_budgets(list))
+        .unwrap_or_default();
+
     debug!(
         project = %name,
         output_path = %output_path.display(),
@@ -609,7 +763,48 @@ pub fn resolve_angular_project(
         i18n,
         service_worker,
         ngsw_config_path,
+        budgets,
     })
+}
+
+/// Convert a slice of `RawBudget` entries into `ResolvedBudget`s, dropping
+/// (with a tracing warning) any entries with an unknown `type` or with no
+/// parseable threshold.
+fn resolve_budgets(raw: &[RawBudget]) -> Vec<ResolvedBudget> {
+    raw.iter()
+        .filter_map(|b| {
+            let kind = match BudgetKind::parse(&b.kind) {
+                Some(k) => k,
+                None => {
+                    tracing::warn!("ignoring unknown budget type {:?} in angular.json", b.kind);
+                    return None;
+                }
+            };
+            let maximum_warning = b
+                .maximum_warning
+                .as_ref()
+                .or(b.warning.as_ref())
+                .and_then(|s| s.to_bytes());
+            let maximum_error = b
+                .maximum_error
+                .as_ref()
+                .or(b.error.as_ref())
+                .and_then(|s| s.to_bytes());
+            if maximum_warning.is_none() && maximum_error.is_none() {
+                tracing::warn!(
+                    "ignoring budget for {:?} — no maximumWarning or maximumError",
+                    b.kind
+                );
+                return None;
+            }
+            Some(ResolvedBudget {
+                kind,
+                name: b.name.clone(),
+                maximum_warning,
+                maximum_error,
+            })
+        })
+        .collect()
 }
 
 /// Resolve a `RawI18nConfig` from `angular.json` into absolute paths.

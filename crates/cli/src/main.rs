@@ -330,7 +330,20 @@ fn main() {
                             .expect("BuildResult serialization should not fail");
                         println!("{json}");
                     } else {
-                        println!("{}", "ngc-rs build complete".bold().green());
+                        // Print budget warnings/errors before the
+                        // success/failure summary so they're easy to find
+                        // even when the bundle list scrolls off-screen.
+                        for w in &result.warnings {
+                            eprintln!("{} {}", "Warning:".yellow().bold(), w.message);
+                        }
+                        for e in &result.errors {
+                            eprintln!("{} {}", "Error:".red().bold(), e.message);
+                        }
+                        if result.success {
+                            println!("{}", "ngc-rs build complete".bold().green());
+                        } else {
+                            println!("{}", "ngc-rs build failed".bold().red());
+                        }
                         println!("  {:<16}{}", "Bundled:".dimmed(), result.modules_bundled);
                         println!(
                             "  {:<16}{}",
@@ -345,6 +358,12 @@ fn main() {
                         for f in &result.output_files {
                             println!("  {:<16}{}", "".dimmed(), f.path.display());
                         }
+                    }
+                    // Budget errors (and any other non-fatal-pipeline-but-
+                    // fatal-build conditions) populate `errors` while still
+                    // returning Ok from the pipeline. Honour them here.
+                    if !result.success {
+                        process::exit(1);
                     }
                 }
                 Err(e) => {
@@ -1063,10 +1082,75 @@ pub(crate) fn run_build_with_cache(
     let total_size_bytes = output_files.iter().map(|f| f.size).sum();
     drop(io_span);
 
+    // Step 14: budget enforcement. Compute size violations against
+    // angular.json's `budgets` array and append them to errors/warnings.
+    // Empty when the project declares no budgets for the active
+    // configuration; quick rejection avoids the per-file work.
+    let mut errors: Vec<Diagnostic> = Vec::new();
+    if let Some(ap) = angular_project.as_ref() {
+        if !ap.budgets.is_empty() {
+            let main_filename = bundle_output.main_filename.as_str();
+            let artifacts: Vec<ngc_bundler::budgets::OutputArtifact<'_>> = output_files
+                .iter()
+                .map(|f| {
+                    let kind = match f.kind {
+                        OutputKind::Script => ngc_bundler::budgets::FileKind::Script,
+                        OutputKind::Style => ngc_bundler::budgets::FileKind::Style,
+                        _ => ngc_bundler::budgets::FileKind::Other,
+                    };
+                    let filename = f.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    let bundle_name = ngc_bundler::budgets::bundle_name_from_filename(filename);
+                    // An output is "initial" if its bundle name is `main`,
+                    // `polyfills`, or `styles`, OR it's the precise file
+                    // the bundler reported as the main entry chunk.
+                    let is_initial = filename == main_filename
+                        || matches!(bundle_name.as_str(), "main" | "polyfills" | "styles");
+                    ngc_bundler::budgets::OutputArtifact {
+                        path: &f.path,
+                        bundle_name,
+                        size: f.size,
+                        kind,
+                        is_initial,
+                    }
+                })
+                .collect();
+            for v in ngc_bundler::budgets::evaluate(&ap.budgets, &artifacts) {
+                let message = ngc_bundler::budgets::format_violation(&v);
+                let diag = Diagnostic {
+                    file: v.bundle_name.as_ref().and_then(|name| {
+                        artifacts
+                            .iter()
+                            .find(|a| &a.bundle_name == name)
+                            .map(|a| a.path.to_path_buf())
+                    }),
+                    line: None,
+                    column: None,
+                    message,
+                    severity: match v.severity {
+                        ngc_bundler::budgets::ViolationSeverity::Error => Severity::Error,
+                        ngc_bundler::budgets::ViolationSeverity::Warning => Severity::Warning,
+                    },
+                };
+                match v.severity {
+                    ngc_bundler::budgets::ViolationSeverity::Error => errors.push(diag),
+                    ngc_bundler::budgets::ViolationSeverity::Warning => warnings.push(diag),
+                }
+            }
+        }
+    }
+
+    let success = errors.is_empty();
     Ok(BuildResult {
-        success: true,
-        error: None,
-        errors: Vec::new(),
+        success,
+        error: if success {
+            None
+        } else {
+            Some(format!(
+                "{} budget violation(s) exceeded the maximumError threshold",
+                errors.len()
+            ))
+        },
+        errors,
         warnings,
         output_path: out_dir,
         output_files,
