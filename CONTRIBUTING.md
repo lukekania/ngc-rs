@@ -76,12 +76,14 @@ The required repository secrets are:
 
 - `NPM_TOKEN` — granular access token scoped to the `@ngc-rs/*` org with
   publish + write permissions. Used by the `publish-npm` job in
-  `.github/workflows/release.yml`.
+  `.github/workflows/release.yml`. **npm caps granular access tokens at
+  90 days**, so rotate quarterly.
 - `CARGO_REGISTRY_TOKEN` — scoped to the `ngc-rs` crate. Used by the
-  crates.io publish step.
+  crates.io publish step. crates.io tokens have no forced expiry; rotate
+  annually.
 
-Rotate both at least annually, immediately on any suspected exposure,
-and document the rotation in the release notes.
+Rotate both immediately on any suspected exposure and document the
+rotation in the release notes.
 
 ## License
 

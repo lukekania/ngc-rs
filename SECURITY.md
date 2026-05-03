@@ -58,8 +58,12 @@ supply-chain security seriously. The mitigations currently in place:
   which links each release back to the workflow run that built it.
 - **Token scoping & rotation** — `NPM_TOKEN` is a granular access token
   scoped to the `@ngc-rs/*` org with publish + write permissions only;
-  `CARGO_REGISTRY_TOKEN` is scoped to the `ngc-rs` crate. Both are
-  rotated at least annually and immediately on any suspected exposure.
+  npm caps granular access tokens at **90 days**, so this token is
+  rotated quarterly (set a calendar reminder; the workflow fails
+  cleanly with a 401 once the token expires). `CARGO_REGISTRY_TOKEN`
+  is scoped to the `ngc-rs` crate; crates.io tokens have no forced
+  expiry but are rotated annually. Both are rotated immediately on
+  any suspected exposure.
 
 ## Contribution Policy
 
