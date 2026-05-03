@@ -5,15 +5,24 @@ on:
     tags:
       - "v*"
 
+# `contents: write` to push the release notes onto the GitHub Release.
+# `pull-requests: read` so the action can include merged-PR titles.
 permissions:
   contents: write
   pull-requests: read
+
+# Don't let two release-notes runs on the same tag race each other.
+concurrency:
+  group: release-notes-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   notes:
     runs-on: ubuntu-latest
     steps:
-      - uses: lukekania/generate-release-notes@v0.3.1
+      # Third-party action pinned to a commit SHA so a force-push to the
+      # `v0.3.1` tag cannot inject code. Comment records the version.
+      - uses: lukekania/generate-release-notes@9b0245ffe0ca4506658b3a5276ea7cb221c0f065 # v0.3.1
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           use_conventional_commits: true
