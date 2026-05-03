@@ -1,6 +1,11 @@
 {
   "$schema": "../../node_modules/@angular-devkit/architect/src/builders-schema.json",
   "builders": {
+    "application": {
+      "implementation": "./dist/build/builder",
+      "schema": "./schemas/application.json",
+      "description": "Application builder backed by ngc-rs (drop-in for @angular/build:application)."
+    },
     "dev-server": {
       "implementation": "./dist/serve/builder",
       "schema": "./schemas/dev-server.json",
