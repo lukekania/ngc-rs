@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;
@@ -20,15 +21,125 @@ mod polyfills;
 mod serve_cmd;
 mod watch_cmd;
 
-/// Result of the bundled build pipeline.
-#[derive(serde::Serialize)]
+/// Severity of a build-pipeline diagnostic, surfaced both to stdout JSON
+/// and to the architect builder shim (`@ngc-rs/builder:application`).
+#[derive(Debug, serde::Serialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum Severity {
+    /// Fatal diagnostic — the build did not complete successfully.
+    Error,
+    /// Non-fatal diagnostic — surfaced to the user but the build still
+    /// produced output.
+    Warning,
+}
+
+/// One entry in [`BuildResult::errors`] or [`BuildResult::warnings`]. The
+/// shape mirrors what the `@angular-devkit/architect` protocol expects on
+/// `BuilderOutput`, with optional file/line/column for editor jump-to-source.
+#[derive(Debug, serde::Serialize, Clone)]
+struct Diagnostic {
+    /// File the diagnostic originated from, when one is known.
+    file: Option<PathBuf>,
+    /// 1-based source line, when the underlying error carries location info.
+    line: Option<u32>,
+    /// 1-based source column, when the underlying error carries location info.
+    column: Option<u32>,
+    /// Human-readable description of what went wrong.
+    message: String,
+    /// Severity of the diagnostic.
+    severity: Severity,
+}
+
+impl Diagnostic {
+    /// Build a [`Diagnostic`] from any [`NgcError`], copying its file/line/
+    /// column accessors into the diagnostic and stringifying its
+    /// `Display` form for the message.
+    fn from_ngc_error(err: &NgcError, severity: Severity) -> Self {
+        Self {
+            file: err.file().map(|p| p.to_path_buf()),
+            line: err.line(),
+            column: err.column(),
+            message: err.to_string(),
+            severity,
+        }
+    }
+}
+
+/// Classification of a single output artifact written under `dist/`. The
+/// architect builder consumes this to report JS/CSS/HTML/maps separately
+/// without re-parsing extensions on the consumer side.
+#[derive(Debug, serde::Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum OutputKind {
+    /// JavaScript module (`.js`, `.mjs`, `.cjs`).
+    Script,
+    /// Stylesheet (`.css`).
+    Style,
+    /// Hypertext document (`.html`, `.htm`).
+    Html,
+    /// Source map sidecar (`.map`).
+    SourceMap,
+    /// Anything else copied through to `dist/` (images, fonts, JSON, etc.).
+    Asset,
+}
+
+impl OutputKind {
+    /// Classify a path by file extension. Falls back to [`OutputKind::Asset`]
+    /// for unrecognised extensions and for paths with no extension.
+    fn from_path(p: &Path) -> Self {
+        match p.extension().and_then(|e| e.to_str()) {
+            Some("js" | "mjs" | "cjs") => OutputKind::Script,
+            Some("css") => OutputKind::Style,
+            Some("html" | "htm") => OutputKind::Html,
+            Some("map") => OutputKind::SourceMap,
+            _ => OutputKind::Asset,
+        }
+    }
+}
+
+/// One file written under [`BuildResult::output_path`], with size and kind.
+/// `BuildResult.output_files` is a `Vec<OutputFile>`; internal callers
+/// (watch/serve loops) read only `.len()` and the aggregate
+/// `total_size_bytes` field, so the structural change is local.
+#[derive(Debug, serde::Serialize, Clone)]
+struct OutputFile {
+    /// Absolute path to the written file.
+    path: PathBuf,
+    /// Size of the file in bytes (0 if `stat` failed).
+    size: u64,
+    /// Coarse classification of the file by extension.
+    kind: OutputKind,
+}
+
+/// Result of the bundled build pipeline. Shaped to drop directly into a
+/// `BuilderOutput` for `@angular-devkit/architect` — the builder shim
+/// consumes the JSON form emitted by `--output-json` verbatim. On failure
+/// the binary still emits this shape (with `success: false` and `errors`
+/// populated) before exiting non-zero, so the shim can parse a coherent
+/// result regardless of exit code.
+#[derive(Debug, serde::Serialize)]
 struct BuildResult {
+    /// Whether the pipeline completed without fatal errors. The shim maps
+    /// this to `BuilderOutput.success`.
+    success: bool,
+    /// Top-level error message when `success` is `false`. Mirrors the
+    /// `error` field of `BuilderOutput`.
+    error: Option<String>,
+    /// Per-file diagnostics that prevented a successful build.
+    errors: Vec<Diagnostic>,
+    /// Per-file warnings emitted by the pipeline. Empty today; reserved for
+    /// post-1.0 expansion (e.g. JIT-fallback warnings).
+    warnings: Vec<Diagnostic>,
+    /// Absolute path to the dist directory.
+    output_path: PathBuf,
+    /// Every file written under `output_path`, with size and kind.
+    output_files: Vec<OutputFile>,
     /// Number of modules included in the bundle.
     modules_bundled: usize,
-    /// Paths to all output files produced.
-    output_files: Vec<PathBuf>,
     /// Total size in bytes of all output files.
     total_size_bytes: u64,
+    /// Wall-clock duration of the build pipeline.
+    duration_ms: u64,
 }
 
 #[derive(Parser)]
@@ -205,40 +316,60 @@ fn main() {
             configuration,
             output_json,
             localize,
-        } => match run_build(
-            &project,
-            out_dir.as_deref(),
-            configuration.as_deref(),
-            localize,
-        ) {
-            Ok(result) => {
-                if output_json {
-                    let json = serde_json::to_string_pretty(&result)
-                        .expect("BuildResult serialization should not fail");
-                    println!("{json}");
-                } else {
-                    println!("{}", "ngc-rs build complete".bold().green());
-                    println!("  {:<16}{}", "Bundled:".dimmed(), result.modules_bundled);
-                    println!(
-                        "  {:<16}{}",
-                        "Output files:".dimmed(),
-                        result.output_files.len()
-                    );
-                    println!(
-                        "  {:<16}{}",
-                        "Total size:".dimmed(),
-                        format_bytes(result.total_size_bytes)
-                    );
-                    for path in &result.output_files {
-                        println!("  {:<16}{}", "".dimmed(), path.display());
+        } => {
+            let started = Instant::now();
+            match run_build(
+                &project,
+                out_dir.as_deref(),
+                configuration.as_deref(),
+                localize,
+            ) {
+                Ok(result) => {
+                    if output_json {
+                        let json = serde_json::to_string_pretty(&result)
+                            .expect("BuildResult serialization should not fail");
+                        println!("{json}");
+                    } else {
+                        println!("{}", "ngc-rs build complete".bold().green());
+                        println!("  {:<16}{}", "Bundled:".dimmed(), result.modules_bundled);
+                        println!(
+                            "  {:<16}{}",
+                            "Output files:".dimmed(),
+                            result.output_files.len()
+                        );
+                        println!(
+                            "  {:<16}{}",
+                            "Total size:".dimmed(),
+                            format_bytes(result.total_size_bytes)
+                        );
+                        for f in &result.output_files {
+                            println!("  {:<16}{}", "".dimmed(), f.path.display());
+                        }
                     }
                 }
+                Err(e) => {
+                    if output_json {
+                        let result = BuildResult {
+                            success: false,
+                            error: Some(e.to_string()),
+                            errors: vec![Diagnostic::from_ngc_error(&e, Severity::Error)],
+                            warnings: Vec::new(),
+                            output_path: out_dir.clone().unwrap_or_else(|| PathBuf::from("dist")),
+                            output_files: Vec::new(),
+                            modules_bundled: 0,
+                            total_size_bytes: 0,
+                            duration_ms: started.elapsed().as_millis() as u64,
+                        };
+                        let json = serde_json::to_string_pretty(&result)
+                            .expect("BuildResult serialization should not fail");
+                        println!("{json}");
+                    } else {
+                        eprintln!("{} {e}", "Error:".red().bold());
+                    }
+                    process::exit(1);
+                }
             }
-            Err(e) => {
-                eprintln!("{} {e}", "Error:".red().bold());
-                process::exit(1);
-            }
-        },
+        }
     }
 }
 
@@ -279,6 +410,8 @@ pub(crate) fn run_build_with_cache(
     localize: bool,
     mut cache: Option<&mut incremental::BuildCache>,
 ) -> NgcResult<BuildResult> {
+    let started_at = Instant::now();
+
     // Step 1: Try to find angular.json
     let angular_project = find_and_resolve_angular_json(project, configuration)?;
 
@@ -348,7 +481,11 @@ pub(crate) fn run_build_with_cache(
         compile_decorators_cached(&files, &style_ctx, cache.as_deref_mut(), &file_hashes)?;
     drop(templates_span);
 
-    // Report any JIT fallbacks
+    // Report any JIT fallbacks. Each fallback also goes into
+    // `BuildResult.warnings` so the architect builder shim can surface it
+    // through `BuilderContext.logger.warn` rather than relying on stderr
+    // scraping.
+    let mut warnings: Vec<Diagnostic> = Vec::new();
     for cf in &compiled {
         if cf.jit_fallback {
             eprintln!(
@@ -356,6 +493,13 @@ pub(crate) fn run_build_with_cache(
                 "Warning:".yellow().bold(),
                 cf.source_path.display()
             );
+            warnings.push(Diagnostic {
+                file: Some(cf.source_path.clone()),
+                line: None,
+                column: None,
+                message: format!("JIT fallback for {}", cf.source_path.display()),
+                severity: Severity::Warning,
+            });
         }
     }
 
@@ -900,18 +1044,35 @@ pub(crate) fn run_build_with_cache(
         output_files = localized_files;
     }
 
-    // Compute total size
-    let total_size_bytes = output_files
-        .iter()
-        .filter_map(|p| std::fs::metadata(p).ok())
-        .map(|m| m.len())
-        .sum();
+    // Stat each written path and tag it with its OutputKind. Failed stats
+    // (e.g. file removed mid-build) report size 0 rather than aborting —
+    // matches the prior behaviour of silently dropping such entries from
+    // the size sum.
+    let output_files: Vec<OutputFile> = output_files
+        .into_iter()
+        .map(|p| {
+            let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+            let kind = OutputKind::from_path(&p);
+            OutputFile {
+                path: p,
+                size,
+                kind,
+            }
+        })
+        .collect();
+    let total_size_bytes = output_files.iter().map(|f| f.size).sum();
     drop(io_span);
 
     Ok(BuildResult {
-        modules_bundled,
+        success: true,
+        error: None,
+        errors: Vec::new(),
+        warnings,
+        output_path: out_dir,
         output_files,
+        modules_bundled,
         total_size_bytes,
+        duration_ms: started_at.elapsed().as_millis() as u64,
     })
 }
 

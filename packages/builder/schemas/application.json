@@ -1,0 +1,282 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema",
+  "title": "ngc-rs application target",
+  "description": "Application builder options for @ngc-rs/builder. Mirrors the most-used subset of @angular/build:application so projects can swap one line in angular.json. Fields not yet handled by ngc-rs are accepted for forward compatibility but documented as ignored. SSR/server/prerender fields are rejected with a hard error so users know upfront.",
+  "type": "object",
+  "properties": {
+    "tsConfig": {
+      "type": "string",
+      "description": "Path to the project's tsconfig.json. Forwarded as `--project` to ngc-rs build."
+    },
+    "outputPath": {
+      "oneOf": [
+        { "type": "string" },
+        {
+          "type": "object",
+          "properties": {
+            "base": { "type": "string" },
+            "browser": { "type": "string" }
+          },
+          "required": ["base"],
+          "additionalProperties": false
+        }
+      ],
+      "description": "Output directory for build artifacts. May be a string or `{ base, browser }`. Forwarded as `--out-dir` to ngc-rs build."
+    },
+    "browser": {
+      "type": "string",
+      "description": "Entry point file (Angular 17+ `browser` field). Read from angular.json by ngc-rs's project resolver; not used directly by the builder shim."
+    },
+    "main": {
+      "type": "string",
+      "description": "Legacy entry point alias. Read from angular.json by ngc-rs's project resolver; not used directly by the builder shim."
+    },
+    "polyfills": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "array", "items": { "type": "string" } }
+      ],
+      "description": "Polyfill entry points. Read from angular.json by ngc-rs."
+    },
+    "index": {
+      "oneOf": [
+        { "type": "string" },
+        {
+          "type": "object",
+          "properties": {
+            "input": { "type": "string" },
+            "output": { "type": "string" }
+          },
+          "required": ["input"],
+          "additionalProperties": false
+        },
+        { "type": "boolean" }
+      ],
+      "description": "Index HTML template. Read from angular.json by ngc-rs."
+    },
+    "assets": {
+      "type": "array",
+      "description": "Static asset entries. Read from angular.json by ngc-rs.",
+      "items": {
+        "oneOf": [
+          { "type": "string" },
+          {
+            "type": "object",
+            "properties": {
+              "glob": { "type": "string" },
+              "input": { "type": "string" },
+              "output": { "type": "string" },
+              "ignore": { "type": "array", "items": { "type": "string" } }
+            },
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    "styles": {
+      "type": "array",
+      "description": "Global stylesheets. Read from angular.json by ngc-rs.",
+      "items": {
+        "oneOf": [
+          { "type": "string" },
+          {
+            "type": "object",
+            "properties": {
+              "input": { "type": "string" },
+              "inject": { "type": "boolean" },
+              "bundleName": { "type": "string" }
+            },
+            "required": ["input"],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    "scripts": {
+      "type": "array",
+      "description": "Global script entries. NOT YET supported by ngc-rs build. Setting this to a non-empty array fails the build with an explanatory error.",
+      "items": {
+        "oneOf": [
+          { "type": "string" },
+          { "type": "object" }
+        ]
+      },
+      "default": []
+    },
+    "fileReplacements": {
+      "type": "array",
+      "description": "Per-configuration file replacements. Read from angular.json by ngc-rs.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "replace": { "type": "string" },
+          "with": { "type": "string" }
+        },
+        "required": ["replace", "with"],
+        "additionalProperties": false
+      }
+    },
+    "sourceMap": {
+      "oneOf": [
+        { "type": "boolean" },
+        {
+          "type": "object",
+          "properties": {
+            "scripts": { "type": "boolean" },
+            "styles": { "type": "boolean" },
+            "vendor": { "type": "boolean" },
+            "hidden": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        }
+      ],
+      "description": "Source map output. ngc-rs hardcodes source map behaviour per `--configuration` (development = inline, production = external). Setting this option logs a warning if it conflicts with the configuration's default; the configuration default wins."
+    },
+    "optimization": {
+      "oneOf": [
+        { "type": "boolean" },
+        {
+          "type": "object",
+          "properties": {
+            "scripts": { "type": "boolean" },
+            "styles": {
+              "oneOf": [
+                { "type": "boolean" },
+                { "type": "object" }
+              ]
+            },
+            "fonts": {
+              "oneOf": [
+                { "type": "boolean" },
+                { "type": "object" }
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ],
+      "description": "Optimization toggles. ngc-rs hardcodes optimization per `--configuration` (development = off, production = on). Setting this option logs a warning if it conflicts with the configuration's default; the configuration default wins."
+    },
+    "outputHashing": {
+      "type": "string",
+      "enum": ["none", "all", "media", "bundles"],
+      "description": "Filename hashing scheme. ngc-rs uses content hashes in production and stable names in development. Setting this option logs a warning if it conflicts; the configuration default wins."
+    },
+    "namedChunks": {
+      "type": "boolean",
+      "description": "Use named chunks instead of hashes. Accepted for compatibility but ngc-rs always derives chunk names from the lazy-route module path."
+    },
+    "vendorChunk": {
+      "type": "boolean",
+      "description": "Emit a separate vendor bundle. Legacy webpack option. Ignored by ngc-rs (no equivalent in its bundler)."
+    },
+    "aot": {
+      "type": "boolean",
+      "description": "Ahead-of-time compilation. Always on in ngc-rs (no JIT path). Setting this to false logs a warning."
+    },
+    "baseHref": {
+      "type": "string",
+      "description": "URL prefix for the application. Read from angular.json by ngc-rs."
+    },
+    "deployUrl": {
+      "type": "string",
+      "description": "URL prefix for static assets. Read from angular.json by ngc-rs."
+    },
+    "crossOrigin": {
+      "type": "string",
+      "enum": ["none", "anonymous", "use-credentials"],
+      "description": "crossorigin attribute on injected script/link tags. Read from angular.json by ngc-rs."
+    },
+    "subresourceIntegrity": {
+      "type": "boolean",
+      "description": "Emit SRI hashes on injected script/link tags. Read from angular.json by ngc-rs."
+    },
+    "serviceWorker": {
+      "oneOf": [
+        { "type": "boolean" },
+        { "type": "string" }
+      ],
+      "description": "Generate `ngsw.json` service-worker manifest. Read from angular.json by ngc-rs."
+    },
+    "ngswConfigPath": {
+      "type": "string",
+      "description": "Path to a custom ngsw config. Read from angular.json by ngc-rs."
+    },
+    "preserveSymlinks": {
+      "type": "boolean",
+      "description": "Preserve symlinks during module resolution. Accepted for compatibility; ngc-rs always canonicalises paths."
+    },
+    "statsJson": {
+      "type": "boolean",
+      "description": "Emit a webpack-style stats.json. NOT supported by ngc-rs. Setting this to true logs a warning."
+    },
+    "budgets": {
+      "type": "array",
+      "description": "Performance budgets. NOT yet enforced by ngc-rs but accepted for compatibility.",
+      "items": {
+        "type": "object"
+      }
+    },
+    "externalDependencies": {
+      "type": "array",
+      "description": "Modules to keep external (not bundled). Accepted for compatibility but currently ignored by ngc-rs.",
+      "items": { "type": "string" }
+    },
+    "allowedCommonJsDependencies": {
+      "type": "array",
+      "description": "CommonJS dependencies to allow without warning. Accepted for compatibility; ngc-rs has no equivalent restriction.",
+      "items": { "type": "string" }
+    },
+    "extractLicenses": {
+      "type": "boolean",
+      "description": "Extract third-party licenses. Always on in ngc-rs (3rdpartylicenses.txt is always emitted)."
+    },
+    "verbose": {
+      "type": "boolean",
+      "description": "Verbose output. Accepted for compatibility but currently ignored by ngc-rs (use `RUST_LOG=info` env var for tracing output)."
+    },
+    "progress": {
+      "type": "boolean",
+      "description": "Display build progress. Accepted for compatibility but currently ignored by ngc-rs."
+    },
+    "watch": {
+      "type": "boolean",
+      "description": "Run in watch mode. NOT yet supported by the application builder; use the `dev-server` builder for incremental rebuilds. Setting this to true fails the build."
+    },
+    "prerender": {
+      "description": "Prerender pages at build time. SSR-related; NOT supported by ngc-rs. Setting this fails the build with a clear error.",
+      "oneOf": [
+        { "type": "boolean" },
+        { "type": "object" }
+      ]
+    },
+    "ssr": {
+      "description": "Server-side rendering output. SSR is out of scope for ngc-rs v1. Setting this fails the build.",
+      "oneOf": [
+        { "type": "boolean" },
+        { "type": "object" }
+      ]
+    },
+    "server": {
+      "type": "string",
+      "description": "Server entry point for SSR. Out of scope for ngc-rs v1. Setting this fails the build."
+    },
+    "outputMode": {
+      "type": "string",
+      "enum": ["static", "server"],
+      "description": "Static vs server output mode. Server mode is out of scope for ngc-rs v1. Setting `server` fails the build."
+    },
+    "ngcRsBinary": {
+      "type": "string",
+      "description": "Optional override for the ngc-rs binary path. If unset, the shim looks at the NGC_RS_BINARY env var, then a node_modules platform package, then a workspace-relative target/release/ngc-rs, and finally PATH."
+    },
+    "localize": {
+      "oneOf": [
+        { "type": "boolean" },
+        { "type": "array", "items": { "type": "string" } }
+      ],
+      "description": "Generate per-locale builds. When set to true ngc-rs is invoked with `--localize` and emits one output tree per `i18n.locales` entry in angular.json. Selecting a locale subset (array form) is NOT yet honoured by ngc-rs and logs a warning."
+    }
+  },
+  "additionalProperties": false
+}
