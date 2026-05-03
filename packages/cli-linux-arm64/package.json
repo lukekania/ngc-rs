@@ -1,0 +1,18 @@
+{
+  "name": "@ngc-rs/cli-linux-arm64",
+  "version": "0.8.3",
+  "description": "Linux arm64 (glibc) binary for @ngc-rs/cli. Installed automatically via optionalDependencies — do not depend on this package directly.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lukekania/ngc-rs",
+    "directory": "packages/cli-linux-arm64"
+  },
+  "homepage": "https://github.com/lukekania/ngc-rs#readme",
+  "files": ["bin/ngc-rs"],
+  "os": ["linux"],
+  "cpu": ["arm64"],
+  "engines": {
+    "node": ">=20.11.0"
+  }
+}
