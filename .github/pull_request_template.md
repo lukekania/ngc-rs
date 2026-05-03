@@ -24,8 +24,8 @@ fixes can omit this. -->
 - [ ] `cargo fmt --check` clean
 - [ ] If touching `packages/builder/`: `npm test && npm run lint` clean
 - [ ] If changing build pipeline behavior: diffed `dist/` output against
-      `ng build` baseline on the treasr-frontend (or another real Angular
-      17+ project) per CLAUDE.md's debugging rule
+      vanilla `ng build` baseline on a real Angular 17+ project (see
+      "Verifying build-pipeline changes" in CONTRIBUTING.md)
 - [ ] Conventional-commit title prefix (`feat:`, `fix:`, `chore:`,
       `refactor:`, `docs:`, `test:`, `style:`, `perf:`)
 - [ ] Public items have `///` doc comments

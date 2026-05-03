@@ -11,6 +11,11 @@ documentation.workspace = true
 readme = "../../README.md"
 keywords = ["angular", "build", "compiler", "bundler", "cli"]
 categories = ["development-tools::build-utils", "command-line-utilities"]
+# Not currently published to crates.io (workspace deps would need to be
+# published too — see #131-style follow-ups). Rust users install via
+# `cargo install --git`. Metadata above is kept so a future flip to
+# `publish = true` is a one-line change.
+publish = false
 include = [
     "src/**/*.rs",
     "Cargo.toml",
@@ -22,6 +27,12 @@ include = [
 [[bin]]
 name = "ngc-rs"
 path = "src/main.rs"
+
+# `publish = false` (above) tells cargo we don't push to crates.io, but
+# cargo-dist treats `publish = false` as "exclude from the release set"
+# by default — which would empty out the release. Re-include explicitly:
+[package.metadata.dist]
+dist = true
 
 [dependencies]
 ngc-diagnostics = { path = "../diagnostics" }

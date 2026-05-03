@@ -64,10 +64,11 @@ to avoid pinging unrelated GitHub users.
 When changing anything in the build pipeline (resolver, transform,
 template compiler, linker, bundler, npm-resolver, dev-server), the
 standing rule is to diff `dist/` output against vanilla `ng build` on a
-real Angular 17+ project. The maintainer's reference project is
-treasr-frontend (Angular 21, standalone, signals, zoneless). Any
-non-trivial pipeline change should include a confirmation that this
-diff is empty (or that any new differences are deliberate).
+real Angular 17+ project. Use any production-grade Angular app with
+standalone components, signals, and either zoneless or zone-based
+change detection. Any non-trivial pipeline change should include a
+confirmation that this diff is empty (or that any new differences are
+deliberate).
 
 ## Release & secret rotation
 
@@ -78,12 +79,12 @@ The required repository secrets are:
   publish + write permissions. Used by the `publish-npm` job in
   `.github/workflows/release.yml`. **npm caps granular access tokens at
   90 days**, so rotate quarterly.
-- `CARGO_REGISTRY_TOKEN` — scoped to the `ngc-rs` crate. Used by the
-  crates.io publish step. crates.io tokens have no forced expiry; rotate
-  annually.
 
-Rotate both immediately on any suspected exposure and document the
-rotation in the release notes.
+The Rust binary is not currently published to crates.io. Rust users
+install via `cargo install --git https://github.com/lukekania/ngc-rs --tag v1.0.0`.
+
+Rotate the npm token immediately on any suspected exposure and document
+the rotation in the release notes.
 
 ## License
 

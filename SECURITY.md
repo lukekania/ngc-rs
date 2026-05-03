@@ -60,10 +60,11 @@ supply-chain security seriously. The mitigations currently in place:
   scoped to the `@ngc-rs/*` org with publish + write permissions only;
   npm caps granular access tokens at **90 days**, so this token is
   rotated quarterly (set a calendar reminder; the workflow fails
-  cleanly with a 401 once the token expires). `CARGO_REGISTRY_TOKEN`
-  is scoped to the `ngc-rs` crate; crates.io tokens have no forced
-  expiry but are rotated annually. Both are rotated immediately on
-  any suspected exposure.
+  cleanly with a 401 once the token expires). The token is also
+  rotated immediately on any suspected exposure. The Rust binary is
+  not published to crates.io; Rust users install via
+  `cargo install --git https://github.com/lukekania/ngc-rs --tag v1.0.0`,
+  so no crates.io token is required.
 
 ## Contribution Policy
 
