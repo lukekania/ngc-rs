@@ -28,6 +28,12 @@ include = [
 name = "ngc-rs"
 path = "src/main.rs"
 
+# `publish = false` (above) tells cargo we don't push to crates.io, but
+# cargo-dist treats `publish = false` as "exclude from the release set"
+# by default — which would empty out the release. Re-include explicitly:
+[package.metadata.dist]
+dist = true
+
 [dependencies]
 ngc-diagnostics = { path = "../diagnostics" }
 ngc-project-resolver = { path = "../project-resolver" }
