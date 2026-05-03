@@ -70,4 +70,58 @@ describe('locateNgcRs', () => {
       ws.cleanup();
     }
   });
+
+  it('finds the npm-distributed platform package binary in node_modules', () => {
+    const ws = makeWorkspace();
+    try {
+      // Materialize a fake `@ngc-rs/cli-{platform}-{arch}` package layout
+      // under <workspace>/node_modules so `require.resolve` finds it.
+      const platformPkg = `@ngc-rs/cli-${process.platform}-${process.arch}`;
+      const pkgDir = path.join(ws.dir, 'node_modules', ...platformPkg.split('/'));
+      fs.mkdirSync(path.join(pkgDir, 'bin'), { recursive: true });
+      fs.writeFileSync(
+        path.join(pkgDir, 'package.json'),
+        JSON.stringify({ name: platformPkg, version: '1.0.0' }),
+      );
+      const binName = process.platform === 'win32' ? 'ngc-rs.exe' : 'ngc-rs';
+      const bin = path.join(pkgDir, 'bin', binName);
+      fs.writeFileSync(bin, '#!/bin/sh\necho hi\n', { mode: 0o755 });
+
+      const out = locateNgcRs(ws.dir, null, {});
+      expect(out.source).toBe('node-modules');
+      // realpath both sides because `require.resolve` returns the realpath
+      // (collapsing macOS' `/var` → `/private/var` symlink) while
+      // `path.join` keeps the symlink form.
+      expect(fs.realpathSync(out.binary)).toBe(fs.realpathSync(bin));
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it('prefers node_modules over <workspace>/target/release when both exist', () => {
+    const ws = makeWorkspace();
+    try {
+      // Materialize both candidates.
+      const targetDir = path.join(ws.dir, 'target', 'release');
+      fs.mkdirSync(targetDir, { recursive: true });
+      const binName = process.platform === 'win32' ? 'ngc-rs.exe' : 'ngc-rs';
+      fs.writeFileSync(path.join(targetDir, binName), '#!/bin/sh\n', { mode: 0o755 });
+
+      const platformPkg = `@ngc-rs/cli-${process.platform}-${process.arch}`;
+      const pkgDir = path.join(ws.dir, 'node_modules', ...platformPkg.split('/'));
+      fs.mkdirSync(path.join(pkgDir, 'bin'), { recursive: true });
+      fs.writeFileSync(
+        path.join(pkgDir, 'package.json'),
+        JSON.stringify({ name: platformPkg, version: '1.0.0' }),
+      );
+      const pkgBin = path.join(pkgDir, 'bin', binName);
+      fs.writeFileSync(pkgBin, '#!/bin/sh\n', { mode: 0o755 });
+
+      const out = locateNgcRs(ws.dir, null, {});
+      expect(out.source).toBe('node-modules');
+      expect(fs.realpathSync(out.binary)).toBe(fs.realpathSync(pkgBin));
+    } finally {
+      ws.cleanup();
+    }
+  });
 });

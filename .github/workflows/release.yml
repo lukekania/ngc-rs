@@ -16,6 +16,11 @@
 name: Release
 permissions:
   "contents": "write"
+  # `id-token: write` enables npm provenance attestations during the
+  # `publish-npm` job. Without it, `npm publish --provenance` fails with
+  # "OIDC token exchange failed". This is safe — the OIDC token is scoped
+  # to the npm publish step and cannot be used for other secrets.
+  "id-token": "write"
 
 # Don't cancel a release run mid-publish if a newer push lands. Tag-triggered
 # runs are rare and idempotency is preferable to a clean cancellation.
@@ -283,6 +288,118 @@ jobs:
           echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
 
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+
+  # Stage prebuilt binaries into each `packages/cli-{os}-{arch}/bin/` and
+  # publish all 6 npm packages (5 platform-specific + the wrapper). Runs
+  # only after the GitHub Release is created so we can `gh release download`
+  # the official archives instead of re-extracting cargo-dist scratch
+  # storage. Wrapper publishes last so its `optionalDependencies` resolve
+  # against already-published versions on first install.
+  publish-npm:
+    needs:
+      - plan
+      - host
+    if: ${{ needs.plan.outputs.publishing == 'true' && needs.host.result == 'success' }}
+    runs-on: "ubuntu-22.04"
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # NPM_TOKEN must be a granular access token scoped to the @ngc-rs/* org
+      # with publish + write permissions; rotation cadence documented in
+      # SECURITY.md.
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+      # Strip leading `v` from the git tag (e.g. `v1.0.0` → `1.0.0`) so
+      # `npm version` accepts it.
+      NPM_VERSION: ${{ needs.plan.outputs.tag && format('{0}', needs.plan.outputs.tag) }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org/'
+      - name: Compute version (strip leading `v`)
+        id: ver
+        run: |
+          v="${RELEASE_TAG#v}"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "publishing version $v"
+      - name: Stage platform binaries from the GitHub Release
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          mkdir -p "$tmp"
+          declare -A targets=(
+            [darwin-arm64]="aarch64-apple-darwin"
+            [darwin-x64]="x86_64-apple-darwin"
+            [linux-arm64]="aarch64-unknown-linux-gnu"
+            [linux-x64]="x86_64-unknown-linux-gnu"
+            [win32-x64]="x86_64-pc-windows-msvc"
+          )
+          for npm_arch in "${!targets[@]}"; do
+            cargo_target="${targets[$npm_arch]}"
+            if [ "$npm_arch" = "win32-x64" ]; then
+              archive="ngc-rs-${cargo_target}.zip"
+              binary="ngc-rs.exe"
+            else
+              archive="ngc-rs-${cargo_target}.tar.xz"
+              binary="ngc-rs"
+            fi
+            echo "::group::Fetching $archive"
+            gh release download "$RELEASE_TAG" --pattern "$archive" --dir "$tmp"
+            mkdir -p "packages/cli-${npm_arch}/bin"
+            if [[ "$archive" == *.zip ]]; then
+              unzip -o "$tmp/$archive" "$binary" -d "packages/cli-${npm_arch}/bin/"
+            else
+              tar -xJf "$tmp/$archive" -C "packages/cli-${npm_arch}/bin/" "$binary"
+            fi
+            chmod +x "packages/cli-${npm_arch}/bin/$binary"
+            ls -la "packages/cli-${npm_arch}/bin/"
+            echo "::endgroup::"
+          done
+      - name: Publish each platform package
+        run: |
+          set -euo pipefail
+          for pkg in cli-darwin-arm64 cli-darwin-x64 cli-linux-arm64 cli-linux-x64 cli-win32-x64; do
+            echo "::group::Publishing @ngc-rs/$pkg@${{ steps.ver.outputs.version }}"
+            (
+              cd "packages/$pkg"
+              npm version "${{ steps.ver.outputs.version }}" --no-git-tag-version --allow-same-version
+              npm publish --access public --provenance
+            )
+            echo "::endgroup::"
+          done
+      - name: Publish the wrapper
+        # Wrapper goes last so its optionalDependencies resolve to
+        # already-published versions on first install. Without this
+        # ordering, `npm install @ngc-rs/cli` would skip every optional
+        # dep with "no matching version found".
+        run: |
+          set -euo pipefail
+          (
+            cd packages/cli
+            # Bump the wrapper itself.
+            npm version "${{ steps.ver.outputs.version }}" --no-git-tag-version --allow-same-version
+            # Bump every optionalDependencies entry to the same version so
+            # npm picks the matching platform package by version, not by
+            # range. Pinning is intentional — we never want a wrapper to
+            # be paired with a different platform-package version.
+            node -e "const f='package.json';const j=require('./'+f);for(const k of Object.keys(j.optionalDependencies||{})){j.optionalDependencies[k]='${{ steps.ver.outputs.version }}'}require('fs').writeFileSync(f, JSON.stringify(j, null, 2)+'\n')"
+            cat package.json
+            npm publish --access public --provenance
+          )
+      - name: Publish @ngc-rs/builder
+        # Same architect builder package shipped today, but for the v1
+        # tag we re-publish it so the version line up with the CLI.
+        run: |
+          set -euo pipefail
+          (
+            cd packages/builder
+            npm version "${{ steps.ver.outputs.version }}" --no-git-tag-version --allow-same-version
+            npm run build
+            npm publish --access public --provenance
+          )
 
   announce:
     needs:

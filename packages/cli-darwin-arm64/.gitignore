@@ -1,0 +1,4 @@
+# The binary is staged here by the release workflow before `npm publish`.
+# It must never be committed.
+bin/ngc-rs
+bin/ngc-rs.exe
