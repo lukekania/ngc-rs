@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or discussion
+    url: https://github.com/lukekania/ngc-rs/discussions
+    about: For usage questions, ideas, and general discussion. Open an issue only after discussing here, unless you have a clear bug report or feature request.
+  - name: Security report (private)
+    url: https://github.com/lukekania/ngc-rs/security/advisories/new
+    about: For vulnerability reports — please use GitHub's private vulnerability reporting, not a public issue.

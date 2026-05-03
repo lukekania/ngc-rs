@@ -35,4 +35,4 @@ See the [main README](https://github.com/lukekania/ngc-rs#readme) for full subco
 
 ## License
 
-MIT
+Licensed under either of [Apache-2.0](https://github.com/lukekania/ngc-rs/blob/main/LICENSE-APACHE) or [MIT](https://github.com/lukekania/ngc-rs/blob/main/LICENSE-MIT) at your option.
