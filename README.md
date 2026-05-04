@@ -10,9 +10,29 @@ A native Rust replacement for `ng build` in Angular projects. Drop-in swap, **~1
 
 Measured with [hyperfine](https://github.com/sharkdp/hyperfine) on Apple Silicon, `-c production` (source maps, minification, tree shaking, content-hashed filenames).
 
-> **Status: v1.0.0 — Angular CLI drop-in.** Add two npm packages, change one line in `angular.json`, run `ng build` as normal — your Angular project gets the Rust pipeline with no other code changes.
+> **Status: pre-1.0 — closing the parity gap with `@angular/build:application`.** The architecture is in place (drop-in via `@ngc-rs/builder:application`, ~6× faster on real apps), but several `angular.json` options are not yet honored. v1.0.0 ships when every issue tagged [`parity:must-have`](https://github.com/lukekania/ngc-rs/labels/parity%3Amust-have) is closed; v0.10.x is the active development line. **Not yet published to npm** — install from source for now (see below).
 
-## Install (recommended: npm)
+## Install (from source)
+
+```sh
+git clone https://github.com/lukekania/ngc-rs.git
+cd ngc-rs
+cargo build --release
+```
+
+The binary lands at `target/release/ngc-rs`.
+
+For the architect builder (used by `ng build` / `ng serve`):
+
+```sh
+cd packages/builder && npm install && npm run build
+# Then `npm link` from packages/builder and `npm link @ngc-rs/builder`
+# in your Angular project to test the swap locally.
+```
+
+## Install (npm — coming with v1.0.0)
+
+Once v1.0.0 ships, the install path will be:
 
 ```sh
 npm i -D @ngc-rs/cli @ngc-rs/builder
@@ -38,26 +58,6 @@ In `angular.json`, change the builder line on your `build` (and optionally `serv
 ```
 
 Then run `ng build` (or `ng serve`) as normal. The builder shells out to the `ngc-rs` binary while continuing to speak the `@angular-devkit/architect` protocol, so editor integrations, proxy configs, and `--configuration` overrides keep working.
-
-## Install (Rust users)
-
-```sh
-cargo install --git https://github.com/lukekania/ngc-rs --tag v1.0.0
-```
-
-Or build from source:
-
-```sh
-git clone https://github.com/lukekania/ngc-rs.git
-cd ngc-rs
-cargo build --release
-```
-
-The binary will be at `target/release/ngc-rs`.
-
-ngc-rs is currently not published to crates.io — its workspace crates form
-a single tightly-coupled toolchain rather than reusable libraries, so the
-git-tag install above is the supported Rust path.
 
 ## Why is it faster?
 

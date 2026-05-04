@@ -52,8 +52,15 @@ concurrency:
 on:
   pull_request:
   push:
+    # Tag pattern intentionally excludes the v0.x development line — those
+    # tags are for internal version tracking only and must NOT trigger
+    # binary archives, GitHub Releases, or npm publishes. v1.0.0 will be
+    # the first tag this workflow acts on; pre-1.0 tags fall through.
+    # Re-broaden the pattern back to `**[0-9]+.[0-9]+.[0-9]+*` once we're
+    # ready to ship the first stable release.
     tags:
-      - '**[0-9]+.[0-9]+.[0-9]+*'
+      - 'v[1-9].[0-9]+.[0-9]+*'        # v1.x.y - v9.x.y (incl. -rc.N)
+      - 'v[1-9][0-9]+.[0-9]+.[0-9]+*'  # v10+.x.y
 
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do

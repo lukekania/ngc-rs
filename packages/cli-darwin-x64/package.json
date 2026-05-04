@@ -1,6 +1,6 @@
 {
   "name": "@ngc-rs/cli-darwin-x64",
-  "version": "1.0.0",
+  "version": "0.10.0",
   "description": "macOS x86_64 binary for @ngc-rs/cli. Installed automatically via optionalDependencies — do not depend on this package directly.",
   "license": "(MIT OR Apache-2.0)",
   "repository": {
