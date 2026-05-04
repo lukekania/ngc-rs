@@ -1,6 +1,6 @@
 {
   "name": "@ngc-rs/builder",
-  "version": "1.0.0",
+  "version": "0.10.0",
   "description": "Angular @angular-devkit/architect builders backed by ngc-rs.",
   "license": "(MIT OR Apache-2.0)",
   "repository": {

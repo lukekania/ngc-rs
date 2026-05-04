@@ -1,6 +1,6 @@
 {
   "name": "@ngc-rs/cli-win32-x64",
-  "version": "1.0.0",
+  "version": "0.10.0",
   "description": "Windows x86_64 (MSVC) binary for @ngc-rs/cli. Installed automatically via optionalDependencies — do not depend on this package directly.",
   "license": "(MIT OR Apache-2.0)",
   "repository": {

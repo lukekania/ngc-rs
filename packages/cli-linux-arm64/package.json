@@ -1,6 +1,6 @@
 {
   "name": "@ngc-rs/cli-linux-arm64",
-  "version": "1.0.0",
+  "version": "0.10.0",
   "description": "Linux arm64 (glibc) binary for @ngc-rs/cli. Installed automatically via optionalDependencies — do not depend on this package directly.",
   "license": "(MIT OR Apache-2.0)",
   "repository": {
