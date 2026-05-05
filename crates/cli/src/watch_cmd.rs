@@ -31,7 +31,10 @@ pub fn run(
 ) -> NgcResult<()> {
     let mut cache = BuildCache::new();
 
-    // Initial build to populate the cache.
+    // Initial build to populate the cache. `run_build_with_cache` always
+    // disables `strict_templates` — `watch` is a dev workflow, so JIT
+    // fallback warnings must not be escalated into a build error that would
+    // block iteration on transient template-compile gaps.
     let initial = crate::run_build_with_cache(
         project,
         out_dir_override,

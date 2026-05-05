@@ -346,6 +346,10 @@
     "webWorkerTsConfig": {
       "type": "string",
       "description": "Separate tsconfig for `new Worker(...)` bundles. NOT yet supported by ngc-rs (web workers are not detected by the bundler). Setting this fails the build."
+    },
+    "strictTemplates": {
+      "type": "boolean",
+      "description": "When true, ngc-rs is invoked with `--strict-templates` and any template that would otherwise fall back to JIT compilation is reported as a hard build error. Mirrors `@angular/build:application`, which has no JIT fallback. ngc-rs also enables this automatically for production configurations."
     }
   },
   "additionalProperties": false

@@ -55,6 +55,27 @@ describe('translateOptions (build)', () => {
     expect(t.args).toContain('--localize');
   });
 
+  it('appends --strict-templates when strictTemplates is true', () => {
+    const t = translateOptions(
+      { ...minimal, strictTemplates: true },
+      '/ws',
+      null,
+    );
+    expect(t.args).toContain('--strict-templates');
+  });
+
+  it('omits --strict-templates when strictTemplates is false or unset', () => {
+    const off = translateOptions(
+      { ...minimal, strictTemplates: false },
+      '/ws',
+      null,
+    );
+    expect(off.args).not.toContain('--strict-templates');
+
+    const unset = translateOptions(minimal, '/ws', null);
+    expect(unset.args).not.toContain('--strict-templates');
+  });
+
   it('appends --localize and warns when localize is an array (subset not yet honoured)', () => {
     const t = translateOptions(
       { ...minimal, localize: ['en', 'de'] },
