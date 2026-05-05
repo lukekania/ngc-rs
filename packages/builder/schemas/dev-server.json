@@ -59,6 +59,10 @@
     "watch": {
       "type": "boolean",
       "description": "Whether the dev server rebuilds on file changes. Always true in `ngc-rs serve`; setting it to false logs a warning."
+    },
+    "servePath": {
+      "type": "string",
+      "description": "URL path prefix to mount the dev server under (e.g. \"/admin/\"). Mirrors @angular/build:dev-server's servePath option for projects deployed behind a subpath. When set, the served index.html is rewritten to use the same value as <base href> unless angular.json already configures one explicitly."
     }
   },
   "additionalProperties": false

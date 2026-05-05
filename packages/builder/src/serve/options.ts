@@ -14,6 +14,7 @@ export interface DevServerOptions extends json.JsonObject {
   ngcRsBinary: string | null;
   define: { [key: string]: string } | null;
   watch: boolean | null;
+  servePath: string | null;
 }
 
 export interface TranslatedServeArgs {
@@ -60,6 +61,7 @@ export function translateOptions(
 
   const configuration = parseConfigurationFromBuildTarget(raw.buildTarget);
   const project = raw.project ?? 'tsconfig.json';
+  const servePath = normalizeServePath(raw.servePath ?? null);
 
   const proxyConfigPath = raw.proxyConfig
     ? path.resolve(workspaceRoot, raw.proxyConfig)
@@ -74,6 +76,9 @@ export function translateOptions(
     args.push('--configuration', configuration);
   }
   args.push('--host', spawnHost, '--port', String(spawnPort));
+  if (servePath) {
+    args.push('--serve-path', servePath);
+  }
 
   return {
     args,
@@ -85,8 +90,28 @@ export function translateOptions(
     proxyPort: userPort,
     proxyConfigPath,
     open,
-    url: formatUrl(userHost, userPort),
+    url: formatUrl(userHost, userPort, servePath),
   };
+}
+
+// Normalize a user-supplied servePath into the canonical `/foo/` form, or
+// return null when the value is empty / a bare `/` (i.e. no prefix). The
+// rust side runs the same normalization (`ngc_dev_server::normalize_serve_path`),
+// but normalizing on this side too lets the printed URL and any downstream
+// proxy rewriting agree without depending on the spawned process.
+function normalizeServePath(raw: string | null | undefined): string | null {
+  if (!raw) {
+    return null;
+  }
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed === '/') {
+    return null;
+  }
+  let out = trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+  if (!out.endsWith('/')) {
+    out = `${out}/`;
+  }
+  return out;
 }
 
 function parseConfigurationFromBuildTarget(buildTarget?: string): string | null {
@@ -100,8 +125,13 @@ function parseConfigurationFromBuildTarget(buildTarget?: string): string | null 
   return null;
 }
 
-export function formatUrl(host: string, port: number): string {
+export function formatUrl(
+  host: string,
+  port: number,
+  servePath: string | null = null,
+): string {
   const isLoopbackName = host === 'localhost' || host === '0.0.0.0';
   const display = isLoopbackName ? 'localhost' : host;
-  return `http://${display}:${port}/`;
+  const suffix = servePath ?? '/';
+  return `http://${display}:${port}${suffix}`;
 }

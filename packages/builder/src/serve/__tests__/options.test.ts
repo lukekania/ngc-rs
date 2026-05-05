@@ -76,6 +76,30 @@ describe('translateOptions', () => {
     const t = translateOptions({ port: 4200, host: 'localhost' }, '/ws');
     expect(t.args).not.toContain('--configuration');
   });
+
+  it('forwards a normalized servePath as --serve-path', () => {
+    const t = translateOptions({ ...base, servePath: 'admin' }, '/ws');
+    const idx = t.args.indexOf('--serve-path');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(t.args[idx + 1]).toBe('/admin/');
+    expect(t.url).toBe('http://localhost:4200/admin/');
+  });
+
+  it('preserves a fully-qualified servePath unchanged', () => {
+    const t = translateOptions({ ...base, servePath: '/app/' }, '/ws');
+    const idx = t.args.indexOf('--serve-path');
+    expect(t.args[idx + 1]).toBe('/app/');
+    expect(t.url).toBe('http://localhost:4200/app/');
+  });
+
+  it('drops --serve-path when servePath is empty or just a slash', () => {
+    expect(
+      translateOptions({ ...base, servePath: '/' }, '/ws').args,
+    ).not.toContain('--serve-path');
+    expect(
+      translateOptions({ ...base, servePath: '' }, '/ws').args,
+    ).not.toContain('--serve-path');
+  });
 });
 
 describe('formatUrl', () => {
@@ -84,5 +108,10 @@ describe('formatUrl', () => {
   });
   it('keeps custom hostnames untouched', () => {
     expect(formatUrl('app.local', 8080)).toBe('http://app.local:8080/');
+  });
+  it('appends a servePath when provided', () => {
+    expect(formatUrl('localhost', 4200, '/admin/')).toBe(
+      'http://localhost:4200/admin/',
+    );
   });
 });

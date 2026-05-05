@@ -222,6 +222,13 @@ enum Commands {
         /// listening.
         #[arg(long)]
         open: bool,
+        /// URL path prefix to mount the dev server under (e.g. `/admin/`).
+        /// Mirrors the `servePath` option of `@angular/build:dev-server` for
+        /// projects deployed behind a subpath. When set without an explicit
+        /// `baseHref` in `angular.json`, the served `index.html` is rewritten
+        /// to use the same value as its `<base href>`.
+        #[arg(long = "serve-path")]
+        serve_path: Option<String>,
     },
     /// Extract translatable messages from every component template in the
     /// project and emit a `messages.xlf` (XLIFF 1.2) file.
@@ -290,8 +297,16 @@ fn main() {
             port,
             host,
             open,
+            serve_path,
         } => {
-            if let Err(e) = serve_cmd::run(&project, Some(&configuration), &host, port, open) {
+            if let Err(e) = serve_cmd::run(
+                &project,
+                Some(&configuration),
+                &host,
+                port,
+                open,
+                serve_path.as_deref(),
+            ) {
                 eprintln!("{} {e}", "Error:".red().bold());
                 process::exit(1);
             }
@@ -416,7 +431,14 @@ fn run_build(
     configuration: Option<&str>,
     localize: bool,
 ) -> NgcResult<BuildResult> {
-    run_build_with_cache(project, out_dir_override, configuration, localize, None)
+    run_build_with_options(
+        project,
+        out_dir_override,
+        configuration,
+        localize,
+        None,
+        None,
+    )
 }
 
 /// Variant of [`run_build`] that consults a [`incremental::BuildCache`] to
@@ -428,7 +450,31 @@ pub(crate) fn run_build_with_cache(
     out_dir_override: Option<&Path>,
     configuration: Option<&str>,
     localize: bool,
+    cache: Option<&mut incremental::BuildCache>,
+) -> NgcResult<BuildResult> {
+    run_build_with_options(
+        project,
+        out_dir_override,
+        configuration,
+        localize,
+        cache,
+        None,
+    )
+}
+
+/// Variant of [`run_build_with_cache`] that additionally accepts an
+/// optional `<base href>` fallback for `index.html` injection. Used by
+/// `ngc-rs serve --serve-path` so that, when `angular.json` does not set
+/// an explicit `baseHref`, the served `index.html` still picks up the
+/// dev-server's URL prefix as its base. When the project resolves a
+/// `baseHref` of its own the override is ignored.
+pub(crate) fn run_build_with_options(
+    project: &Path,
+    out_dir_override: Option<&Path>,
+    configuration: Option<&str>,
+    localize: bool,
     mut cache: Option<&mut incremental::BuildCache>,
+    base_href_override: Option<&str>,
 ) -> NgcResult<BuildResult> {
     let started_at = Instant::now();
 
@@ -1037,8 +1083,13 @@ pub(crate) fn run_build_with_cache(
                 .filter(|s| s.inject)
                 .map(|s| s.filename.as_str())
                 .collect();
+            // angular.json's baseHref wins when present; otherwise fall
+            // back to the dev-server servePath override (for #139) so
+            // subpath-deployed apps still get a correct <base href> in
+            // dev. When neither is set, leave the index untouched.
+            let resolved_base_href = ap.base_href.as_deref().or(base_href_override);
             let index_opts = IndexHtmlOptions {
-                base_href: ap.base_href.as_deref(),
+                base_href: resolved_base_href,
                 deploy_url: ap.deploy_url.as_deref(),
                 cross_origin: ap.cross_origin,
                 subresource_integrity: ap.subresource_integrity,

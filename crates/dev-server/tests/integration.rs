@@ -387,3 +387,89 @@ fn unknown_extension_serves_octet_stream() {
         "application/octet-stream"
     );
 }
+
+fn prefixed_fixture(serve_path: &str) -> Fixture {
+    let root = TempDir::new().expect("tempdir");
+    write_file(
+        root.path(),
+        "index.html",
+        b"<html><body><h1>hi</h1></body></html>",
+    );
+    write_file(root.path(), "main.js", b"console.log('hello');");
+    let cfg = DevServerConfig::new(root.path())
+        .with_port(0)
+        .with_serve_path(Some(serve_path));
+    let (_tx, rx) = channel::<DevServerEvent>();
+    let server = DevServer::start(cfg, rx).expect("start dev server");
+    Fixture {
+        server,
+        _root: root,
+    }
+}
+
+#[test]
+fn prefixed_root_serves_index_html() {
+    let fx = prefixed_fixture("/admin/");
+    let resp = http_get(fx.server.addr(), "/admin/");
+    assert_eq!(resp.status, 200);
+    let body = std::str::from_utf8(&resp.body).expect("utf8 body");
+    assert!(body.contains("<h1>hi</h1>"));
+    // EventSource URL must point to the prefixed SSE channel.
+    assert!(body.contains("'/admin/__ngc_reload'"));
+}
+
+#[test]
+fn prefixed_static_asset_strips_prefix_for_filesystem_lookup() {
+    let fx = prefixed_fixture("/admin/");
+    let resp = http_get(fx.server.addr(), "/admin/main.js");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, b"console.log('hello');");
+}
+
+#[test]
+fn prefixed_deep_link_falls_back_to_index_html() {
+    let fx = prefixed_fixture("/admin/");
+    let resp = http_get(fx.server.addr(), "/admin/users/42");
+    assert_eq!(resp.status, 200);
+    let body = std::str::from_utf8(&resp.body).expect("utf8 body");
+    assert!(body.contains("<h1>hi</h1>"));
+}
+
+#[test]
+fn unprefixed_request_returns_404_when_serve_path_set() {
+    let fx = prefixed_fixture("/admin/");
+    assert_eq!(http_get(fx.server.addr(), "/").status, 404);
+    assert_eq!(http_get(fx.server.addr(), "/main.js").status, 404);
+    assert_eq!(http_get(fx.server.addr(), "/__ngc_reload").status, 404);
+}
+
+#[test]
+fn prefixed_sse_channel_is_reachable_under_prefix() {
+    let fx = prefixed_fixture("/admin/");
+    let mut stream = TcpStream::connect(fx.server.addr()).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    let req =
+        "GET /admin/__ngc_reload HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/event-stream\r\n\r\n";
+    stream.write_all(req.as_bytes()).expect("write");
+    stream.flush().expect("flush");
+
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line).expect("status line");
+    assert!(status_line.contains("200"), "got {status_line}");
+
+    let mut saw_event_stream = false;
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).expect("header");
+        if n == 0 || line == "\r\n" {
+            break;
+        }
+        if line.to_ascii_lowercase().contains("text/event-stream") {
+            saw_event_stream = true;
+        }
+    }
+    assert!(saw_event_stream);
+}

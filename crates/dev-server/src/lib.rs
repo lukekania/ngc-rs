@@ -88,6 +88,11 @@ pub struct DevServerConfig {
     /// Port to bind on. Defaults to `4200`. A value of `0` will let the OS
     /// pick an ephemeral port — useful for tests.
     pub port: u16,
+    /// Optional URL prefix the server is mounted under, normalized to the
+    /// `/foo/` form (always leading and trailing `/`). When `None`, the
+    /// server mounts at `/`. Mirrors `@angular/build:dev-server`'s
+    /// `servePath` option for subpath deploys.
+    pub serve_path: Option<String>,
 }
 
 impl DevServerConfig {
@@ -98,6 +103,7 @@ impl DevServerConfig {
             root: root.into(),
             host: "127.0.0.1".to_string(),
             port: 4200,
+            serve_path: None,
         }
     }
 
@@ -112,6 +118,40 @@ impl DevServerConfig {
         self.port = port;
         self
     }
+
+    /// Mount the server under a URL prefix. `None` (or `Some("/")`) keeps
+    /// the default root mount. Any other value is normalized to the
+    /// `/foo/` form so callers don't need to remember to add slashes.
+    pub fn with_serve_path(mut self, serve_path: Option<&str>) -> Self {
+        self.serve_path = serve_path.and_then(normalize_serve_path);
+        self
+    }
+}
+
+/// Normalize a `servePath` string to the canonical `/foo/` form.
+///
+/// Returns `None` when the normalized value is `/` (i.e. the prefix is
+/// effectively empty), so callers can treat a normalized `None` as "no
+/// prefix" without separate boolean tracking. Empty input also returns
+/// `None`.
+pub fn normalize_serve_path(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(trimmed.len() + 2);
+    if !trimmed.starts_with('/') {
+        out.push('/');
+    }
+    out.push_str(trimmed);
+    if !out.ends_with('/') {
+        out.push('/');
+    }
+    if out == "/" {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 /// Handle to a running dev server.
@@ -122,6 +162,7 @@ pub struct DevServer {
     event_tx: Sender<DevServerEvent>,
     server: Arc<Server>,
     accept_join: Option<JoinHandle<()>>,
+    serve_path: Option<String>,
 }
 
 impl DevServer {
@@ -168,20 +209,23 @@ impl DevServer {
         let request_server = Arc::clone(&server);
         let root = config.root.clone();
         let request_clients = Arc::clone(&clients);
+        let serve_path = config.serve_path.clone();
+        let serve_path_for_loop = serve_path.clone();
         let join = thread::Builder::new()
             .name("ngc-dev-server-accept".into())
-            .spawn(move || serve_loop(request_server, root, request_clients))
+            .spawn(move || serve_loop(request_server, root, request_clients, serve_path_for_loop))
             .map_err(|e| NgcError::ServeError {
                 message: format!("could not spawn accept thread: {e}"),
             })?;
 
-        tracing::info!(addr = %actual_addr, "ngc-rs dev server listening");
+        tracing::info!(addr = %actual_addr, serve_path = ?serve_path, "ngc-rs dev server listening");
 
         Ok(Self {
             addr: actual_addr,
             event_tx: internal_tx,
             server,
             accept_join: Some(join),
+            serve_path,
         })
     }
 
@@ -189,6 +233,12 @@ impl DevServer {
     /// `0` this reflects the ephemeral port chosen by the OS.
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// URL prefix the server is mounted under, in canonical `/foo/` form,
+    /// or `None` when the server is mounted at `/`.
+    pub fn serve_path(&self) -> Option<&str> {
+        self.serve_path.as_deref()
     }
 
     /// Send a reload event to all connected browsers without going through
@@ -291,19 +341,25 @@ pub fn sse_frame(event: &DevServerEvent) -> String {
     }
 }
 
-fn serve_loop(server: Arc<Server>, root: PathBuf, clients: SseClients) {
+fn serve_loop(server: Arc<Server>, root: PathBuf, clients: SseClients, serve_path: Option<String>) {
     for request in server.incoming_requests() {
         let root = root.clone();
         let clients = Arc::clone(&clients);
+        let serve_path = serve_path.clone();
         thread::spawn(move || {
-            if let Err(e) = handle_request(request, &root, &clients) {
+            if let Err(e) = handle_request(request, &root, &clients, serve_path.as_deref()) {
                 tracing::warn!(error = %e, "dev server request failed");
             }
         });
     }
 }
 
-fn handle_request(request: tiny_http::Request, root: &Path, clients: &SseClients) -> NgcResult<()> {
+fn handle_request(
+    request: tiny_http::Request,
+    root: &Path,
+    clients: &SseClients,
+    serve_path: Option<&str>,
+) -> NgcResult<()> {
     if !matches!(request.method(), Method::Get | Method::Head) {
         let resp = Response::from_string("method not allowed").with_status_code(StatusCode(405));
         return request.respond(resp).map_err(io_err);
@@ -312,11 +368,51 @@ fn handle_request(request: tiny_http::Request, root: &Path, clients: &SseClients
     let url = request.url().to_string();
     let path = url.split('?').next().unwrap_or("/");
 
-    if path == "/__ngc_reload" {
+    let stripped = match strip_serve_path(path, serve_path) {
+        Some(s) => s,
+        None => {
+            let resp = Response::from_string("not found").with_status_code(StatusCode(404));
+            return request.respond(resp).map_err(io_err);
+        }
+    };
+
+    if stripped == "/__ngc_reload" {
         return handle_sse(request, clients);
     }
 
-    serve_static(request, root, path)
+    serve_static(request, root, stripped, serve_path)
+}
+
+/// Strip the `serve_path` prefix from `path`, returning the remainder
+/// (always starting with `/`). Returns `None` when `path` falls outside
+/// the prefix and should be served as 404.
+///
+/// Special case: a request to the prefix without its trailing slash
+/// (e.g. `/admin` for prefix `/admin/`) is accepted and treated as the
+/// prefix root, matching what `@angular/build:dev-server` does for the
+/// servePath base — production deployments behind reverse proxies often
+/// rewrite this anyway, and rejecting it is more surprising than helpful.
+fn strip_serve_path<'a>(path: &'a str, serve_path: Option<&str>) -> Option<&'a str> {
+    let Some(prefix) = serve_path else {
+        return Some(path);
+    };
+    if let Some(rest) = path.strip_prefix(prefix) {
+        if rest.is_empty() {
+            return Some("/");
+        }
+        // strip_prefix leaves the rest without the trailing `/` of the
+        // prefix, so reattach a leading `/` for the downstream router.
+        // SAFETY: rest is a suffix of path; we just need to splice the
+        // leading slash back on.
+        let start = path.len() - rest.len() - 1;
+        return Some(&path[start..]);
+    }
+    // Allow the prefix without its trailing `/`: prefix="/admin/" → "/admin".
+    let prefix_no_slash = prefix.trim_end_matches('/');
+    if path == prefix_no_slash {
+        return Some("/");
+    }
+    None
 }
 
 fn handle_sse(request: tiny_http::Request, clients: &SseClients) -> NgcResult<()> {
@@ -343,7 +439,12 @@ Access-Control-Allow-Origin: *\r\n\
     Ok(())
 }
 
-fn serve_static(request: tiny_http::Request, root: &Path, url_path: &str) -> NgcResult<()> {
+fn serve_static(
+    request: tiny_http::Request,
+    root: &Path,
+    url_path: &str,
+    serve_path: Option<&str>,
+) -> NgcResult<()> {
     let decoded = decode_path(url_path);
     let candidate = match resolve_under_root(root, &decoded) {
         Some(p) => p,
@@ -354,8 +455,8 @@ fn serve_static(request: tiny_http::Request, root: &Path, url_path: &str) -> Ngc
     };
 
     match pick_file(&candidate) {
-        Some(file_path) => respond_with_file(request, &file_path),
-        None => spa_fallback(request, root),
+        Some(file_path) => respond_with_file(request, &file_path, serve_path),
+        None => spa_fallback(request, root, serve_path),
     }
 }
 
@@ -372,17 +473,25 @@ fn pick_file(candidate: &Path) -> Option<PathBuf> {
     None
 }
 
-fn spa_fallback(request: tiny_http::Request, root: &Path) -> NgcResult<()> {
+fn spa_fallback(
+    request: tiny_http::Request,
+    root: &Path,
+    serve_path: Option<&str>,
+) -> NgcResult<()> {
     let index = root.join("index.html");
     if index.is_file() {
-        respond_with_file(request, &index)
+        respond_with_file(request, &index, serve_path)
     } else {
         let resp = Response::from_string("not found").with_status_code(StatusCode(404));
         request.respond(resp).map_err(io_err)
     }
 }
 
-fn respond_with_file(request: tiny_http::Request, path: &Path) -> NgcResult<()> {
+fn respond_with_file(
+    request: tiny_http::Request,
+    path: &Path,
+    serve_path: Option<&str>,
+) -> NgcResult<()> {
     let bytes = std::fs::read(path).map_err(|e| NgcError::Io {
         path: path.to_path_buf(),
         source: e,
@@ -390,7 +499,7 @@ fn respond_with_file(request: tiny_http::Request, path: &Path) -> NgcResult<()> 
     let mime = mime_for(path);
 
     let body = if is_index_html(path) {
-        inject_live_reload_client(&bytes)
+        inject_live_reload_client_with_prefix(&bytes, serve_path)
     } else {
         bytes
     };
@@ -520,29 +629,59 @@ pub const LIVE_RELOAD_SCRIPT: &str = r#"<script>(function(){try{var ID='__ngc_rs
 /// Insert the live-reload client script into an HTML byte buffer.
 ///
 /// Inserts immediately before the closing `</body>` tag (case-insensitive).
-/// If no `</body>` is present, appends to the end.
+/// If no `</body>` is present, appends to the end. The injected script
+/// subscribes to `/__ngc_reload` (the un-prefixed SSE channel); use
+/// [`inject_live_reload_client_with_prefix`] when the dev server is
+/// mounted under a [`DevServerConfig::serve_path`] prefix.
 pub fn inject_live_reload_client(html: &[u8]) -> Vec<u8> {
+    inject_live_reload_client_with_prefix(html, None)
+}
+
+/// Variant of [`inject_live_reload_client`] that rewrites the SSE
+/// `EventSource` URL in the injected script to be mounted under
+/// `serve_path` when the server is configured with a URL prefix.
+pub fn inject_live_reload_client_with_prefix(html: &[u8], serve_path: Option<&str>) -> Vec<u8> {
+    let script = live_reload_script_for(serve_path);
     let s = match std::str::from_utf8(html) {
         Ok(s) => s,
         Err(_) => {
-            let mut out = Vec::with_capacity(html.len() + LIVE_RELOAD_SCRIPT.len());
+            let mut out = Vec::with_capacity(html.len() + script.len());
             out.extend_from_slice(html);
-            out.extend_from_slice(LIVE_RELOAD_SCRIPT.as_bytes());
+            out.extend_from_slice(script.as_bytes());
             return out;
         }
     };
     let lower = s.to_ascii_lowercase();
     if let Some(idx) = lower.rfind("</body>") {
-        let mut out = String::with_capacity(s.len() + LIVE_RELOAD_SCRIPT.len());
+        let mut out = String::with_capacity(s.len() + script.len());
         out.push_str(&s[..idx]);
-        out.push_str(LIVE_RELOAD_SCRIPT);
+        out.push_str(&script);
         out.push_str(&s[idx..]);
         return out.into_bytes();
     }
-    let mut out = String::with_capacity(s.len() + LIVE_RELOAD_SCRIPT.len());
+    let mut out = String::with_capacity(s.len() + script.len());
     out.push_str(s);
-    out.push_str(LIVE_RELOAD_SCRIPT);
+    out.push_str(&script);
     out.into_bytes()
+}
+
+/// Render the injected live-reload `<script>` for a given mount prefix.
+///
+/// When `serve_path` is `None` (server mounted at `/`), this returns
+/// [`LIVE_RELOAD_SCRIPT`] unchanged. Otherwise, the literal
+/// `'/__ngc_reload'` `EventSource` URL is rewritten to point at the
+/// prefixed channel (e.g. `'/admin/__ngc_reload'`) so the browser
+/// subscribes to the right path under reverse proxies and subpath
+/// deploys.
+pub fn live_reload_script_for(serve_path: Option<&str>) -> String {
+    match serve_path {
+        None => LIVE_RELOAD_SCRIPT.to_string(),
+        Some(prefix) => {
+            let trimmed = prefix.trim_end_matches('/');
+            let new_url = format!("'{trimmed}/__ngc_reload'");
+            LIVE_RELOAD_SCRIPT.replace("'/__ngc_reload'", &new_url)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -760,5 +899,79 @@ mod tests {
         assert!(!LIVE_RELOAD_SCRIPT.contains("http://"));
         assert!(!LIVE_RELOAD_SCRIPT.contains("https://"));
         assert!(!LIVE_RELOAD_SCRIPT.contains("<link"));
+    }
+
+    #[test]
+    fn normalize_serve_path_canonicalizes_to_leading_and_trailing_slash() {
+        assert_eq!(normalize_serve_path("admin").as_deref(), Some("/admin/"));
+        assert_eq!(normalize_serve_path("/admin").as_deref(), Some("/admin/"));
+        assert_eq!(normalize_serve_path("admin/").as_deref(), Some("/admin/"));
+        assert_eq!(normalize_serve_path("/admin/").as_deref(), Some("/admin/"));
+        assert_eq!(normalize_serve_path("/a/b/c").as_deref(), Some("/a/b/c/"));
+    }
+
+    #[test]
+    fn normalize_serve_path_treats_root_and_empty_as_no_prefix() {
+        assert_eq!(normalize_serve_path("").as_deref(), None);
+        assert_eq!(normalize_serve_path("   ").as_deref(), None);
+        assert_eq!(normalize_serve_path("/").as_deref(), None);
+    }
+
+    #[test]
+    fn devserver_config_with_serve_path_normalizes_and_drops_root() {
+        let cfg = DevServerConfig::new("/tmp/dist").with_serve_path(Some("admin"));
+        assert_eq!(cfg.serve_path.as_deref(), Some("/admin/"));
+        let cfg = DevServerConfig::new("/tmp/dist").with_serve_path(Some("/"));
+        assert!(cfg.serve_path.is_none());
+        let cfg = DevServerConfig::new("/tmp/dist").with_serve_path(None);
+        assert!(cfg.serve_path.is_none());
+    }
+
+    #[test]
+    fn strip_serve_path_returns_unchanged_without_prefix() {
+        assert_eq!(strip_serve_path("/main.js", None), Some("/main.js"));
+        assert_eq!(strip_serve_path("/", None), Some("/"));
+    }
+
+    #[test]
+    fn strip_serve_path_strips_matching_prefix() {
+        let p = Some("/admin/");
+        assert_eq!(strip_serve_path("/admin/", p), Some("/"));
+        assert_eq!(strip_serve_path("/admin/main.js", p), Some("/main.js"));
+        assert_eq!(strip_serve_path("/admin/users/42", p), Some("/users/42"));
+        assert_eq!(
+            strip_serve_path("/admin/__ngc_reload", p),
+            Some("/__ngc_reload")
+        );
+    }
+
+    #[test]
+    fn strip_serve_path_accepts_prefix_without_trailing_slash() {
+        assert_eq!(strip_serve_path("/admin", Some("/admin/")), Some("/"));
+    }
+
+    #[test]
+    fn strip_serve_path_rejects_outside_prefix() {
+        let p = Some("/admin/");
+        assert_eq!(strip_serve_path("/", p), None);
+        assert_eq!(strip_serve_path("/main.js", p), None);
+        // No false positive on look-alike segment names.
+        assert_eq!(strip_serve_path("/adminer", p), None);
+        assert_eq!(strip_serve_path("/adminer/foo", p), None);
+    }
+
+    #[test]
+    fn live_reload_script_for_no_prefix_returns_default() {
+        assert_eq!(live_reload_script_for(None), LIVE_RELOAD_SCRIPT);
+    }
+
+    #[test]
+    fn live_reload_script_for_prefix_rewrites_event_source_url() {
+        let script = live_reload_script_for(Some("/admin/"));
+        assert!(script.contains("'/admin/__ngc_reload'"));
+        assert!(!script.contains("'/__ngc_reload'"));
+        // Other behavior is preserved.
+        assert!(script.contains("addEventListener('reload'"));
+        assert!(script.contains("addEventListener('build-failed'"));
     }
 }
