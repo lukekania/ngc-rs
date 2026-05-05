@@ -65,14 +65,17 @@ describe('translateOptions (build)', () => {
     expect(t.warnings.some((w) => w.includes('locale subset'))).toBe(true);
   });
 
-  it('rejects non-empty scripts arrays', () => {
+  it('accepts non-empty scripts arrays without error', () => {
+    // ngc-rs reads `scripts` directly from angular.json, so the builder
+    // does not need to forward it as a CLI flag — but it must no longer
+    // reject the option (issue #138).
     expect(() =>
       translateOptions(
         { ...minimal, scripts: ['some.js'] as never },
         '/ws',
         null,
       ),
-    ).toThrow(OptionTranslationError);
+    ).not.toThrow();
   });
 
   it('accepts empty scripts arrays without error', () => {

@@ -156,6 +156,10 @@ pub struct RawBuildOptions {
     /// option of `@angular/build:application`, which itself mirrors
     /// esbuild's `--define`.
     pub define: Option<HashMap<String, String>>,
+    /// Global script entries injected into the build (analytics snippets,
+    /// CDN libraries, polyfill shims that don't fit through `polyfills.ts`).
+    /// Each entry is a string path or `{ input, inject, bundleName }` object.
+    pub scripts: Option<Vec<RawScriptEntry>>,
 }
 
 /// One entry in `architect.build.options.budgets` (or in a per-configuration
@@ -299,6 +303,29 @@ pub enum RawStyleEntry {
     },
 }
 
+/// A global script entry: string path or `{ input, inject, bundleName }`
+/// object. Mirrors the `scripts` field accepted by
+/// `@angular/build:application` — entries are concatenated per `bundleName`
+/// (default `"scripts"`) into a single non-module JS file injected into
+/// `index.html` as `<script defer>` when `inject` is true (default).
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum RawScriptEntry {
+    /// Simple string path (e.g. `"src/global.js"`).
+    Simple(String),
+    /// Object form with options.
+    Object {
+        /// Path to the script file.
+        input: String,
+        /// Whether to inject into index.html (default: true).
+        inject: Option<bool>,
+        /// Custom bundle name. Entries that share a bundle name are
+        /// concatenated. Default: `"scripts"`.
+        #[serde(rename = "bundleName")]
+        bundle_name: Option<String>,
+    },
+}
+
 /// An asset entry: string or `{ glob, input, output, ignore }` object.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(untagged)]
@@ -364,6 +391,25 @@ pub struct ResolvedStyle {
     pub inject: bool,
     /// Custom bundle name (None means default `"styles"`).
     pub bundle_name: Option<String>,
+}
+
+/// A resolved global script bundle. Multiple `scripts` entries that share
+/// a `bundleName` are merged into one bundle: their source files are
+/// concatenated (in declaration order) into `<bundle_name>.js` and a single
+/// `<script defer>` tag is emitted when [`Self::inject`] is true.
+#[derive(Debug, Clone)]
+pub struct ResolvedScriptBundle {
+    /// Bundle name (without `.js`). Default `"scripts"` when no entry in
+    /// the group declares one.
+    pub name: String,
+    /// Absolute paths of the source files to concatenate, in declaration
+    /// order from `angular.json`.
+    pub sources: Vec<PathBuf>,
+    /// Whether to inject a `<script defer>` tag for this bundle into the
+    /// emitted `index.html`. Defaults to true; entries that opt out via
+    /// `inject: false` produce a bundle that is written to disk but not
+    /// referenced from the index.
+    pub inject: bool,
 }
 
 /// A resolved asset entry.
@@ -464,6 +510,11 @@ pub struct ResolvedAngularProject {
     /// — see [`RawBuildOptions::define`] for the encoding. Empty when no
     /// `define` block is declared.
     pub define: HashMap<String, String>,
+    /// Resolved global script bundles. Each entry is one emitted JS file
+    /// (`<name>.js`) holding the concatenated contents of every `scripts`
+    /// entry that shares the same `bundleName`. Empty when no `scripts`
+    /// are declared.
+    pub scripts: Vec<ResolvedScriptBundle>,
 }
 
 /// Type of a resolved size budget.
@@ -760,6 +811,11 @@ pub fn resolve_angular_project(
         }
     }
 
+    let scripts = options
+        .and_then(|o| o.scripts.as_ref())
+        .map(|raw_scripts| resolve_scripts(raw_scripts, &base_dir))
+        .unwrap_or_default();
+
     debug!(
         project = %name,
         output_path = %output_path.display(),
@@ -790,6 +846,7 @@ pub fn resolve_angular_project(
         ngsw_config_path,
         budgets,
         define,
+        scripts,
     })
 }
 
@@ -919,6 +976,52 @@ fn resolve_styles(raw: &[RawStyleEntry], base_dir: &Path) -> Vec<ResolvedStyle> 
             },
         })
         .collect()
+}
+
+/// Resolve raw script entries into per-bundle groups with absolute paths.
+///
+/// Entries that share a `bundleName` (default `"scripts"`) are collapsed
+/// into one [`ResolvedScriptBundle`], preserving declaration order so the
+/// concatenation step writes them in the order the user declared. Bundle
+/// order in the returned `Vec` matches the order in which each bundle
+/// name first appeared.
+///
+/// When entries within the same bundle disagree on `inject`, the first
+/// entry wins and a warning is logged — `@angular/build:application`
+/// treats this as undefined behavior, so we pick a deterministic policy
+/// rather than silently merging.
+fn resolve_scripts(raw: &[RawScriptEntry], base_dir: &Path) -> Vec<ResolvedScriptBundle> {
+    let mut bundles: Vec<ResolvedScriptBundle> = Vec::new();
+    for entry in raw {
+        let (input, inject, bundle_name) = match entry {
+            RawScriptEntry::Simple(s) => (s.clone(), true, None),
+            RawScriptEntry::Object {
+                input,
+                inject,
+                bundle_name,
+            } => (input.clone(), inject.unwrap_or(true), bundle_name.clone()),
+        };
+        let name = bundle_name.unwrap_or_else(|| "scripts".to_string());
+        let path = base_dir.join(&input);
+        if let Some(existing) = bundles.iter_mut().find(|b| b.name == name) {
+            if existing.inject != inject {
+                tracing::warn!(
+                    bundle = %name,
+                    "scripts entries in bundle {:?} disagree on `inject`; using first entry's value ({})",
+                    name,
+                    existing.inject
+                );
+            }
+            existing.sources.push(path);
+        } else {
+            bundles.push(ResolvedScriptBundle {
+                name,
+                sources: vec![path],
+                inject,
+            });
+        }
+    }
+    bundles
 }
 
 /// Resolve raw asset entries to absolute paths or glob specs.
@@ -1052,6 +1155,122 @@ mod tests {
         assert!(result.styles[0].inject);
         assert!(!result.styles[1].inject);
         assert_eq!(result.styles[1].bundle_name.as_deref(), Some("theme"));
+    }
+
+    #[test]
+    fn test_parse_scripts_string_form_defaults_inject_and_bundle_name() {
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "architect": {
+                        "build": {
+                            "options": {
+                                "outputPath": "dist",
+                                "tsConfig": "tsconfig.json",
+                                "scripts": ["src/global.js"]
+                            }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let result = resolve_angular_project(f.path(), None, None).unwrap();
+        assert_eq!(result.scripts.len(), 1);
+        let bundle = &result.scripts[0];
+        assert_eq!(bundle.name, "scripts");
+        assert!(bundle.inject);
+        assert_eq!(bundle.sources.len(), 1);
+        assert!(bundle.sources[0].ends_with("src/global.js"));
+    }
+
+    #[test]
+    fn test_parse_scripts_object_form_with_bundle_name_and_inject_false() {
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "architect": {
+                        "build": {
+                            "options": {
+                                "outputPath": "dist",
+                                "tsConfig": "tsconfig.json",
+                                "scripts": [
+                                    { "input": "src/lazy.js", "inject": false, "bundleName": "lazy" }
+                                ]
+                            }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let result = resolve_angular_project(f.path(), None, None).unwrap();
+        assert_eq!(result.scripts.len(), 1);
+        let bundle = &result.scripts[0];
+        assert_eq!(bundle.name, "lazy");
+        assert!(!bundle.inject);
+        assert!(bundle.sources[0].ends_with("src/lazy.js"));
+    }
+
+    #[test]
+    fn test_parse_scripts_groups_shared_bundle_name() {
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "architect": {
+                        "build": {
+                            "options": {
+                                "outputPath": "dist",
+                                "tsConfig": "tsconfig.json",
+                                "scripts": [
+                                    "src/a.js",
+                                    { "input": "src/b.js", "bundleName": "scripts" },
+                                    { "input": "node_modules/web-vitals/dist/web-vitals.iife.js", "bundleName": "vitals" }
+                                ]
+                            }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let result = resolve_angular_project(f.path(), None, None).unwrap();
+        assert_eq!(result.scripts.len(), 2);
+        let scripts_bundle = result
+            .scripts
+            .iter()
+            .find(|b| b.name == "scripts")
+            .expect("scripts bundle present");
+        assert_eq!(scripts_bundle.sources.len(), 2);
+        assert!(scripts_bundle.sources[0].ends_with("src/a.js"));
+        assert!(scripts_bundle.sources[1].ends_with("src/b.js"));
+        let vitals = result
+            .scripts
+            .iter()
+            .find(|b| b.name == "vitals")
+            .expect("vitals bundle present");
+        assert_eq!(vitals.sources.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_scripts_omitted_field_yields_empty_vec() {
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "architect": {
+                        "build": {
+                            "options": {
+                                "outputPath": "dist",
+                                "tsConfig": "tsconfig.json"
+                            }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let result = resolve_angular_project(f.path(), None, None).unwrap();
+        assert!(result.scripts.is_empty());
     }
 
     #[test]

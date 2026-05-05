@@ -18,6 +18,7 @@ mod incremental;
 mod localize;
 mod ngsw;
 mod polyfills;
+mod scripts;
 mod serve_cmd;
 mod watch_cmd;
 
@@ -1014,14 +1015,34 @@ pub(crate) fn run_build_with_cache(
         }
     }
 
+    // Step 10.5: Emit global script bundles. Concatenate each `scripts`
+    // entry's contents per `bundleName` and write `<name>.js` to the
+    // output directory; the index.html step picks the inject flag back
+    // up below.
+    let mut emitted_scripts: Vec<scripts::EmittedScriptBundle> = Vec::new();
+    if let Some(ref ap) = angular_project {
+        if !ap.scripts.is_empty() {
+            let (emitted, paths) =
+                scripts::emit_script_bundles(&ap.scripts, &out_dir, bundle_options)?;
+            emitted_scripts = emitted;
+            output_files.extend(paths);
+        }
+    }
+
     // Step 11: Generate index.html
     if let Some(ref ap) = angular_project {
         if let Some(ref index_path) = ap.index_html {
+            let inject_scripts: Vec<&str> = emitted_scripts
+                .iter()
+                .filter(|s| s.inject)
+                .map(|s| s.filename.as_str())
+                .collect();
             let index_opts = IndexHtmlOptions {
                 base_href: ap.base_href.as_deref(),
                 deploy_url: ap.deploy_url.as_deref(),
                 cross_origin: ap.cross_origin,
                 subresource_integrity: ap.subresource_integrity,
+                scripts: &inject_scripts,
             };
             let path = generate_index_html(
                 index_path,
@@ -1932,6 +1953,12 @@ struct IndexHtmlOptions<'a> {
     /// When true, compute SHA-384 integrity hashes of emitted artifacts and
     /// inject `integrity="sha384-..."` attributes on the tags that load them.
     subresource_integrity: bool,
+    /// Filenames of global script bundles that opted into injection
+    /// (`scripts` entries with `inject: true`). Each entry produces a
+    /// `<script defer src="…">` tag emitted before the application's
+    /// module script so the global runs synchronously on parse and
+    /// finishes before the app boots.
+    scripts: &'a [&'a str],
 }
 
 /// Read source index.html, inject stylesheet and script tags, write to out_dir.
@@ -1985,7 +2012,27 @@ fn generate_index_html(
     }
 
     // Inject script tags before </body>
-    let mut scripts = String::new();
+    let mut script_tags = String::new();
+
+    // Global `scripts` array entries: emitted as `<script defer>` so they
+    // execute in document order before module evaluation, matching
+    // `@angular/build:application`.
+    for script_filename in options.scripts {
+        let src = format!("{deploy_url}{script_filename}");
+        let integrity = if options.subresource_integrity {
+            Some(compute_sri_hash(&out_dir.join(script_filename))?)
+        } else {
+            None
+        };
+        let integrity_attr = integrity
+            .as_deref()
+            .map(|i| format!(" integrity=\"{i}\""))
+            .unwrap_or_default();
+        script_tags.push_str(&format!(
+            "  <script src=\"{src}\" defer{crossorigin_attr}{integrity_attr}></script>\n"
+        ));
+    }
+
     if let Some(polyfills) = polyfills_filename {
         let src = format!("{deploy_url}{polyfills}");
         let integrity = if options.subresource_integrity {
@@ -1997,7 +2044,7 @@ fn generate_index_html(
             .as_deref()
             .map(|i| format!(" integrity=\"{i}\""))
             .unwrap_or_default();
-        scripts.push_str(&format!(
+        script_tags.push_str(&format!(
             "  <script src=\"{src}\" type=\"module\"{crossorigin_attr}{integrity_attr}></script>\n"
         ));
     }
@@ -2012,11 +2059,11 @@ fn generate_index_html(
             .as_deref()
             .map(|i| format!(" integrity=\"{i}\""))
             .unwrap_or_default();
-        scripts.push_str(&format!(
+        script_tags.push_str(&format!(
             "  <script src=\"{src}\" type=\"module\"{crossorigin_attr}{integrity_attr}></script>\n"
         ));
     }
-    html = html.replace("</body>", &format!("{scripts}</body>"));
+    html = html.replace("</body>", &format!("{script_tags}</body>"));
 
     let path = out_dir.join(output_filename);
     std::fs::write(&path, &html).map_err(|e| NgcError::Io {
@@ -2644,6 +2691,47 @@ mod tests {
     }
 
     #[test]
+    fn test_index_html_global_scripts_injected_with_defer() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let index_src = dir.path().join("index.html");
+        std::fs::write(
+            &index_src,
+            "<!doctype html>\n<html>\n<head>\n</head>\n<body>\n  <app-root></app-root>\n</body>\n</html>\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("main.js"), "").unwrap();
+        std::fs::write(dir.path().join("scripts.js"), "").unwrap();
+        std::fs::write(dir.path().join("vitals.js"), "").unwrap();
+        let injected = ["scripts.js", "vitals.js"];
+        let opts = IndexHtmlOptions {
+            scripts: &injected,
+            ..IndexHtmlOptions::default()
+        };
+        let out = generate_index_html(
+            &index_src,
+            "index.html",
+            false,
+            None,
+            dir.path(),
+            "main.js",
+            &opts,
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(out).unwrap();
+        assert!(content.contains(r#"<script src="scripts.js" defer></script>"#));
+        assert!(content.contains(r#"<script src="vitals.js" defer></script>"#));
+        assert!(content.contains(r#"<script src="main.js" type="module"></script>"#));
+        // Globals must precede the module entry so they execute first.
+        let globals_pos = content
+            .find(r#"<script src="scripts.js" defer></script>"#)
+            .unwrap();
+        let main_pos = content
+            .find(r#"<script src="main.js" type="module"></script>"#)
+            .unwrap();
+        assert!(globals_pos < main_pos);
+    }
+
+    #[test]
     fn test_index_html_no_styles_no_polyfills() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let index_src = dir.path().join("index.html");
@@ -2834,6 +2922,7 @@ mod tests {
             deploy_url: Some("https://cdn.example.com/"),
             cross_origin: CrossOrigin::Anonymous,
             subresource_integrity: true,
+            ..IndexHtmlOptions::default()
         };
         let out = generate_index_html(
             &index_src,
