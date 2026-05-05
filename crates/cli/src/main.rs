@@ -868,16 +868,31 @@ pub(crate) fn run_build_with_cache(
         }
     }
 
-    // Production-only: substitute Angular's build-time flags with their
-    // literal values so the minifier can dead-code-eliminate `if (ngDevMode)`
-    // branches throughout `@angular/core` and friends. Replaces the runtime
-    // `globalThis.ngDevMode = false` prologue from earlier ngc-rs versions.
-    if configuration == Some("production") {
+    // Build the active define map:
+    //   * Production builds seed with the ngc-rs built-ins (`ngDevMode = false`,
+    //     etc.) so the minifier can dead-code-eliminate `if (ngDevMode)`
+    //     branches throughout `@angular/core` and friends. This replaces the
+    //     runtime `globalThis.ngDevMode = false` prologue from earlier
+    //     ngc-rs versions.
+    //   * `define` entries from `angular.json` are then layered on top —
+    //     user values override built-ins on collision (with a warning).
+    //   * Non-production builds get only the user-supplied entries, matching
+    //     `@angular/build:application`'s behaviour.
+    let mut define_map = if configuration == Some("production") {
+        ngc_ts_transform::DefineMap::production_angular()
+    } else {
+        ngc_ts_transform::DefineMap::new()
+    };
+    if let Some(ap) = angular_project.as_ref() {
+        if !ap.define.is_empty() {
+            define_map.merge_overriding(ngc_ts_transform::DefineMap::from_map(
+                ap.define.iter().map(|(k, v)| (k.clone(), v.clone())),
+            ));
+        }
+    }
+    if !define_map.is_empty() {
         let define_span = tracing::info_span!("define_substitution").entered();
-        ngc_ts_transform::apply_defines_to_modules(
-            &mut modules,
-            &ngc_ts_transform::DefineMap::production_angular(),
-        );
+        ngc_ts_transform::apply_defines_to_modules(&mut modules, &define_map);
         drop(define_span);
     }
 
@@ -974,6 +989,7 @@ pub(crate) fn run_build_with_cache(
                 &config_dir,
                 bundle_options,
                 configuration,
+                &ap.define,
             )?;
             polyfills_filename = Some(bundle.filename);
             output_files.extend(bundle.output_files);

@@ -35,12 +35,18 @@ pub struct PolyfillsBundle {
 /// - Relative paths (e.g. `src/polyfills.ts`) are resolved against
 ///   `project_root`, transformed through `ts-transform`, and their imports
 ///   recursively followed (relative or bare).
+///
+/// `user_defines` carries the resolved `define` map from `angular.json`; it
+/// is layered on top of ngc-rs's built-in production flags (in production
+/// builds) and applied to the polyfill graph too, so a user define like
+/// `__BUILD_VERSION__` resolves the same way in polyfill code as in app code.
 pub fn generate_polyfills(
     polyfills: &[String],
     out_dir: &Path,
     project_root: &Path,
     bundle_options: BundleOptions,
     configuration: Option<&str>,
+    user_defines: &std::collections::HashMap<String, String>,
 ) -> NgcResult<PolyfillsBundle> {
     let export_conditions =
         ngc_npm_resolver::package_json::conditions_for_configuration(configuration);
@@ -226,12 +232,21 @@ pub fn generate_polyfills(
 
     // Substitute Angular's build-time flags so any dev-only branches reachable
     // from the polyfill graph (e.g. zone.js' development guards) are dropped
-    // by the minifier.
-    if configuration == Some("production") {
-        ngc_ts_transform::apply_defines_to_modules(
-            &mut modules,
-            &ngc_ts_transform::DefineMap::production_angular(),
-        );
+    // by the minifier. User-supplied `define` entries from `angular.json`
+    // are layered on top so polyfill code sees the same substitutions as
+    // app code.
+    let mut polyfill_defines = if configuration == Some("production") {
+        ngc_ts_transform::DefineMap::production_angular()
+    } else {
+        ngc_ts_transform::DefineMap::new()
+    };
+    if !user_defines.is_empty() {
+        polyfill_defines.merge_overriding(ngc_ts_transform::DefineMap::from_map(
+            user_defines.iter().map(|(k, v)| (k.clone(), v.clone())),
+        ));
+    }
+    if !polyfill_defines.is_empty() {
+        ngc_ts_transform::apply_defines_to_modules(&mut modules, &polyfill_defines);
     }
 
     // Phase 5: bundle. Disable content-hashing inside the bundler — the
@@ -455,6 +470,7 @@ mod tests {
             &project_root,
             BundleOptions::default(),
             None,
+            &HashMap::new(),
         )
         .unwrap();
 
@@ -496,6 +512,7 @@ mod tests {
             &project_root,
             BundleOptions::default(),
             None,
+            &HashMap::new(),
         )
         .unwrap();
 
@@ -552,6 +569,7 @@ mod tests {
             &project_root,
             BundleOptions::default(),
             None,
+            &HashMap::new(),
         )
         .unwrap();
 
@@ -601,6 +619,7 @@ mod tests {
             &project_root,
             opts,
             None,
+            &HashMap::new(),
         )
         .unwrap();
         assert!(result.filename.starts_with("polyfills."));

@@ -150,6 +150,12 @@ pub struct RawBuildOptions {
     pub ngsw_config_path: Option<String>,
     /// Per-bundle and per-initial size budgets.
     pub budgets: Option<Vec<RawBudget>>,
+    /// Build-time string-replacement map. Each value is a raw JS source
+    /// fragment (e.g. `"\"https://api.example.com\""` for a string literal,
+    /// `"42"` for a number, `"true"` for a boolean). Mirrors the `define`
+    /// option of `@angular/build:application`, which itself mirrors
+    /// esbuild's `--define`.
+    pub define: Option<HashMap<String, String>>,
 }
 
 /// One entry in `architect.build.options.budgets` (or in a per-configuration
@@ -339,6 +345,10 @@ pub struct RawBuildConfiguration {
     /// Override for `budgets` — typically only set in the `production`
     /// configuration (development builds usually have no size limits).
     pub budgets: Option<Vec<RawBudget>>,
+    /// Override for `define`. Per-configuration entries are layered on top
+    /// of the base `define` map: same-key entries replace the base value,
+    /// keys that appear only in the base are preserved.
+    pub define: Option<HashMap<String, String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -449,6 +459,11 @@ pub struct ResolvedAngularProject {
     /// the active configuration. Honoured by the bundler in production
     /// builds; ignored otherwise.
     pub budgets: Vec<ResolvedBudget>,
+    /// Resolved `define` map (base options merged with the active
+    /// configuration's overrides). Each value is a raw JS source fragment
+    /// — see [`RawBuildOptions::define`] for the encoding. Empty when no
+    /// `define` block is declared.
+    pub define: HashMap<String, String>,
 }
 
 /// Type of a resolved size budget.
@@ -735,6 +750,16 @@ pub fn resolve_angular_project(
         .map(|list| resolve_budgets(list))
         .unwrap_or_default();
 
+    // Merge `define`: start from base options, then layer the active
+    // configuration's overrides on top (same-key entries replace).
+    let mut define: HashMap<String, String> =
+        options.and_then(|o| o.define.clone()).unwrap_or_default();
+    if let Some(overrides) = build_config.and_then(|bc| bc.define.as_ref()) {
+        for (k, v) in overrides {
+            define.insert(k.clone(), v.clone());
+        }
+    }
+
     debug!(
         project = %name,
         output_path = %output_path.display(),
@@ -764,6 +789,7 @@ pub fn resolve_angular_project(
         service_worker,
         ngsw_config_path,
         budgets,
+        define,
     })
 }
 
@@ -1473,6 +1499,97 @@ mod tests {
         assert!(!result.service_worker);
         // Path defaults to <base_dir>/ngsw-config.json even when sw is off.
         assert!(result.ngsw_config_path.ends_with("ngsw-config.json"));
+    }
+
+    #[test]
+    fn test_parse_define_base_options() {
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "architect": {
+                        "build": {
+                            "options": {
+                                "outputPath": "dist",
+                                "tsConfig": "tsconfig.json",
+                                "define": {
+                                    "__APP_API_URL__": "\"https://api.example.com\"",
+                                    "__BUILD_VERSION__": "\"1.0.0\""
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let result = resolve_angular_project(f.path(), None, None).unwrap();
+        assert_eq!(
+            result.define.get("__APP_API_URL__").map(String::as_str),
+            Some("\"https://api.example.com\"")
+        );
+        assert_eq!(
+            result.define.get("__BUILD_VERSION__").map(String::as_str),
+            Some("\"1.0.0\"")
+        );
+    }
+
+    #[test]
+    fn test_define_configuration_overrides_base() {
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "architect": {
+                        "build": {
+                            "options": {
+                                "outputPath": "dist",
+                                "tsConfig": "tsconfig.json",
+                                "define": {
+                                    "__API__": "\"dev\"",
+                                    "__SHARED__": "true"
+                                }
+                            },
+                            "configurations": {
+                                "production": {
+                                    "define": {
+                                        "__API__": "\"prod\""
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let result = resolve_angular_project(f.path(), None, Some("production")).unwrap();
+        // Configuration overrides win for collisions.
+        assert_eq!(
+            result.define.get("__API__").map(String::as_str),
+            Some("\"prod\"")
+        );
+        // Base-only entries are preserved.
+        assert_eq!(
+            result.define.get("__SHARED__").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn test_define_defaults_to_empty_when_absent() {
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "architect": {
+                        "build": {
+                            "options": { "outputPath": "dist", "tsConfig": "tsconfig.json" }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let result = resolve_angular_project(f.path(), None, None).unwrap();
+        assert!(result.define.is_empty());
     }
 
     #[test]
