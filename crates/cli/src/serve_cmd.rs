@@ -33,8 +33,17 @@ pub fn run(
     host: &str,
     port: u16,
     open: bool,
+    serve_path: Option<&str>,
 ) -> NgcResult<()> {
-    run_with_stop(project, configuration, host, port, open, install_ctrlc)
+    run_with_stop(
+        project,
+        configuration,
+        host,
+        port,
+        open,
+        serve_path,
+        install_ctrlc,
+    )
 }
 
 /// Variant of [`run`] that lets the caller decide how the shutdown flag is
@@ -47,13 +56,25 @@ pub(crate) fn run_with_stop(
     host: &str,
     port: u16,
     open: bool,
+    serve_path: Option<&str>,
     install_stop: impl FnOnce(Arc<AtomicBool>),
 ) -> NgcResult<()> {
     let out_dir = crate::resolve_out_dir(project, None, configuration)?;
     let mut cache = BuildCache::new();
 
-    let initial =
-        crate::run_build_with_cache(project, None, configuration, false, Some(&mut cache))?;
+    // Normalize the user-supplied servePath up-front so the dev server
+    // mount and the index.html `<base href>` fallback agree on the
+    // canonical `/foo/` form (see `ngc_dev_server::normalize_serve_path`).
+    let normalized_serve_path = serve_path.and_then(ngc_dev_server::normalize_serve_path);
+
+    let initial = crate::run_build_with_options(
+        project,
+        None,
+        configuration,
+        false,
+        Some(&mut cache),
+        normalized_serve_path.as_deref(),
+    )?;
     eprintln!(
         "{} {} module(s), {} file(s)",
         "ngc-rs build complete".bold().green(),
@@ -64,9 +85,13 @@ pub(crate) fn run_with_stop(
     let (event_tx, event_rx) = channel::<DevServerEvent>();
     let cfg = DevServerConfig::new(&out_dir)
         .with_host(host.to_string())
-        .with_port(port);
+        .with_port(port)
+        .with_serve_path(normalized_serve_path.as_deref());
     let server = DevServer::start(cfg, event_rx)?;
-    let url = format!("http://{}", server.addr());
+    let url = match server.serve_path() {
+        Some(prefix) => format!("http://{}{}", server.addr(), prefix),
+        None => format!("http://{}", server.addr()),
+    };
     eprintln!(
         "{} {}",
         "ngc-rs serve listening on".bold().green(),
@@ -85,6 +110,7 @@ pub(crate) fn run_with_stop(
     let watcher = Watcher::new(WatcherConfig::new(watch_root(project)));
     let project_path = project.to_path_buf();
     let configuration_owned = configuration.map(|s| s.to_string());
+    let serve_path_owned = normalized_serve_path.clone();
 
     let build_fn = move |dirty: &[PathBuf]| -> NgcResult<()> {
         if dirty.iter().any(|p| !is_ts_path(p)) {
@@ -92,12 +118,13 @@ pub(crate) fn run_with_stop(
         } else {
             cache.invalidate(dirty);
         }
-        let outcome = crate::run_build_with_cache(
+        let outcome = crate::run_build_with_options(
             &project_path,
             None,
             configuration_owned.as_deref(),
             false,
             Some(&mut cache),
+            serve_path_owned.as_deref(),
         );
         match outcome {
             Ok(result) => {

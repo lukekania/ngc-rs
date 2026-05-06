@@ -76,7 +76,14 @@ fn serve_help_lists_all_flags() {
         .expect("spawn ngc-rs serve --help");
     assert!(out.status.success(), "serve --help should exit 0");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for flag in ["--project", "--configuration", "--port", "--host", "--open"] {
+    for flag in [
+        "--project",
+        "--configuration",
+        "--port",
+        "--host",
+        "--open",
+        "--serve-path",
+    ] {
         assert!(
             stdout.contains(flag),
             "serve --help missing {flag}, got: {stdout}"
@@ -257,6 +264,128 @@ fn serve_lists_index_and_emits_reload() {
         reload_observed,
         "SSE channel should have emitted a reload event after rebuild"
     );
+}
+
+#[test]
+fn serve_path_mounts_under_prefix_and_404s_root() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().canonicalize().expect("canonicalize root");
+    write_fixture(&root);
+
+    let bin = env!("CARGO_BIN_EXE_ngc-rs");
+    let tsconfig = root.join("tsconfig.json");
+
+    let mut child = Command::new(bin)
+        .args(["serve", "--project"])
+        .arg(&tsconfig)
+        .args([
+            "--port",
+            "0",
+            "--host",
+            "127.0.0.1",
+            "--serve-path",
+            "/admin/",
+        ])
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn ngc-rs serve");
+
+    let stderr = child.stderr.take().expect("stderr pipe");
+    let reader = BufReader::new(stderr);
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let stderr_handle = std::thread::spawn(move || {
+        for line in reader.lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let deadline = Instant::now() + TIMEOUT;
+    let ready_line = match wait_for(&rx, READY_MARKER, deadline) {
+        Some(l) => l,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("serve never reported ready within {TIMEOUT:?}");
+        }
+    };
+
+    // The printed URL must include the prefix so users can copy it.
+    assert!(
+        ready_line.contains("/admin/"),
+        "ready line missing servePath, got: {ready_line}"
+    );
+
+    let addr = match extract_addr(&ready_line) {
+        Some(a) => a,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("could not parse address from ready line: {ready_line}");
+        }
+    };
+
+    let dist = root.join("dist");
+    fs::create_dir_all(&dist).expect("create dist");
+    fs::write(
+        dist.join("index.html"),
+        "<!doctype html><html><body><h1>hello</h1></body></html>",
+    )
+    .expect("write index.html");
+
+    let prefixed = http_status(&addr, "/admin/").expect("status under prefix");
+    let body = http_get(&addr, "/admin/").expect("body under prefix");
+    let deep = http_status(&addr, "/admin/users/42").expect("deep link");
+    let root_status = http_status(&addr, "/").expect("status at /");
+    let sse_status = http_status_only(&addr, "/admin/__ngc_reload").expect("SSE under prefix");
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = stderr_handle.join();
+
+    assert_eq!(prefixed, 200, "prefix root should serve index");
+    assert!(
+        body.contains("<h1>hello</h1>") && body.contains("'/admin/__ngc_reload'"),
+        "prefix body missing index or rewritten EventSource URL: {body}"
+    );
+    assert_eq!(deep, 200, "deep link should fall back to index");
+    assert_eq!(root_status, 404, "root should 404 when servePath is set");
+    assert_eq!(sse_status, 200, "SSE channel must be mounted under prefix");
+}
+
+/// Issue an HTTP/1.1 GET and return only the response status code.
+fn http_status(addr: &str, path: &str) -> std::io::Result<u16> {
+    let mut stream = TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes())?;
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line)?;
+    Ok(status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0))
+}
+
+/// Issue an HTTP/1.1 GET that closes the socket as soon as headers are
+/// drained. Used for SSE checks where waiting for body close would block.
+fn http_status_only(addr: &str, path: &str) -> std::io::Result<u16> {
+    let mut stream = TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n\r\n");
+    stream.write_all(req.as_bytes())?;
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line)?;
+    Ok(status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0))
 }
 
 /// Issue a minimal HTTP/1.1 GET against `addr` and return the response
