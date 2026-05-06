@@ -189,11 +189,6 @@ export function translateOptions(
       'Selecting a locale subset via `localize` array is not yet honoured by ngc-rs; all locales declared in `angular.json` `i18n.locales` are emitted.',
     );
   }
-  if (raw.define && Object.keys(raw.define).length > 0) {
-    warnings.push(
-      'The `define` option is accepted for schema compatibility but engine-side substitution is being added in a parallel change; values are silently ignored until that lands.',
-    );
-  }
   if (raw.stylePreprocessorOptions) {
     const opts = raw.stylePreprocessorOptions as json.JsonObject;
     const includePaths = opts['includePaths'];

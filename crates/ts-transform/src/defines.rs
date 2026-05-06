@@ -25,27 +25,76 @@ use rayon::prelude::*;
 /// Map of identifier name → replacement source text.
 ///
 /// Values are raw JavaScript source fragments (typically literals like
-/// `"false"`) spliced verbatim into the output.
+/// `"false"` or `"\"https://api.example.com\""`) spliced verbatim into the
+/// output. The strings are owned so the map can carry user-supplied values
+/// loaded from `angular.json` at runtime, not just `&'static` built-ins.
 #[derive(Debug, Clone, Default)]
 pub struct DefineMap {
-    entries: HashMap<String, &'static str>,
+    entries: HashMap<String, String>,
 }
 
 impl DefineMap {
+    /// Create an empty map.
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn insert(&mut self, name: impl Into<String>, value: &'static str) {
-        self.entries.insert(name.into(), value);
+    /// Insert a single replacement, overwriting any existing entry for `name`.
+    pub fn insert(&mut self, name: impl Into<String>, value: impl Into<String>) {
+        self.entries.insert(name.into(), value.into());
     }
 
-    pub fn get(&self, name: &str) -> Option<&'static str> {
-        self.entries.get(name).copied()
+    /// Look up the replacement source text for `name`, if any.
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.entries.get(name).map(String::as_str)
     }
 
+    /// Whether the map has no entries (used to short-circuit the substitution
+    /// pass entirely on no-op runs).
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Number of entries in the map.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Build a [`DefineMap`] from an arbitrary `name → value` map. Values are
+    /// raw JS source fragments — pass `"42"`, `"true"`, `"\"https://x\""`, or
+    /// `"{\"k\":1}"` rather than the unquoted Rust strings.
+    pub fn from_map<I, K, V>(entries: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let mut map = Self::new();
+        for (k, v) in entries {
+            map.insert(k, v);
+        }
+        map
+    }
+
+    /// Merge `other` into `self`. Entries in `other` overwrite existing
+    /// entries with the same key; collisions are reported via
+    /// [`tracing::warn`] so an `angular.json` define that shadows one of
+    /// ngc-rs's built-in flags (`ngDevMode`, `ngI18nClosureMode`,
+    /// `ngJitMode`) is visible in the build log.
+    pub fn merge_overriding(&mut self, other: DefineMap) {
+        for (key, value) in other.entries {
+            if let Some(existing) = self.entries.get(&key) {
+                if existing != &value {
+                    tracing::warn!(
+                        define = %key,
+                        builtin = %existing,
+                        user = %value,
+                        "user-supplied `define` overrides ngc-rs built-in flag"
+                    );
+                }
+            }
+            self.entries.insert(key, value);
+        }
     }
 
     /// Defines applied to Angular production builds. Lowering these to literal
@@ -134,7 +183,7 @@ pub fn apply_defines_to_modules(modules: &mut HashMap<PathBuf, String>, defines:
 struct Collector<'a, 'b> {
     scoping: &'b Scoping,
     defines: &'b DefineMap,
-    replacements: Vec<(u32, u32, &'static str)>,
+    replacements: Vec<(u32, u32, &'b str)>,
     _marker: std::marker::PhantomData<&'a ()>,
 }
 
@@ -149,7 +198,7 @@ impl<'a, 'b> Collector<'a, 'b> {
     }
 }
 
-impl<'a> Visit<'a> for Collector<'a, '_> {
+impl<'a, 'b> Visit<'a> for Collector<'a, 'b> {
     fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
         let Some(replacement) = self.defines.get(it.name.as_str()) else {
             return;
@@ -311,5 +360,94 @@ mod tests {
         let defines = defines();
         let c = Collector::new(semantic.scoping(), &defines);
         assert!(c.replacements.is_empty());
+    }
+
+    // ----- User-supplied define support (issue #137) -----
+
+    #[test]
+    fn user_string_literal_value_is_substituted_verbatim() {
+        // `angular.json` value is a JSON string: `"\"https://api.example.com\""`.
+        // The outer quotes are part of the replacement source text so the
+        // resulting JS contains a string literal.
+        let map = DefineMap::from_map([("__APP_API_URL__", "\"https://api.example.com\"")]);
+        let src = "console.log(__APP_API_URL__);\n";
+        let out = apply_defines(src, "in.js", &map);
+        assert_eq!(out, "console.log(\"https://api.example.com\");\n");
+    }
+
+    #[test]
+    fn user_number_value_is_substituted_verbatim() {
+        let map = DefineMap::from_map([("__BUILD_NUMBER__", "42")]);
+        let src = "const n = __BUILD_NUMBER__;\n";
+        let out = apply_defines(src, "in.js", &map);
+        assert_eq!(out, "const n = 42;\n");
+    }
+
+    #[test]
+    fn user_boolean_value_is_substituted_verbatim() {
+        let map = DefineMap::from_map([("__FEATURE_X__", "true")]);
+        let src = "if (__FEATURE_X__) {}\n";
+        let out = apply_defines(src, "in.js", &map);
+        assert_eq!(out, "if (true) {}\n");
+    }
+
+    #[test]
+    fn user_json_object_value_is_substituted_verbatim() {
+        let map = DefineMap::from_map([("__CFG__", "{\"k\":1}")]);
+        let src = "const c = __CFG__;\n";
+        let out = apply_defines(src, "in.js", &map);
+        assert_eq!(out, "const c = {\"k\":1};\n");
+    }
+
+    #[test]
+    fn merge_overriding_user_value_wins() {
+        // User's `ngDevMode` (= `true`) overrides the production_angular
+        // built-in (= `false`). The collision triggers a tracing warning,
+        // but here we just assert the resulting substitution.
+        let mut map = DefineMap::production_angular();
+        map.merge_overriding(DefineMap::from_map([("ngDevMode", "true")]));
+        let src = "if (ngDevMode) { 'a'; }\n";
+        let out = apply_defines(src, "in.js", &map);
+        assert_eq!(out, "if (true) { 'a'; }\n");
+    }
+
+    #[test]
+    fn merge_overriding_keeps_unrelated_builtins() {
+        let mut map = DefineMap::production_angular();
+        map.merge_overriding(DefineMap::from_map([("__FOO__", "1")]));
+        // Built-ins still in place.
+        let src = "if (ngI18nClosureMode) {}\n";
+        let out = apply_defines(src, "in.js", &map);
+        assert_eq!(out, "if (false) {}\n");
+        // User entry took effect too.
+        let src = "const f = __FOO__;\n";
+        let out = apply_defines(src, "in.js", &map);
+        assert_eq!(out, "const f = 1;\n");
+    }
+
+    #[test]
+    fn merge_overriding_same_value_is_a_noop() {
+        // Re-defining a built-in to the same value shouldn't change behaviour;
+        // (and the warning path checks `existing != value`, so it stays quiet).
+        let mut map = DefineMap::production_angular();
+        map.merge_overriding(DefineMap::from_map([("ngDevMode", "false")]));
+        let src = "if (ngDevMode) {}\n";
+        let out = apply_defines(src, "in.js", &map);
+        assert_eq!(out, "if (false) {}\n");
+    }
+
+    #[test]
+    fn from_map_empty_iterator_is_empty() {
+        let map = DefineMap::from_map(std::iter::empty::<(String, String)>());
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn len_reports_entry_count() {
+        let mut map = DefineMap::new();
+        assert_eq!(map.len(), 0);
+        map.insert("A", "1");
+        map.insert("B", "2");
+        assert_eq!(map.len(), 2);
     }
 }
