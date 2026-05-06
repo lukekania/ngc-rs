@@ -71,8 +71,8 @@ export interface TranslatedBuildArgs {
 }
 
 /// Thrown when an option is set in a way ngc-rs cannot honor (e.g. SSR
-/// fields, scripts array, watch=true). The builder turns this into a
-/// `BuilderOutput` with `success: false` and surfaces the message.
+/// fields, watch=true). The builder turns this into a `BuilderOutput`
+/// with `success: false` and surfaces the message.
 export class OptionTranslationError extends Error {
   constructor(message: string) {
     super(message);
@@ -94,11 +94,6 @@ export function translateOptions(
   const warnings: string[] = [];
 
   // Hard rejections — anything ngc-rs cannot do at all.
-  if (raw.scripts && Array.isArray(raw.scripts) && raw.scripts.length > 0) {
-    throw new OptionTranslationError(
-      'The `scripts` option (global script entries) is not yet supported by ngc-rs build. Move script imports into your application code, or open an issue to request the feature.',
-    );
-  }
   if (raw.watch === true) {
     throw new OptionTranslationError(
       '`watch: true` on the application builder is not supported. Use the `@ngc-rs/builder:dev-server` builder for incremental rebuilds.',
