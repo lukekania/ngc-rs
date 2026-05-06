@@ -217,6 +217,11 @@
         "type": "object"
       }
     },
+    "define": {
+      "type": "object",
+      "description": "Build-time string-replacement map. Each value is a raw JS source fragment (matching esbuild and @angular/build:application semantics): `\"\\\"https://api.example.com\\\"\"` produces a string literal, `\"42\"` a number, `\"true\"` a boolean. Read from angular.json by ngc-rs.",
+      "additionalProperties": { "type": "string" }
+    },
     "externalDependencies": {
       "type": "array",
       "description": "Modules to keep external (not bundled). Accepted for compatibility but currently ignored by ngc-rs.",

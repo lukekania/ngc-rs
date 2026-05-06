@@ -144,4 +144,21 @@ describe('translateOptions (build)', () => {
     const i = t.args.indexOf('--project');
     expect(t.args[i + 1]).toBe('tsconfig.json');
   });
+
+  it('accepts a `define` map without warnings (passed through via angular.json)', () => {
+    const t = translateOptions(
+      {
+        ...minimal,
+        define: {
+          __APP_API_URL__: '"https://api.example.com"',
+          __BUILD_VERSION__: '"1.0.0"',
+        },
+      },
+      '/ws',
+      null,
+    );
+    expect(t.warnings.some((w) => w.toLowerCase().includes('define'))).toBe(
+      false,
+    );
+  });
 });
