@@ -3304,14 +3304,14 @@ fn build_conditional_expr(
 ) -> String {
     let mut expr = format!(
         "{} ? {} : ",
-        ctx_expr_with_locals(condition, locals),
+        ctx_expr_with_locals(strip_block_alias(condition), locals),
         if_slot
     );
 
     for (cond, _fn_name, slot) in else_ifs {
         expr.push_str(&format!(
             "{} ? {} : ",
-            ctx_expr_with_locals(cond, locals),
+            ctx_expr_with_locals(strip_block_alias(cond), locals),
             slot
         ));
     }
@@ -3323,6 +3323,75 @@ fn build_conditional_expr(
     }
 
     expr
+}
+
+/// Strip the `; as <alias>` suffix from an `@if` / `@else if` control-flow
+/// expression so the codegen emits valid JavaScript for `ɵɵconditional(...)`.
+///
+/// Angular's grammar allows `@if (expr; as alias) { ... }` to expose the
+/// truthy value of `expr` as `alias` inside the body. The pest grammar
+/// captures the whole `expr; as alias` as a single condition string; without
+/// this strip the codegen emits `ɵɵconditional(expr; as alias ? slot : -1)`
+/// which is not valid JS and causes the bundler's tree-shake parse to fail.
+///
+/// Note: this is a Phase-1 fix that only stops the build from breaking. The
+/// alias binding itself (so `{{ alias.name }}` inside the body actually
+/// resolves at runtime) is tracked as a separate follow-up.
+fn strip_block_alias(condition: &str) -> &str {
+    let trimmed = condition.trim();
+    if let Some(idx) = find_alias_separator(trimmed) {
+        trimmed[..idx].trim()
+    } else {
+        trimmed
+    }
+}
+
+/// Find the byte index of the `;` that introduces an `as <alias>` clause in
+/// a control-flow condition, if one is present. Returns `None` for plain
+/// expressions that contain no alias.
+///
+/// Walks the string tracking string-literal and parenthesis depth so a
+/// semicolon that lives inside `'a; as b'` or `f('x; as y')` is not picked
+/// up. The alias clause only matches at the top level (paren depth 0).
+fn find_alias_separator(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut paren_depth: i32 = 0;
+    let mut in_string: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match in_string {
+            Some(quote) => {
+                if b == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if b == quote {
+                    in_string = None;
+                }
+            }
+            None => match b {
+                b'\'' | b'"' | b'`' => in_string = Some(b),
+                b'(' | b'[' | b'{' => paren_depth += 1,
+                b')' | b']' | b'}' => paren_depth -= 1,
+                b';' if paren_depth == 0 => {
+                    let rest = s[i + 1..].trim_start();
+                    if let Some(stripped) = rest.strip_prefix("as") {
+                        if stripped
+                            .chars()
+                            .next()
+                            .is_none_or(|c| c.is_whitespace() || c == '\t')
+                        {
+                            return Some(i);
+                        }
+                    }
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Format static attributes as an array expression.
@@ -3928,6 +3997,41 @@ fn decode_html_entities(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::extract::ExtractedComponent;
+
+    #[test]
+    fn strip_block_alias_handles_plain_expressions() {
+        assert_eq!(strip_block_alias("ctx.x"), "ctx.x");
+        assert_eq!(strip_block_alias("a && b"), "a && b");
+        assert_eq!(strip_block_alias("  state$ | async  "), "state$ | async");
+    }
+
+    #[test]
+    fn strip_block_alias_strips_top_level_alias() {
+        assert_eq!(strip_block_alias("item(); as it"), "item()");
+        assert_eq!(strip_block_alias("state$ | async; as s"), "state$ | async");
+        assert_eq!(strip_block_alias("foo;as bar"), "foo");
+        assert_eq!(strip_block_alias("foo ; as bar"), "foo");
+    }
+
+    #[test]
+    fn strip_block_alias_does_not_strip_alias_inside_strings() {
+        assert_eq!(strip_block_alias("'a; as b'"), "'a; as b'");
+        assert_eq!(strip_block_alias("f(\"; as b\")"), "f(\"; as b\")");
+        assert_eq!(strip_block_alias("`x; as y`"), "`x; as y`");
+    }
+
+    #[test]
+    fn strip_block_alias_does_not_strip_inside_parens() {
+        assert_eq!(strip_block_alias("f(a; as b)"), "f(a; as b)");
+        assert_eq!(strip_block_alias("(a; as b) || c"), "(a; as b) || c");
+    }
+
+    #[test]
+    fn strip_block_alias_only_matches_as_with_word_break() {
+        // `;asfoo` is not an alias clause — the `as` must be followed by
+        // whitespace.
+        assert_eq!(strip_block_alias("foo;ascending"), "foo;ascending");
+    }
 
     fn test_component() -> ExtractedComponent {
         ExtractedComponent {
