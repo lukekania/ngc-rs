@@ -276,6 +276,76 @@
         { "type": "array", "items": { "type": "string" } }
       ],
       "description": "Generate per-locale builds. When set to true ngc-rs is invoked with `--localize` and emits one output tree per `i18n.locales` entry in angular.json. Selecting a locale subset (array form) is NOT yet honoured by ngc-rs and logs a warning."
+    },
+    "inlineStyleLanguage": {
+      "type": "string",
+      "enum": ["css", "less", "sass", "scss"],
+      "description": "Stylesheet language for inline component styles. Read from angular.json by ngc-rs's preprocessor; SCSS / Sass / Less are supported via shelled-out preprocessing."
+    },
+    "stylePreprocessorOptions": {
+      "type": "object",
+      "properties": {
+        "includePaths": { "type": "array", "items": { "type": "string" } },
+        "sass": { "type": "object" }
+      },
+      "additionalProperties": false,
+      "description": "Options forwarded to the style preprocessor. Custom `includePaths` are NOT yet honoured by ngc-rs's preprocessor pipeline; setting them logs a warning."
+    },
+    "define": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Build-time global identifier replacement (e.g. `\"process.env.API_URL\": \"\\\"https://...\\\"\"`). Read from angular.json by ngc-rs; engine support is being landed alongside this declaration. Until that lands, values are silently ignored."
+    },
+    "conditions": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Custom package.json export conditions for module resolution. Accepted for schema compatibility but ngc-rs's resolver uses a fixed condition set; setting this logs a warning."
+    },
+    "loader": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Per-extension loader overrides (e.g. `{ \".svg\": \"text\" }`). NOT yet supported by ngc-rs. Setting this fails the build with a clear error."
+    },
+    "deleteOutputPath": {
+      "type": "boolean",
+      "description": "Whether to delete the output directory before each build. ngc-rs always cleans the output path; setting this to false logs a warning."
+    },
+    "clearScreen": {
+      "type": "boolean",
+      "description": "Whether to clear the terminal between watch-mode rebuilds. Accepted for compatibility; ngc-rs does not clear the screen."
+    },
+    "i18nDuplicateTranslation": {
+      "type": "string",
+      "enum": ["warning", "error", "ignore"],
+      "description": "Behaviour when a translation message id appears more than once. Accepted for schema compatibility; ngc-rs currently treats duplicates as warnings regardless of this setting."
+    },
+    "i18nMissingTranslation": {
+      "type": "string",
+      "enum": ["warning", "error", "ignore"],
+      "description": "Behaviour when a message has no translation in a target locale. Accepted for schema compatibility; ngc-rs currently treats missing translations as warnings regardless of this setting."
+    },
+    "poll": {
+      "type": "number",
+      "description": "Filesystem poll interval (ms) for watch mode. Application builder's watch mode is rejected by ngc-rs (use the `dev-server` builder); this option has no effect in `ng build`."
+    },
+    "security": {
+      "type": "object",
+      "properties": {
+        "autoCsp": { "oneOf": [{ "type": "boolean" }, { "type": "object" }] }
+      },
+      "additionalProperties": false,
+      "description": "Security-related output knobs (CSP auto-emission etc.). NOT yet supported by ngc-rs; setting `security.autoCsp` logs a warning."
+    },
+    "appShell": {
+      "oneOf": [
+        { "type": "boolean" },
+        { "type": "object" }
+      ],
+      "description": "App-shell prerender output. SSR-related; out of scope for ngc-rs v1. Setting this to a truthy value fails the build."
+    },
+    "webWorkerTsConfig": {
+      "type": "string",
+      "description": "Separate tsconfig for `new Worker(...)` bundles. NOT yet supported by ngc-rs (web workers are not detected by the bundler). Setting this fails the build."
     }
   },
   "additionalProperties": false

@@ -12,6 +12,8 @@ export interface DevServerOptions extends json.JsonObject {
   proxyConfig: string | null;
   project: string;
   ngcRsBinary: string | null;
+  define: { [key: string]: string } | null;
+  watch: boolean | null;
 }
 
 export interface TranslatedServeArgs {
