@@ -730,7 +730,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-bundler"
-version = "0.10.3"
+version = "0.10.4"
 dependencies = [
  "dashmap",
  "ngc-diagnostics",
@@ -755,7 +755,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-dev-server"
-version = "0.10.3"
+version = "0.10.4"
 dependencies = [
  "ngc-diagnostics",
  "serde_json",
@@ -766,7 +766,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-diagnostics"
-version = "0.10.3"
+version = "0.10.4"
 dependencies = [
  "serde_json",
  "thiserror",
@@ -774,7 +774,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-linker"
-version = "0.10.3"
+version = "0.10.4"
 dependencies = [
  "dashmap",
  "insta",
@@ -792,7 +792,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-npm-resolver"
-version = "0.10.3"
+version = "0.10.4"
 dependencies = [
  "dashmap",
  "ngc-diagnostics",
@@ -807,7 +807,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-project-resolver"
-version = "0.10.3"
+version = "0.10.4"
 dependencies = [
  "dashmap",
  "glob",
@@ -823,7 +823,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-rs"
-version = "0.10.3"
+version = "0.10.4"
 dependencies = [
  "base64",
  "clap",
@@ -857,7 +857,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-template-compiler"
-version = "0.10.3"
+version = "0.10.4"
 dependencies = [
  "insta",
  "ngc-diagnostics",
@@ -879,7 +879,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-ts-transform"
-version = "0.10.3"
+version = "0.10.4"
 dependencies = [
  "ngc-diagnostics",
  "oxc_allocator",
@@ -898,7 +898,7 @@ dependencies = [
 
 [[package]]
 name = "ngc-watch"
-version = "0.10.3"
+version = "0.10.4"
 dependencies = [
  "ngc-diagnostics",
  "notify",
