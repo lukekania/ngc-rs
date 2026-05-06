@@ -31,7 +31,6 @@ export interface ApplicationOptions extends json.JsonObject {
   preserveSymlinks: boolean | null;
   statsJson: boolean | null;
   budgets: json.JsonArray | null;
-  define: json.JsonObject | null;
   externalDependencies: string[] | null;
   allowedCommonJsDependencies: string[] | null;
   extractLicenses: boolean | null;
