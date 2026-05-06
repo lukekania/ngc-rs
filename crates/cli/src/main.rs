@@ -237,19 +237,50 @@ enum Commands {
         serve_path: Option<String>,
     },
     /// Extract translatable messages from every component template in the
-    /// project and emit a `messages.xlf` (XLIFF 1.2) file.
+    /// project and emit a translation file (XLIFF 2.0 by default; XLIFF 1.2
+    /// available via `--format xliff`).
     ExtractI18n {
         /// Path to tsconfig.json
         #[arg(long, default_value = "tsconfig.json")]
         project: PathBuf,
-        /// Output file path (defaults to `messages.xlf` in the project dir).
+        /// Output file path. Defaults to `messages.xlf` in the project
+        /// directory regardless of format — Angular tooling tolerates either
+        /// XLIFF dialect under the same `.xlf` extension.
         #[arg(long, short = 'o')]
         out_file: Option<PathBuf>,
-        /// Source locale recorded in the XLIFF `source-language` attribute.
-        /// Defaults to the value from `angular.json` or `"en-US"`.
+        /// Source locale recorded in the XLIFF root attribute (`srcLang`
+        /// for 2.0, `source-language` for 1.2). Defaults to the value from
+        /// `angular.json` or `"en-US"`.
         #[arg(long)]
         source_locale: Option<String>,
+        /// Output format. `xliff2` (the default) matches Angular's
+        /// `ng extract-i18n` default since v9; `xliff` emits the older 1.2
+        /// dialect for projects that haven't migrated their translators.
+        /// `json` and `arb` are accepted for forward-compatibility but
+        /// currently return a clear error.
+        #[arg(long, value_enum, default_value_t = ExtractFormat::Xliff2)]
+        format: ExtractFormat,
     },
+}
+
+/// Output format selector for `extract-i18n`. Matches the `--format` flag
+/// shape of `ng extract-i18n` so downstream tooling can pass through the
+/// same value verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "lowercase")]
+enum ExtractFormat {
+    /// XLIFF 1.2 — older Angular default, still widely used by translation
+    /// vendors that haven't migrated tooling.
+    Xliff,
+    /// XLIFF 2.0 — Angular's recommended format since v9 and the default
+    /// for `ng extract-i18n` with no `--format` flag.
+    Xliff2,
+    /// JSON — accepted for parity with `ng extract-i18n` but currently
+    /// rejected with a clear error (out of scope for this release).
+    Json,
+    /// ARB (Application Resource Bundle) — accepted for parity but
+    /// currently rejected with a clear error (out of scope for this release).
+    Arb,
 }
 
 fn main() {
@@ -321,7 +352,13 @@ fn main() {
             project,
             out_file,
             source_locale,
-        } => match run_extract_i18n(&project, out_file.as_deref(), source_locale.as_deref()) {
+            format,
+        } => match run_extract_i18n(
+            &project,
+            out_file.as_deref(),
+            source_locale.as_deref(),
+            format,
+        ) {
             Ok(report) => {
                 println!("{}", "ngc-rs i18n extraction complete".bold().green());
                 println!("  {:<16}{}", "Messages:".dimmed(), report.message_count);
@@ -1375,13 +1412,32 @@ struct ExtractI18nReport {
 }
 
 /// Walk every component file reachable from the tsconfig graph, collect
-/// translatable messages, and write a deduplicated `messages.xlf` to
-/// `out_file` (default: `<project_dir>/messages.xlf`).
+/// translatable messages, and write a deduplicated translation file to
+/// `out_file` (default: `<project_dir>/messages.xlf`). The output dialect
+/// is selected by `format` — XLIFF 2.0 (the new default) or XLIFF 1.2.
+/// JSON and ARB are accepted by the flag but rejected at this layer until
+/// emitters land in a follow-up parity:nice-to-have.
 fn run_extract_i18n(
     project: &Path,
     out_file: Option<&Path>,
     source_locale_override: Option<&str>,
+    format: ExtractFormat,
 ) -> NgcResult<ExtractI18nReport> {
+    match format {
+        ExtractFormat::Xliff | ExtractFormat::Xliff2 => {}
+        ExtractFormat::Json => {
+            return Err(NgcError::ConfigError {
+                message: "extract-i18n --format json is not yet supported (parity:nice-to-have)"
+                    .to_string(),
+            });
+        }
+        ExtractFormat::Arb => {
+            return Err(NgcError::ConfigError {
+                message: "extract-i18n --format arb is not yet supported (parity:nice-to-have)"
+                    .to_string(),
+            });
+        }
+    }
     let angular_project = find_and_resolve_angular_json(project, None)?;
     let tsconfig_path = angular_project
         .as_ref()
@@ -1423,7 +1479,12 @@ fn run_extract_i18n(
         })
         .unwrap_or_else(|| "en-US".to_string());
 
-    let xlf = build_xliff(&source_locale, &by_key);
+    let xlf = match format {
+        ExtractFormat::Xliff => build_xliff(&source_locale, &by_key),
+        ExtractFormat::Xliff2 => build_xliff_v2(&source_locale, &by_key),
+        // The Json/Arb arms returned early above; this branch is unreachable.
+        ExtractFormat::Json | ExtractFormat::Arb => unreachable!(),
+    };
 
     let project_dir = project.parent().unwrap_or(Path::new(".")).to_path_buf();
     let out_path = out_file
@@ -1506,6 +1567,63 @@ fn build_xliff(
         s.push_str("      </trans-unit>\n");
     }
     s.push_str("    </body>\n  </file>\n</xliff>\n");
+    s
+}
+
+/// Render a `BTreeMap<id, message>` as an XLIFF 2.0 document. The shape
+/// matches what `@angular/localize`'s own extractor produces — root
+/// `<xliff version="2.0" srcLang="...">`, one `<file id="ngi18n">`, each
+/// message a `<unit>` with optional `<notes>` and a single `<segment>`
+/// containing only `<source>` (translators add the `<target>`).
+fn build_xliff_v2(
+    source_locale: &str,
+    messages: &std::collections::BTreeMap<
+        String,
+        (PathBuf, ngc_template_compiler::i18n::ExtractedI18nMessage),
+    >,
+) -> String {
+    let mut s = String::new();
+    s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n");
+    s.push_str(&format!(
+        "<xliff version=\"2.0\" xmlns=\"urn:oasis:names:tc:xliff:document:2.0\" srcLang=\"{}\">\n  <file id=\"ngi18n\" original=\"ng.template\">\n",
+        xml_escape(source_locale)
+    ));
+    for (id, (path, msg)) in messages {
+        s.push_str(&format!("    <unit id=\"{}\">\n", xml_escape(id)));
+        let has_notes =
+            msg.meaning.is_some() || msg.description.is_some() || !path.as_os_str().is_empty();
+        if has_notes {
+            s.push_str("      <notes>\n");
+            // Location note keeps the source-file pointer that 1.2's
+            // `<context-group>` carried; same key (`location`) Angular's
+            // extractor uses so xlf-merge tools recognise it.
+            s.push_str(&format!(
+                "        <note category=\"location\">{}</note>\n",
+                xml_escape(&path.display().to_string())
+            ));
+            if let Some(m) = &msg.meaning {
+                s.push_str(&format!(
+                    "        <note category=\"meaning\">{}</note>\n",
+                    xml_escape(m)
+                ));
+            }
+            if let Some(d) = &msg.description {
+                s.push_str(&format!(
+                    "        <note category=\"description\">{}</note>\n",
+                    xml_escape(d)
+                ));
+            }
+            s.push_str("      </notes>\n");
+        }
+        s.push_str("      <segment>\n");
+        s.push_str(&format!(
+            "        <source>{}</source>\n",
+            xml_escape(&msg.source)
+        ));
+        s.push_str("      </segment>\n");
+        s.push_str("    </unit>\n");
+    }
+    s.push_str("  </file>\n</xliff>\n");
     s
 }
 
@@ -2740,6 +2858,59 @@ fn find_entry_point(entry_points: &[PathBuf]) -> NgcResult<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xliff_v2_round_trip_extract_translate_apply() {
+        // Round-trip: build a v2 XLIFF document via the same emitter
+        // `extract-i18n --format xliff2` uses, parse it back through the
+        // public dispatcher (the same path `--localize` takes), then apply
+        // the result to a `$localize` call site. Mirrors the DoD flow on
+        // issue #141 without needing the full bundler pipeline.
+        use std::collections::BTreeMap;
+        let mut by_key: BTreeMap<
+            String,
+            (PathBuf, ngc_template_compiler::i18n::ExtractedI18nMessage),
+        > = BTreeMap::new();
+        by_key.insert(
+            "cart.title".to_string(),
+            (
+                PathBuf::from("src/app/cart.component.ts"),
+                ngc_template_compiler::i18n::ExtractedI18nMessage {
+                    id: Some("cart.title".to_string()),
+                    meaning: None,
+                    description: Some("Header above the cart".to_string()),
+                    source: "Your cart".to_string(),
+                },
+            ),
+        );
+        let xlf = build_xliff_v2("en-US", &by_key);
+        assert!(xlf.contains("version=\"2.0\""));
+        assert!(xlf.contains("<unit id=\"cart.title\">"));
+        assert!(xlf.contains("<source>Your cart</source>"));
+
+        // Splice in a German <target> the way a translator would.
+        let translated = xlf.replace(
+            "<source>Your cart</source>\n      </segment>",
+            "<source>Your cart</source><target>Mein Warenkorb</target>\n      </segment>",
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xlf_path = dir.path().join("messages.de.xlf");
+        std::fs::write(&xlf_path, translated).expect("write xlf");
+
+        let map = localize::parse_xliff(&xlf_path).expect("parse xlf v2 back");
+        assert_eq!(map.get("cart.title"), Some(&"Mein Warenkorb".to_string()));
+
+        let js = "var x = $localize`:Header above the cart@@cart.title:Your cart`;";
+        let out = localize::apply_translations(js, &map);
+        assert!(
+            out.contains("Mein Warenkorb"),
+            "expected translated string in output, got: {out}"
+        );
+        assert!(
+            !out.contains("Your cart"),
+            "source string should be replaced, got: {out}"
+        );
+    }
 
     #[test]
     fn test_format_bytes() {

@@ -1,11 +1,15 @@
 //! Compile-time `$localize` translation substitution.
 //!
-//! Reads XLIFF 1.2 (`.xlf`) translation files into a `{ id → target text }`
-//! map, then rewrites every `$localize\`...\`` tagged template literal in a
+//! Reads XLIFF (`.xlf`) translation files into a `{ id → target text }` map,
+//! then rewrites every `$localize\`...\`` tagged template literal in a
 //! generated JavaScript bundle so that the source-locale text is replaced
 //! with its translation. Messages without an `@@id` marker, or whose id is
 //! not present in the translation map, pass through untouched — at runtime
 //! Angular's `$localize` will fall back to the source string.
+//!
+//! Both XLIFF 1.2 (`<trans-unit>` / `<target>`) and XLIFF 2.0 (`<unit>` /
+//! `<segment>` / `<target>`) are accepted; the parser is selected from the
+//! root element's `version` attribute.
 //!
 //! Currently substitutes only the static text portions; messages containing
 //! `${...}:INTERPOLATION:` placeholders keep the runtime `$localize` shape
@@ -18,71 +22,106 @@ use std::path::Path;
 
 use ngc_diagnostics::{NgcError, NgcResult};
 
+mod xliff_v1;
+mod xliff_v2;
+
 /// Map of message id → translated text. Empty when no XLIFF file is loaded.
 pub type TranslationMap = HashMap<String, String>;
 
-/// Parse an XLIFF 1.2 translation file into a `{ id → target }` map.
+/// Parse an XLIFF translation file into a `{ id → target }` map.
 ///
-/// Recognises `<trans-unit id="...">` entries with a `<target>...</target>`
-/// child. The XLIFF 2.0 (`<unit>` / `<segment>`) format is not yet
-/// supported — extraction emits 1.2 to match Angular's default format.
+/// Detects the schema from the root `<xliff version="...">` attribute and
+/// dispatches to the matching parser:
+///
+/// - `1.2` → [`xliff_v1::parse_xliff_str`] (`<trans-unit id> <target>...`).
+/// - `2.0` → [`xliff_v2::parse_xliff_v2_str`] (`<unit id> <segment> <target>...`).
+///
+/// Other versions (or a missing root element) return an [`NgcError::ConfigError`]
+/// so the user gets a clear diagnostic instead of silently empty translations.
 pub fn parse_xliff(path: &Path) -> NgcResult<TranslationMap> {
     let xml = std::fs::read_to_string(path).map_err(|e| NgcError::Io {
         path: path.to_path_buf(),
         source: e,
     })?;
-    Ok(parse_xliff_str(&xml))
+    parse_xliff_with_path(&xml, Some(path))
 }
 
-/// Internal: parse XLIFF 1.2 from a source string. Tolerant of whitespace
-/// and attribute order; designed to handle the output of Angular's own
-/// `ng extract-i18n` and most third-party translation editors.
-pub fn parse_xliff_str(xml: &str) -> TranslationMap {
-    let mut out: TranslationMap = HashMap::new();
-    // Cursor over `xml`; advance past each `<trans-unit id="...">` block,
-    // grab the inner `<target>...</target>` text, restart from the closing
-    // `</trans-unit>`. Hand-rolled to avoid pulling a full XML parser into
-    // the CLI for what is effectively a flat, well-known schema.
-    let mut cursor = 0;
-    while let Some(open_rel) = xml[cursor..].find("<trans-unit") {
-        let open = cursor + open_rel;
-        let after_tag = match xml[open..].find('>') {
-            Some(p) => open + p + 1,
-            None => break,
-        };
-        let id = extract_attr(&xml[open..after_tag], "id").unwrap_or_default();
-        let close_rel = match xml[after_tag..].find("</trans-unit>") {
-            Some(p) => p,
-            None => break,
-        };
-        let body = &xml[after_tag..after_tag + close_rel];
-        if let Some(target) = extract_inner_text(body, "target") {
-            if !id.is_empty() {
-                out.insert(id, decode_xml_entities(&target));
-            }
-        }
-        cursor = after_tag + close_rel + "</trans-unit>".len();
+fn parse_xliff_with_path(xml: &str, path: Option<&Path>) -> NgcResult<TranslationMap> {
+    match detect_xliff_version(xml) {
+        Some(XliffVersion::V1_2) => Ok(xliff_v1::parse_xliff_str(xml)),
+        Some(XliffVersion::V2_0) => Ok(xliff_v2::parse_xliff_v2_str(xml)),
+        Some(XliffVersion::Other(v)) => Err(NgcError::ConfigError {
+            message: format!(
+                "unsupported XLIFF version {v:?}{}: only 1.2 and 2.0 are supported",
+                path.map(|p| format!(" in {}", p.display()))
+                    .unwrap_or_default()
+            ),
+        }),
+        None => Err(NgcError::ConfigError {
+            message: format!(
+                "no <xliff version=\"...\"> root element found{}",
+                path.map(|p| format!(" in {}", p.display()))
+                    .unwrap_or_default()
+            ),
+        }),
     }
-    out
+}
+
+/// Discriminated value from the root `<xliff version="...">` attribute.
+enum XliffVersion {
+    V1_2,
+    V2_0,
+    Other(String),
+}
+
+/// Locate the root `<xliff ...>` opening tag and return its `version`. The
+/// scan is tolerant of leading XML prologue, comments, and whitespace; it
+/// returns `None` when no `<xliff>` element is present.
+fn detect_xliff_version(xml: &str) -> Option<XliffVersion> {
+    let open = xml.find("<xliff")?;
+    let after = &xml[open..];
+    let close_rel = after.find('>')?;
+    let tag = &after[..close_rel + 1];
+    let version = extract_attr(tag, "version")?;
+    Some(match version.as_str() {
+        "1.2" => XliffVersion::V1_2,
+        "2.0" => XliffVersion::V2_0,
+        _ => XliffVersion::Other(version),
+    })
 }
 
 /// Extract the `name="value"` attribute from a tag opening (single or
 /// double quoted). Returns `None` when the attribute is absent.
-fn extract_attr(tag: &str, name: &str) -> Option<String> {
-    let needle = format!("{name}=");
-    let start = tag.find(&needle)?;
-    let after = &tag[start + needle.len()..];
-    let mut chars = after.chars();
-    let quote = chars.next()?;
-    if quote != '"' && quote != '\'' {
-        return None;
+///
+/// The match is anchored at a whitespace boundary so an attribute named
+/// `lang` does not match `srcLang`.
+pub(crate) fn extract_attr(tag: &str, name: &str) -> Option<String> {
+    let bytes = tag.as_bytes();
+    let needle = name.as_bytes();
+    let mut i = 0;
+    while i + needle.len() < bytes.len() {
+        let prev = bytes[i];
+        let is_boundary = prev == b' ' || prev == b'\t' || prev == b'\n' || prev == b'\r';
+        if is_boundary && bytes[i + 1..].starts_with(needle) {
+            let after_name = i + 1 + needle.len();
+            if bytes.get(after_name) == Some(&b'=') {
+                let after = &tag[after_name + 1..];
+                let mut chars = after.chars();
+                let quote = chars.next()?;
+                if quote != '"' && quote != '\'' {
+                    return None;
+                }
+                let end = after[1..].find(quote)?;
+                return Some(after[1..1 + end].to_string());
+            }
+        }
+        i += 1;
     }
-    let end = after[1..].find(quote)?;
-    Some(after[1..1 + end].to_string())
+    None
 }
 
 /// Extract the text between `<tag>...</tag>`.
-fn extract_inner_text(body: &str, tag: &str) -> Option<String> {
+pub(crate) fn extract_inner_text(body: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}");
     let close = format!("</{tag}>");
     let start = body.find(&open)?;
@@ -92,7 +131,7 @@ fn extract_inner_text(body: &str, tag: &str) -> Option<String> {
 }
 
 /// Decode the XML entities used in XLIFF target text.
-fn decode_xml_entities(s: &str) -> String {
+pub(crate) fn decode_xml_entities(s: &str) -> String {
     s.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
@@ -245,7 +284,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_xliff_trans_units() {
+    fn dispatches_to_xliff_1_2_parser() {
         let xml = r#"<?xml version="1.0" encoding="UTF-8" ?>
 <xliff version="1.2">
   <file>
@@ -254,16 +293,44 @@ mod tests {
         <source>Hello</source>
         <target>Hallo</target>
       </trans-unit>
-      <trans-unit id="bye">
-        <source>Bye</source>
-        <target>Tsch&#252;ss</target>
-      </trans-unit>
     </body>
   </file>
 </xliff>"#;
-        let map = parse_xliff_str(xml);
+        let map = parse_xliff_with_path(xml, None).expect("dispatch ok");
         assert_eq!(map.get("intro"), Some(&"Hallo".to_string()));
-        assert_eq!(map.get("bye"), Some(&"Tsch&#252;ss".to_string()));
+    }
+
+    #[test]
+    fn dispatches_to_xliff_2_0_parser() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8" ?>
+<xliff version="2.0" srcLang="en-US" trgLang="de" xmlns="urn:oasis:names:tc:xliff:document:2.0">
+  <file id="ngi18n" original="ng.template">
+    <unit id="intro">
+      <segment>
+        <source>Hello</source>
+        <target>Hallo</target>
+      </segment>
+    </unit>
+  </file>
+</xliff>"#;
+        let map = parse_xliff_with_path(xml, None).expect("dispatch ok");
+        assert_eq!(map.get("intro"), Some(&"Hallo".to_string()));
+    }
+
+    #[test]
+    fn rejects_unknown_xliff_version() {
+        let xml = r#"<xliff version="1.1"><file/></xliff>"#;
+        let err = parse_xliff_with_path(xml, None).expect_err("should reject");
+        let s = err.to_string();
+        assert!(s.contains("unsupported XLIFF version"), "got: {s}");
+    }
+
+    #[test]
+    fn rejects_missing_root() {
+        let xml = r#"<?xml version="1.0"?><not-xliff/>"#;
+        let err = parse_xliff_with_path(xml, None).expect_err("should reject");
+        let s = err.to_string();
+        assert!(s.contains("no <xliff"), "got: {s}");
     }
 
     #[test]
