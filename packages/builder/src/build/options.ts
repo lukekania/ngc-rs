@@ -56,6 +56,7 @@ export interface ApplicationOptions extends json.JsonObject {
   security: json.JsonObject | null;
   appShell: boolean | json.JsonObject | null;
   webWorkerTsConfig: string | null;
+  strictTemplates: boolean | null;
 }
 
 /// Result of translating raw [`ApplicationOptions`] into a CLI invocation.
@@ -238,6 +239,9 @@ export function translateOptions(
   }
   if (localize) {
     args.push('--localize');
+  }
+  if (raw.strictTemplates === true) {
+    args.push('--strict-templates');
   }
 
   return { args, configuration, warnings };

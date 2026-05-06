@@ -179,6 +179,12 @@ enum Commands {
         /// `<out_dir>/<sourceLocale>/`.
         #[arg(long)]
         localize: bool,
+        /// Treat any template that would fall back to JIT compilation as a
+        /// hard error. Mirrors `@angular/build:application`, which has no
+        /// JIT fallback. Defaults to on for `--configuration production` and
+        /// off otherwise; pass `--strict-templates` to force on.
+        #[arg(long)]
+        strict_templates: bool,
     },
     /// Watch the project's input files and rebuild incrementally on every
     /// save. The first rebuild does a full pipeline run; subsequent rebuilds
@@ -332,13 +338,20 @@ fn main() {
             configuration,
             output_json,
             localize,
+            strict_templates,
         } => {
             let started = Instant::now();
+            // Default `strict_templates` to on for production, off otherwise —
+            // matches `@angular/build:application`'s lack of JIT fallback.
+            // An explicit `--strict-templates` always forces on.
+            let strict_templates =
+                strict_templates || configuration.as_deref() == Some("production");
             match run_build(
                 &project,
                 out_dir.as_deref(),
                 configuration.as_deref(),
                 localize,
+                strict_templates,
             ) {
                 Ok(result) => {
                     if output_json {
@@ -430,12 +443,14 @@ fn run_build(
     out_dir_override: Option<&Path>,
     configuration: Option<&str>,
     localize: bool,
+    strict_templates: bool,
 ) -> NgcResult<BuildResult> {
     run_build_with_options(
         project,
         out_dir_override,
         configuration,
         localize,
+        strict_templates,
         None,
         None,
     )
@@ -445,6 +460,10 @@ fn run_build(
 /// skip template compilation and TypeScript transformation for source files
 /// whose bytes haven't changed since the last successful build. Used by the
 /// `watch` subcommand; one-shot `build` callers pass `None`.
+///
+/// Always disables `strict_templates`: `watch` is a dev workflow, so JIT
+/// fallback warnings must not be escalated into a build error that would
+/// block iteration.
 pub(crate) fn run_build_with_cache(
     project: &Path,
     out_dir_override: Option<&Path>,
@@ -457,6 +476,7 @@ pub(crate) fn run_build_with_cache(
         out_dir_override,
         configuration,
         localize,
+        false,
         cache,
         None,
     )
@@ -468,11 +488,16 @@ pub(crate) fn run_build_with_cache(
 /// an explicit `baseHref`, the served `index.html` still picks up the
 /// dev-server's URL prefix as its base. When the project resolves a
 /// `baseHref` of its own the override is ignored.
+///
+/// `strict_templates` mirrors the `--strict-templates` build flag: when
+/// true, any template that would otherwise fall back to JIT compilation
+/// produces an [`NgcError::TemplateCompileError`] instead.
 pub(crate) fn run_build_with_options(
     project: &Path,
     out_dir_override: Option<&Path>,
     configuration: Option<&str>,
     localize: bool,
+    strict_templates: bool,
     mut cache: Option<&mut incremental::BuildCache>,
     base_href_override: Option<&str>,
 ) -> NgcResult<BuildResult> {
@@ -543,8 +568,14 @@ pub(crate) fn run_build_with_options(
         .iter()
         .filter_map(|p| incremental::BuildCache::hash_file(p).map(|h| (p.clone(), h)))
         .collect();
-    let (compiled, transform_cache_seed) =
-        compile_decorators_cached(&files, &style_ctx, cache.as_deref_mut(), &file_hashes)?;
+    let compile_opts = ngc_template_compiler::CompileOptions { strict_templates };
+    let (compiled, transform_cache_seed) = compile_decorators_cached(
+        &files,
+        &style_ctx,
+        &compile_opts,
+        cache.as_deref_mut(),
+        &file_hashes,
+    )?;
     drop(templates_span);
 
     // Report any JIT fallbacks. Each fallback also goes into
@@ -2464,6 +2495,7 @@ type CompileWithHashes = (
 fn compile_decorators_cached(
     files: &[PathBuf],
     style_ctx: &ngc_template_compiler::StyleContext,
+    compile_opts: &ngc_template_compiler::CompileOptions,
     mut cache: Option<&mut incremental::BuildCache>,
     file_hashes: &HashMap<PathBuf, [u8; 32]>,
 ) -> NgcResult<CompileWithHashes> {
@@ -2490,7 +2522,12 @@ fn compile_decorators_cached(
             path: file.clone(),
             source: e,
         })?;
-        let cf = ngc_template_compiler::compile_file_with_styles(&source, file, style_ctx)?;
+        let cf = ngc_template_compiler::compile_file_with_options(
+            &source,
+            file,
+            style_ctx,
+            compile_opts,
+        )?;
         if cache_present {
             // Recompute hash if pre-hashing missed (file changed under us).
             let h = hash.unwrap_or_else(|| incremental::BuildCache::hash_bytes(source.as_bytes()));

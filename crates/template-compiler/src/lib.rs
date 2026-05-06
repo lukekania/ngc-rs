@@ -57,6 +57,24 @@ impl Default for StyleContext {
     }
 }
 
+/// Knobs that change template-compile behaviour without affecting style
+/// preprocessing.
+///
+/// Threaded alongside [`StyleContext`] so the two concerns stay separable:
+/// `StyleContext` carries inputs the preprocessor needs, while `CompileOptions`
+/// controls how strict the compiler is about constructs it can't yet emit
+/// natively. Keeping them split lets call sites that only care about one
+/// concern leave the other at its default.
+#[derive(Debug, Clone, Default)]
+pub struct CompileOptions {
+    /// When `true`, any component whose template would otherwise fall back to
+    /// JIT (because it uses a construct the native compiler doesn't recognise)
+    /// produces an [`NgcError::TemplateCompileError`] instead. Mirrors
+    /// `@angular/build:application`'s `strictTemplates` behaviour, which has
+    /// no JIT fallback.
+    pub strict_templates: bool,
+}
+
 /// Lightweight metadata for template compilation without `ExtractedComponent`.
 ///
 /// Used by the Angular linker to compile templates from `ɵɵngDeclareComponent`
@@ -259,6 +277,21 @@ pub fn compile_all_decorators_with_styles(
     files: &[PathBuf],
     style_ctx: &StyleContext,
 ) -> NgcResult<Vec<CompiledFile>> {
+    compile_all_decorators_with_options(files, style_ctx, &CompileOptions::default())
+}
+
+/// Variant of [`compile_all_decorators_with_styles`] that also takes
+/// [`CompileOptions`].
+///
+/// Used by callers that need to enable strict template compilation
+/// (`strict_templates: true`), which converts JIT-fallback events into
+/// [`NgcError::TemplateCompileError`] so production builds fail loudly
+/// instead of silently shipping a JIT-compiled component.
+pub fn compile_all_decorators_with_options(
+    files: &[PathBuf],
+    style_ctx: &StyleContext,
+    compile_opts: &CompileOptions,
+) -> NgcResult<Vec<CompiledFile>> {
     let results: Vec<NgcResult<CompiledFile>> = files
         .par_iter()
         .map(|file_path| {
@@ -267,7 +300,7 @@ pub fn compile_all_decorators_with_styles(
                 source: e,
             })?;
 
-            compile_file(&source, file_path, style_ctx)
+            compile_file(&source, file_path, style_ctx, compile_opts)
         })
         .collect();
 
@@ -292,7 +325,21 @@ pub fn compile_file_with_styles(
     file_path: &Path,
     style_ctx: &StyleContext,
 ) -> NgcResult<CompiledFile> {
-    compile_file(source, file_path, style_ctx)
+    compile_file(source, file_path, style_ctx, &CompileOptions::default())
+}
+
+/// Variant of [`compile_file_with_styles`] that also takes [`CompileOptions`].
+///
+/// When `compile_opts.strict_templates` is true, a component that would
+/// normally fall back to JIT instead returns
+/// [`NgcError::TemplateCompileError`] so the caller can fail the build.
+pub fn compile_file_with_options(
+    source: &str,
+    file_path: &Path,
+    style_ctx: &StyleContext,
+    compile_opts: &CompileOptions,
+) -> NgcResult<CompiledFile> {
+    compile_file(source, file_path, style_ctx, compile_opts)
 }
 
 /// Compile a single TypeScript source file, handling all Angular decorator types.
@@ -309,14 +356,15 @@ fn compile_file(
     source: &str,
     file_path: &Path,
     style_ctx: &StyleContext,
+    compile_opts: &CompileOptions,
 ) -> NgcResult<CompiledFile> {
     #[cfg(feature = "ast-reuse")]
     {
-        compile_file_dispatch(source, file_path, style_ctx)
+        compile_file_dispatch(source, file_path, style_ctx, compile_opts)
     }
     #[cfg(not(feature = "ast-reuse"))]
     {
-        compile_file_fallthrough(source, file_path, style_ctx)
+        compile_file_fallthrough(source, file_path, style_ctx, compile_opts)
     }
 }
 
@@ -325,9 +373,11 @@ fn compile_file_fallthrough(
     source: &str,
     file_path: &Path,
     style_ctx: &StyleContext,
+    compile_opts: &CompileOptions,
 ) -> NgcResult<CompiledFile> {
     // Try @Component first (most complex, has template compilation)
-    let component_result = compile_component_with_styles(source, file_path, style_ctx)?;
+    let component_result =
+        compile_component_with_options(source, file_path, style_ctx, compile_opts)?;
     if component_result.compiled || component_result.jit_fallback {
         return Ok(component_result);
     }
@@ -371,6 +421,7 @@ fn compile_file_dispatch(
     source: &str,
     file_path: &Path,
     style_ctx: &StyleContext,
+    compile_opts: &CompileOptions,
 ) -> NgcResult<CompiledFile> {
     let has_component = source.contains("@Component");
     let has_injectable = source.contains("@Injectable");
@@ -388,7 +439,7 @@ fn compile_file_dispatch(
     }
 
     if has_component {
-        let r = compile_component_with_styles(source, file_path, style_ctx)?;
+        let r = compile_component_with_options(source, file_path, style_ctx, compile_opts)?;
         if r.compiled || r.jit_fallback {
             return Ok(r);
         }
@@ -611,6 +662,22 @@ pub fn compile_component_with_styles(
     file_path: &Path,
     style_ctx: &StyleContext,
 ) -> NgcResult<CompiledFile> {
+    compile_component_with_options(source, file_path, style_ctx, &CompileOptions::default())
+}
+
+/// Variant of [`compile_component_with_styles`] that also takes
+/// [`CompileOptions`].
+///
+/// When `compile_opts.strict_templates` is true, a template that would
+/// normally fall back to JIT is reported as an
+/// [`NgcError::TemplateCompileError`] instead, matching
+/// `@angular/build:application`'s behaviour of having no JIT fallback.
+pub fn compile_component_with_options(
+    source: &str,
+    file_path: &Path,
+    style_ctx: &StyleContext,
+    compile_opts: &CompileOptions,
+) -> NgcResult<CompiledFile> {
     let mut extracted = match extract::extract_component(source, file_path)? {
         Some(ext) => ext,
         None => {
@@ -625,6 +692,16 @@ pub fn compile_component_with_styles(
 
     // Check for JIT fallback triggers
     if extracted.needs_jit_fallback() {
+        if compile_opts.strict_templates {
+            return Err(NgcError::TemplateCompileError {
+                path: file_path.to_path_buf(),
+                message: "template contains constructs the AOT compiler does not yet support; \
+                          JIT fallback is disabled by --strict-templates"
+                    .to_string(),
+                line: None,
+                column: None,
+            });
+        }
         tracing::warn!(
             path = %file_path.display(),
             "template contains unsupported constructs, using JIT fallback"
@@ -709,6 +786,32 @@ export class XComponent {}
         let ids: Vec<&str> = messages.iter().filter_map(|m| m.id.as_deref()).collect();
         assert!(ids.contains(&"intro"));
         assert!(ids.contains(&"alt"));
+    }
+
+    #[test]
+    fn test_strict_templates_does_not_break_valid_components() {
+        // Regression guard: strict mode must not turn fully-AOT-compilable
+        // components into errors. The strict→Err branch only fires for
+        // components whose template would otherwise fall back to JIT.
+        let source = "import { Component } from '@angular/core';\n\n@Component({\n  selector: 'app-x',\n  standalone: true,\n  template: '<div>{{ name }}</div>',\n})\nexport class XComponent { name = 'world'; }\n";
+        let path = PathBuf::from("x.component.ts");
+        let style_ctx = StyleContext::default();
+        let strict = CompileOptions {
+            strict_templates: true,
+        };
+        let lenient = CompileOptions::default();
+
+        let r_strict = compile_component_with_options(source, &path, &style_ctx, &strict)
+            .expect("strict compile should succeed on valid component");
+        assert!(r_strict.compiled, "strict-mode build should AOT-compile");
+        assert!(
+            !r_strict.jit_fallback,
+            "no jit_fallback on a valid component"
+        );
+
+        let r_lenient = compile_component_with_options(source, &path, &style_ctx, &lenient)
+            .expect("lenient compile should also succeed");
+        assert!(r_lenient.compiled);
     }
 
     #[test]
@@ -903,7 +1006,13 @@ export class SidenavComponent implements OnInit {
 }
 "#;
         let path = PathBuf::from("test.component.ts");
-        let result = compile_file(source, &path, &StyleContext::default()).expect("should compile");
+        let result = compile_file(
+            source,
+            &path,
+            &StyleContext::default(),
+            &CompileOptions::default(),
+        )
+        .expect("should compile");
         assert!(result.compiled, "should be compiled");
         assert!(
             !result.source.contains("@Component"),
@@ -932,7 +1041,13 @@ export class AuthService {
 }
 "#;
         let path = PathBuf::from("auth.service.ts");
-        let result = compile_file(source, &path, &StyleContext::default()).expect("should compile");
+        let result = compile_file(
+            source,
+            &path,
+            &StyleContext::default(),
+            &CompileOptions::default(),
+        )
+        .expect("should compile");
         assert!(result.compiled, "should be compiled");
         assert!(result.source.contains("\u{0275}prov"));
         assert!(result.source.contains("\u{0275}\u{0275}defineInjectable"));
@@ -959,7 +1074,13 @@ export class DataService {
 }
 "#;
         let path = PathBuf::from("data.service.ts");
-        let result = compile_file(source, &path, &StyleContext::default()).expect("should compile");
+        let result = compile_file(
+            source,
+            &path,
+            &StyleContext::default(),
+            &CompileOptions::default(),
+        )
+        .expect("should compile");
         assert!(result.compiled);
         assert!(result.source.contains("\u{0275}\u{0275}inject(HttpClient)"));
         assert!(result.source.contains("\u{0275}\u{0275}inject(Router)"));
@@ -994,7 +1115,13 @@ export class HostDirective {
 }
 "#;
         let path = PathBuf::from("host.directive.ts");
-        let result = compile_file(source, &path, &StyleContext::default()).expect("should compile");
+        let result = compile_file(
+            source,
+            &path,
+            &StyleContext::default(),
+            &CompileOptions::default(),
+        )
+        .expect("should compile");
         assert!(result.compiled, "should be compiled");
         let out = &result.source;
 
@@ -1058,7 +1185,13 @@ export class PortfolioComponent {
 }
 "#;
         let path = PathBuf::from("portfolio.component.ts");
-        let result = compile_file(source, &path, &StyleContext::default()).expect("should compile");
+        let result = compile_file(
+            source,
+            &path,
+            &StyleContext::default(),
+            &CompileOptions::default(),
+        )
+        .expect("should compile");
         assert!(result.compiled);
         let out = &result.source;
         assert!(
@@ -1103,7 +1236,13 @@ export class ChildDirective {}
 export class HostComponent {}
 "#;
         let path = PathBuf::from("host.component.ts");
-        let result = compile_file(source, &path, &StyleContext::default()).expect("should compile");
+        let result = compile_file(
+            source,
+            &path,
+            &StyleContext::default(),
+            &CompileOptions::default(),
+        )
+        .expect("should compile");
         assert!(result.compiled);
         let out = &result.source;
         assert!(
@@ -1156,7 +1295,13 @@ import { ChildDir } from './child.directive';
 export class HostDir {}
 "#;
         let path = PathBuf::from("host.directive.ts");
-        let result = compile_file(source, &path, &StyleContext::default()).expect("should compile");
+        let result = compile_file(
+            source,
+            &path,
+            &StyleContext::default(),
+            &CompileOptions::default(),
+        )
+        .expect("should compile");
         assert!(result.compiled);
         let out = &result.source;
         assert!(
@@ -1178,7 +1323,13 @@ export class HighlightDirective {
 }
 "#;
         let path = PathBuf::from("highlight.directive.ts");
-        let result = compile_file(source, &path, &StyleContext::default()).expect("should compile");
+        let result = compile_file(
+            source,
+            &path,
+            &StyleContext::default(),
+            &CompileOptions::default(),
+        )
+        .expect("should compile");
         assert!(result.compiled);
         assert!(result.source.contains("\u{0275}dir"));
         assert!(result.source.contains("\u{0275}\u{0275}defineDirective"));
@@ -1207,7 +1358,13 @@ export class DateFormatPipe implements PipeTransform {
 }
 "#;
         let path = PathBuf::from("date-format.pipe.ts");
-        let result = compile_file(source, &path, &StyleContext::default()).expect("should compile");
+        let result = compile_file(
+            source,
+            &path,
+            &StyleContext::default(),
+            &CompileOptions::default(),
+        )
+        .expect("should compile");
         assert!(result.compiled);
         assert!(result.source.contains("\u{0275}pipe"));
         assert!(result.source.contains("\u{0275}\u{0275}definePipe"));
@@ -1235,7 +1392,13 @@ export class DateFormatPipe implements PipeTransform {
 export class AppModule {}
 "#;
         let path = PathBuf::from("app.module.ts");
-        let result = compile_file(source, &path, &StyleContext::default()).expect("should compile");
+        let result = compile_file(
+            source,
+            &path,
+            &StyleContext::default(),
+            &CompileOptions::default(),
+        )
+        .expect("should compile");
         assert!(result.compiled);
         assert!(result.source.contains("\u{0275}mod"));
         assert!(result.source.contains("\u{0275}inj"));
@@ -1256,7 +1419,13 @@ export class AppModule {}
     fn test_plain_class_unchanged() {
         let source = "export class PlainClass { x = 1; }\n";
         let path = PathBuf::from("plain.ts");
-        let result = compile_file(source, &path, &StyleContext::default()).expect("should compile");
+        let result = compile_file(
+            source,
+            &path,
+            &StyleContext::default(),
+            &CompileOptions::default(),
+        )
+        .expect("should compile");
         assert!(!result.compiled);
         assert_eq!(result.source, source);
     }
@@ -1445,7 +1614,13 @@ export class TestComponent {
 export class IconComponent {}
 "#;
         let path = PathBuf::from("icon.component.ts");
-        let result = compile_file(source, &path, &StyleContext::default()).expect("should compile");
+        let result = compile_file(
+            source,
+            &path,
+            &StyleContext::default(),
+            &CompileOptions::default(),
+        )
+        .expect("should compile");
         assert!(result.compiled, "should be compiled");
 
         let out = &result.source;

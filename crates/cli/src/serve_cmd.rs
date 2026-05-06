@@ -67,10 +67,14 @@ pub(crate) fn run_with_stop(
     // canonical `/foo/` form (see `ngc_dev_server::normalize_serve_path`).
     let normalized_serve_path = serve_path.and_then(ngc_dev_server::normalize_serve_path);
 
+    // `serve` is dev-only; pass `strict_templates: false` so JIT fallback
+    // warnings are not escalated into a build error that would block dev
+    // iteration on transient template-compile gaps.
     let initial = crate::run_build_with_options(
         project,
         None,
         configuration,
+        false,
         false,
         Some(&mut cache),
         normalized_serve_path.as_deref(),
@@ -122,6 +126,7 @@ pub(crate) fn run_with_stop(
             &project_path,
             None,
             configuration_owned.as_deref(),
+            false,
             false,
             Some(&mut cache),
             serve_path_owned.as_deref(),
