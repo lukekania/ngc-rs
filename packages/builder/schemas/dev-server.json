@@ -50,6 +50,15 @@
     "ngcRsBinary": {
       "type": "string",
       "description": "Optional override for the ngc-rs binary path. If unset, the shim looks at the NGC_RS_BINARY env var, then a workspace-relative target/release/ngc-rs, and finally PATH."
+    },
+    "define": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Build-time global identifier replacement (mirrors `application.define`). Accepted on the dev-server target for schema parity; values are resolved against the underlying build target."
+    },
+    "watch": {
+      "type": "boolean",
+      "description": "Whether the dev server rebuilds on file changes. Always true in `ngc-rs serve`; setting it to false logs a warning."
     }
   },
   "additionalProperties": false

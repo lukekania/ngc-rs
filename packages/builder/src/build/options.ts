@@ -43,6 +43,19 @@ export interface ApplicationOptions extends json.JsonObject {
   outputMode: 'static' | 'server' | null;
   ngcRsBinary: string | null;
   localize: boolean | string[] | null;
+  inlineStyleLanguage: 'css' | 'less' | 'sass' | 'scss' | null;
+  stylePreprocessorOptions: json.JsonObject | null;
+  define: { [key: string]: string } | null;
+  conditions: string[] | null;
+  loader: { [ext: string]: string } | null;
+  deleteOutputPath: boolean | null;
+  clearScreen: boolean | null;
+  i18nDuplicateTranslation: 'warning' | 'error' | 'ignore' | null;
+  i18nMissingTranslation: 'warning' | 'error' | 'ignore' | null;
+  poll: number | null;
+  security: json.JsonObject | null;
+  appShell: boolean | json.JsonObject | null;
+  webWorkerTsConfig: string | null;
 }
 
 /// Result of translating raw [`ApplicationOptions`] into a CLI invocation.
@@ -111,6 +124,21 @@ export function translateOptions(
       '`outputMode: "server"` is not supported by ngc-rs. Use `"static"` or omit the option.',
     );
   }
+  if (raw.appShell) {
+    throw new OptionTranslationError(
+      'The `appShell` option is SSR-related and is out of scope for ngc-rs v1. Remove the option.',
+    );
+  }
+  if (raw.webWorkerTsConfig) {
+    throw new OptionTranslationError(
+      'The `webWorkerTsConfig` option is not supported by ngc-rs (web workers are not yet detected by the bundler). Remove the option.',
+    );
+  }
+  if (raw.loader && Object.keys(raw.loader).length > 0) {
+    throw new OptionTranslationError(
+      'The `loader` option (per-extension file loaders) is not yet supported by ngc-rs. Remove the option.',
+    );
+  }
 
   // Compatibility warnings — accepted, but ngc-rs's behaviour is hardcoded.
   if (raw.aot === false) {
@@ -159,6 +187,51 @@ export function translateOptions(
   if (Array.isArray(raw.localize)) {
     warnings.push(
       'Selecting a locale subset via `localize` array is not yet honoured by ngc-rs; all locales declared in `angular.json` `i18n.locales` are emitted.',
+    );
+  }
+  if (raw.define && Object.keys(raw.define).length > 0) {
+    warnings.push(
+      'The `define` option is accepted for schema compatibility but engine-side substitution is being added in a parallel change; values are silently ignored until that lands.',
+    );
+  }
+  if (raw.stylePreprocessorOptions) {
+    const opts = raw.stylePreprocessorOptions as json.JsonObject;
+    const includePaths = opts['includePaths'];
+    if (Array.isArray(includePaths) && includePaths.length > 0) {
+      warnings.push(
+        '`stylePreprocessorOptions.includePaths` is not yet honoured by ngc-rs; SCSS/Sass `@use`/`@import` resolves against the file directory and node_modules only.',
+      );
+    }
+  }
+  if (raw.conditions && raw.conditions.length > 0) {
+    warnings.push(
+      'The `conditions` option (custom package.json export conditions) is not yet honoured by ngc-rs; the resolver uses a fixed condition set.',
+    );
+  }
+  if (raw.deleteOutputPath === false) {
+    warnings.push(
+      '`deleteOutputPath: false` is not honoured by ngc-rs; the output directory is always cleaned before each build.',
+    );
+  }
+  if (raw.clearScreen === true) {
+    warnings.push('`clearScreen: true` is not honoured by ngc-rs; the screen is not cleared between rebuilds.');
+  }
+  if (raw.i18nDuplicateTranslation && raw.i18nDuplicateTranslation !== 'warning') {
+    warnings.push(
+      `\`i18nDuplicateTranslation: "${raw.i18nDuplicateTranslation}"\` is not honoured by ngc-rs; duplicate ids are reported as warnings regardless.`,
+    );
+  }
+  if (raw.i18nMissingTranslation && raw.i18nMissingTranslation !== 'warning') {
+    warnings.push(
+      `\`i18nMissingTranslation: "${raw.i18nMissingTranslation}"\` is not honoured by ngc-rs; missing translations are reported as warnings regardless.`,
+    );
+  }
+  if (raw.security) {
+    warnings.push('The `security` option (CSP auto-emission etc.) is not yet supported by ngc-rs.');
+  }
+  if (raw.poll !== null && raw.poll !== undefined) {
+    warnings.push(
+      'The `poll` option only applies in watch mode, which the application builder does not support — use the `dev-server` builder if you need polling.',
     );
   }
 
