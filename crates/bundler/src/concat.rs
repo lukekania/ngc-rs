@@ -91,6 +91,14 @@ pub struct BundleOutput {
     /// Source maps for each chunk, keyed by the same filename as `chunks`.
     /// Empty when source map generation is disabled.
     pub chunk_source_maps: HashMap<String, SourceMap>,
+    /// Filenames the HTML must inject as `<script type="module">` tags, in
+    /// load order. Always ends with the main chunk; earlier entries are
+    /// eagerly-loaded vendor/shared chunks that main statically imports.
+    pub initial_chunks: Vec<String>,
+    /// Per-chunk kind (Main / Lazy / Shared). Lets downstream tooling
+    /// distinguish vendor chunks from lazy-route chunks without re-parsing
+    /// filenames.
+    pub chunk_kinds: HashMap<String, ChunkKind>,
 }
 
 /// Bundle all modules into one or more ESM chunk files.
@@ -291,16 +299,32 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
     }
 
     // Content-hash filenames
-    let main_filename = if input.options.content_hash {
+    let (main_filename, rename_map) = if input.options.content_hash {
         apply_content_hashes(&mut output_chunks, &mut chunk_source_maps)?
     } else {
-        "main.js".to_string()
+        ("main.js".to_string(), HashMap::new())
     };
+
+    // Build per-chunk kind index and the list of initial chunks. With the
+    // pre-vendor partition rule, the only initial chunk is `main`. The field
+    // exists now so future vendor-chunk work can populate it without breaking
+    // the BundleOutput shape.
+    let mut chunk_kinds: HashMap<String, ChunkKind> = HashMap::new();
+    for chunk in &chunk_graph.chunks {
+        let final_filename = rename_map
+            .get(&chunk.filename)
+            .cloned()
+            .unwrap_or_else(|| chunk.filename.clone());
+        chunk_kinds.insert(final_filename, chunk.kind.clone());
+    }
+    let initial_chunks = vec![main_filename.clone()];
 
     Ok(BundleOutput {
         chunks: output_chunks,
         main_filename,
         chunk_source_maps,
+        initial_chunks,
+        chunk_kinds,
     })
 }
 
@@ -1005,7 +1029,7 @@ fn content_hash(content: &str) -> String {
 fn apply_content_hashes(
     chunks: &mut HashMap<String, String>,
     source_maps: &mut HashMap<String, SourceMap>,
-) -> NgcResult<String> {
+) -> NgcResult<(String, HashMap<String, String>)> {
     // Build rename map: process all chunks, computing hashes
     // First do non-main chunks (lazy/shared), then main
     let filenames: Vec<String> = chunks.keys().cloned().collect();
@@ -1061,7 +1085,7 @@ fn apply_content_hashes(
         .unwrap_or_else(|| "main.js".to_string());
 
     debug!(main = %main_filename, "applied content hashes");
-    Ok(main_filename)
+    Ok((main_filename, rename_map))
 }
 
 /// Insert a content hash into a filename: `chunk-foo.js` → `chunk-foo.a1b2c3d4.js`.

@@ -38,6 +38,22 @@ pub struct ChunkGraph {
     pub chunks: Vec<Chunk>,
     /// Map from dynamic import target path to its chunk filename.
     pub dynamic_import_map: HashMap<PathBuf, String>,
+    /// Map from every module path to the index of the chunk that owns it.
+    /// Built after partition; lets `bundle_chunk` resolve a cross-chunk
+    /// reference's target chunk in O(1) instead of scanning every chunk's
+    /// module list.
+    pub module_to_chunk_idx: HashMap<PathBuf, usize>,
+}
+
+/// Populate `module_to_chunk_idx` from the final chunk list.
+fn build_module_to_chunk_idx(chunks: &[Chunk]) -> HashMap<PathBuf, usize> {
+    let mut map = HashMap::new();
+    for (idx, chunk) in chunks.iter().enumerate() {
+        for module in &chunk.modules {
+            map.insert(module.clone(), idx);
+        }
+    }
+    map
 }
 
 /// Build a chunk graph by partitioning modules into main, lazy, and shared chunks.
@@ -94,14 +110,17 @@ pub fn build_chunk_graph(
             module_count = modules.len(),
             "no dynamic imports, single chunk"
         );
+        let chunks = vec![Chunk {
+            kind: ChunkKind::Main,
+            filename: "main.js".to_string(),
+            modules,
+            entry: entry.clone(),
+        }];
+        let module_to_chunk_idx = build_module_to_chunk_idx(&chunks);
         return Ok(ChunkGraph {
-            chunks: vec![Chunk {
-                kind: ChunkKind::Main,
-                filename: "main.js".to_string(),
-                modules,
-                entry: entry.clone(),
-            }],
+            chunks,
             dynamic_import_map: HashMap::new(),
+            module_to_chunk_idx,
         });
     }
 
@@ -245,9 +264,11 @@ pub fn build_chunk_graph(
         "built chunk graph"
     );
 
+    let module_to_chunk_idx = build_module_to_chunk_idx(&chunks);
     Ok(ChunkGraph {
         chunks,
         dynamic_import_map,
+        module_to_chunk_idx,
     })
 }
 

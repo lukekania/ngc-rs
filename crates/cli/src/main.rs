@@ -1169,7 +1169,7 @@ pub(crate) fn run_build_with_options(
                 !ap.styles.is_empty(),
                 polyfills_filename.as_deref(),
                 &out_dir,
-                &bundle_output.main_filename,
+                &bundle_output.initial_chunks,
                 &index_opts,
             )?;
             output_files.push(path);
@@ -2173,7 +2173,7 @@ fn generate_index_html(
     has_styles: bool,
     polyfills_filename: Option<&str>,
     out_dir: &Path,
-    main_filename: &str,
+    initial_chunks: &[String],
     options: &IndexHtmlOptions,
 ) -> NgcResult<PathBuf> {
     let mut html = std::fs::read_to_string(index_source).map_err(|e| NgcError::Io {
@@ -2248,10 +2248,10 @@ fn generate_index_html(
             "  <script src=\"{src}\" type=\"module\"{crossorigin_attr}{integrity_attr}></script>\n"
         ));
     }
-    {
-        let src = format!("{deploy_url}{main_filename}");
+    for chunk_filename in initial_chunks {
+        let src = format!("{deploy_url}{chunk_filename}");
         let integrity = if options.subresource_integrity {
-            Some(compute_sri_hash(&out_dir.join(main_filename))?)
+            Some(compute_sri_hash(&out_dir.join(chunk_filename))?)
         } else {
             None
         };
@@ -2939,7 +2939,7 @@ mod tests {
             true,
             Some("polyfills.js"),
             dir.path(),
-            "main.js",
+            &["main.js".to_string()],
             &IndexHtmlOptions::default(),
         )
         .unwrap();
@@ -2972,7 +2972,7 @@ mod tests {
             false,
             None,
             dir.path(),
-            "main.js",
+            &["main.js".to_string()],
             &opts,
         )
         .unwrap();
@@ -3002,7 +3002,7 @@ mod tests {
             false,
             None,
             dir.path(),
-            "main.js",
+            &["main.js".to_string()],
             &IndexHtmlOptions::default(),
         )
         .unwrap();
@@ -3041,7 +3041,7 @@ mod tests {
             true,
             Some("polyfills.js"),
             dir.path(),
-            "main.js",
+            &["main.js".to_string()],
             &opts,
         )
         .unwrap();
@@ -3069,7 +3069,7 @@ mod tests {
             false,
             None,
             dir.path(),
-            "main.js",
+            &["main.js".to_string()],
             &opts,
         )
         .unwrap();
@@ -3092,7 +3092,7 @@ mod tests {
             true,
             Some("polyfills.js"),
             dir.path(),
-            "main.js",
+            &["main.js".to_string()],
             &opts,
         )
         .unwrap();
@@ -3115,7 +3115,7 @@ mod tests {
             true,
             Some("polyfills.js"),
             dir.path(),
-            "main.js",
+            &["main.js".to_string()],
             &opts,
         )
         .unwrap();
@@ -3136,7 +3136,7 @@ mod tests {
             true,
             Some("polyfills.js"),
             dir.path(),
-            "main.js",
+            &["main.js".to_string()],
             &opts,
         )
         .unwrap();
@@ -3165,7 +3165,7 @@ mod tests {
             true,
             Some("polyfills.js"),
             dir.path(),
-            "main.js",
+            &["main.js".to_string()],
             &opts,
         )
         .unwrap();
@@ -3189,7 +3189,7 @@ mod tests {
             true,
             Some("polyfills.js"),
             dir.path(),
-            "main.js",
+            &["main.js".to_string()],
             &opts,
         )
         .unwrap();
