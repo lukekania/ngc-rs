@@ -295,7 +295,11 @@ fn vendor_chunk_partition_is_deterministic_across_builds() {
     );
 
     // Vendor chunk bodies should be byte-identical too.
-    for (name, _) in out_a.chunk_kinds.iter().filter(|(_, k)| **k == ChunkKind::Shared) {
+    for (name, _) in out_a
+        .chunk_kinds
+        .iter()
+        .filter(|(_, k)| **k == ChunkKind::Shared)
+    {
         let a_code = out_a.chunks.get(name).expect("vendor in out_a");
         let b_code = out_b.chunks.get(name).expect("vendor in out_b");
         assert_eq!(a_code, b_code, "vendor chunk {name} should be byte-stable");

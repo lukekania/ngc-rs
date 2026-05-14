@@ -163,10 +163,7 @@ pub fn build_chunk_graph(
     // that statically reach it.
     let mut importer_set: HashMap<NodeIndex, BTreeSet<u32>> = HashMap::new();
     for &node in &main_reach {
-        importer_set
-            .entry(node)
-            .or_default()
-            .insert(MAIN_CHUNK_ID);
+        importer_set.entry(node).or_default().insert(MAIN_CHUNK_ID);
     }
     for (&sp, reachable) in &lazy_reach {
         let id = lazy_id_of[&sp];
@@ -605,7 +602,10 @@ fn scc_emit_deps_first(
 /// invalidation behavior.
 fn vendor_chunk_filename(modules: &[PathBuf]) -> String {
     use sha2::{Digest, Sha256};
-    let mut paths: Vec<String> = modules.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    let mut paths: Vec<String> = modules
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
     paths.sort();
     let mut hasher = Sha256::new();
     for p in &paths {
@@ -1059,12 +1059,10 @@ mod tests {
             );
         }
         // Main has no npm here either.
-        assert!(
-            !result.chunks[0]
-                .modules
-                .iter()
-                .any(|m| m.to_string_lossy().contains("node_modules"))
-        );
+        assert!(!result.chunks[0]
+            .modules
+            .iter()
+            .any(|m| m.to_string_lossy().contains("node_modules")));
     }
 
     /// Per issue #131: an npm module reachable from Main AND ≥1 lazy chunk
@@ -1105,12 +1103,10 @@ mod tests {
             .iter()
             .find(|c| c.kind == ChunkKind::Shared)
             .expect("should have a vendor chunk");
-        assert!(
-            vendor
-                .modules
-                .iter()
-                .any(|m| m.to_string_lossy().contains("core.mjs"))
-        );
+        assert!(vendor
+            .modules
+            .iter()
+            .any(|m| m.to_string_lossy().contains("core.mjs")));
     }
 
     /// Two npm modules with the same importer-set fold into the same vendor
@@ -1145,8 +1141,14 @@ mod tests {
             .collect();
         assert_eq!(vendor_chunks.len(), 1, "expected one vendor chunk");
         let vendor = vendor_chunks[0];
-        assert!(vendor.modules.iter().any(|m| m.to_string_lossy().contains("pkg-a")));
-        assert!(vendor.modules.iter().any(|m| m.to_string_lossy().contains("pkg-b")));
+        assert!(vendor
+            .modules
+            .iter()
+            .any(|m| m.to_string_lossy().contains("pkg-a")));
+        assert!(vendor
+            .modules
+            .iter()
+            .any(|m| m.to_string_lossy().contains("pkg-b")));
     }
 
     /// Two npm modules with DIFFERENT importer-sets split into two distinct
@@ -1184,7 +1186,11 @@ mod tests {
             .iter()
             .filter(|c| c.kind == ChunkKind::Shared)
             .collect();
-        assert_eq!(vendor_chunks.len(), 2, "expected two distinct vendor chunks");
+        assert_eq!(
+            vendor_chunks.len(),
+            2,
+            "expected two distinct vendor chunks"
+        );
     }
 
     /// Filename regex: `chunk-<8hex>.js`.

@@ -349,7 +349,10 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
     let mut initial: BTreeSet<String> = BTreeSet::new();
     for (owner, consumers) in &consumers_by_owner {
         if consumers.contains(&pre_main) {
-            let renamed = rename_map.get(owner).cloned().unwrap_or_else(|| owner.clone());
+            let renamed = rename_map
+                .get(owner)
+                .cloned()
+                .unwrap_or_else(|| owner.clone());
             initial.insert(renamed);
         }
     }
@@ -431,7 +434,11 @@ fn compute_global_namespace_maps(
         }
     }
 
-    (all_file_to_ns, namespace_to_chunk_idx, specifier_to_namespace)
+    (
+        all_file_to_ns,
+        namespace_to_chunk_idx,
+        specifier_to_namespace,
+    )
 }
 
 /// Build a mapping from raw import specifiers (as they appear in source) to chunk filenames.
@@ -1076,12 +1083,10 @@ fn wire_cross_chunk_namespace_imports(
     // full character set so we don't miss namespaces whose underlying
     // file path contains uppercase characters.
     let ns_re = Regex::new(r"\b__ns_[A-Za-z0-9_]+\b").expect("regex compiles");
-    let var_decl_re =
-        Regex::new(r"var\s+(__ns_[A-Za-z0-9_]+)\s*=").expect("regex compiles");
+    let var_decl_re = Regex::new(r"var\s+(__ns_[A-Za-z0-9_]+)\s*=").expect("regex compiles");
 
     // imports_by_chunk[consumer_filename][owner_filename] = set of __ns_X
-    let mut imports_by_chunk: HashMap<String, HashMap<String, BTreeSet<String>>> =
-        HashMap::new();
+    let mut imports_by_chunk: HashMap<String, HashMap<String, BTreeSet<String>>> = HashMap::new();
 
     for (filename, code) in chunks.iter() {
         let mut used: HashSet<String> = HashSet::new();
