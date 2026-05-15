@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use ngc_diagnostics::{NgcError, NgcResult};
@@ -38,6 +38,22 @@ pub struct ChunkGraph {
     pub chunks: Vec<Chunk>,
     /// Map from dynamic import target path to its chunk filename.
     pub dynamic_import_map: HashMap<PathBuf, String>,
+    /// Map from every module path to the index of the chunk that owns it.
+    /// Built after partition; lets `bundle_chunk` resolve a cross-chunk
+    /// reference's target chunk in O(1) instead of scanning every chunk's
+    /// module list.
+    pub module_to_chunk_idx: HashMap<PathBuf, usize>,
+}
+
+/// Populate `module_to_chunk_idx` from the final chunk list.
+fn build_module_to_chunk_idx(chunks: &[Chunk]) -> HashMap<PathBuf, usize> {
+    let mut map = HashMap::new();
+    for (idx, chunk) in chunks.iter().enumerate() {
+        for module in &chunk.modules {
+            map.insert(module.clone(), idx);
+        }
+    }
+    map
 }
 
 /// Build a chunk graph by partitioning modules into main, lazy, and shared chunks.
@@ -94,79 +110,115 @@ pub fn build_chunk_graph(
             module_count = modules.len(),
             "no dynamic imports, single chunk"
         );
+        let chunks = vec![Chunk {
+            kind: ChunkKind::Main,
+            filename: "main.js".to_string(),
+            modules,
+            entry: entry.clone(),
+        }];
+        let module_to_chunk_idx = build_module_to_chunk_idx(&chunks);
         return Ok(ChunkGraph {
-            chunks: vec![Chunk {
-                kind: ChunkKind::Main,
-                filename: "main.js".to_string(),
-                modules,
-                entry: entry.clone(),
-            }],
+            chunks,
             dynamic_import_map: HashMap::new(),
+            module_to_chunk_idx,
         });
     }
 
-    // Step 2: Compute static-only reachability from main entry
-    let mut main_reachable = static_reachable(graph, *entry_idx);
+    // Partition into worker vs non-worker split points. Workers run in a
+    // separate ESM realm and can't import from non-worker chunks, so they
+    // must remain self-contained — they inline every module they statically
+    // reach, even if non-worker chunks also reach the same npm module. As
+    // a result workers do NOT participate in vendor-chunk grouping.
+    let non_worker_split_points: Vec<NodeIndex> = split_points
+        .iter()
+        .copied()
+        .filter(|sp| !worker_split_points.contains(sp))
+        .collect();
+    let worker_split_points_ordered: Vec<NodeIndex> = split_points
+        .iter()
+        .copied()
+        .filter(|sp| worker_split_points.contains(sp))
+        .collect();
 
-    // Force npm modules that are reachable from ANY entry point (main or split)
-    // into the main chunk.  The bundler's IIFE wrapping and namespace system
-    // only operates on the main chunk — npm modules that end up in lazy/shared
-    // chunks would be silently omitted, producing missing cross-chunk exports.
-    // We compute full reachability (all edge types) from the main entry to find
-    // all npm modules the app actually uses, excluding unreachable npm modules
-    // (e.g. test-only packages discovered by scanning non-entry files).
-    let all_reachable = all_reachable(graph, *entry_idx);
-    for idx in all_reachable {
-        if graph[idx]
-            .components()
-            .any(|c| c.as_os_str() == "node_modules")
-        {
-            main_reachable.insert(idx);
-        }
+    // Stable, deterministic ChunkId numbering for non-worker chunks: Main
+    // is always 0, non-worker lazies are 1..=N in `split_points` order.
+    // ChunkId is used as the key for importer-set grouping; small integers
+    // (rather than NodeIndex) keep keys cheap and independent of graph
+    // layout.
+    const MAIN_CHUNK_ID: u32 = 0;
+    let mut lazy_id_of: HashMap<NodeIndex, u32> = HashMap::new();
+    for (i, sp) in non_worker_split_points.iter().enumerate() {
+        lazy_id_of.insert(*sp, (i + 1) as u32);
     }
 
-    // Step 3: Compute static-only reachability from each split point
-    let mut split_reachable: HashMap<NodeIndex, HashSet<NodeIndex>> = HashMap::new();
-    for &sp in &split_points {
-        split_reachable.insert(sp, static_reachable(graph, sp));
+    // Compute static reachability from main + every non-worker split point.
+    // Workers are computed separately further down.
+    let main_reach = static_reachable(graph, *entry_idx);
+    let mut lazy_reach: HashMap<NodeIndex, HashSet<NodeIndex>> = HashMap::new();
+    for &sp in &non_worker_split_points {
+        lazy_reach.insert(sp, static_reachable(graph, sp));
     }
 
-    // Step 4: Assign modules to chunks
-    // - Module in main_reachable → main chunk
-    // - Module reachable from exactly 1 split point (not in main) → that lazy chunk
-    // - Module reachable from 2+ split points (not in main) → shared chunk
-
-    // For each non-main module, track which split points can reach it
-    let mut module_consumers: HashMap<NodeIndex, BTreeSet<NodeIndex>> = HashMap::new();
-    for (&sp, reachable) in &split_reachable {
+    // Invert: each non-worker-reachable module → set of non-worker chunks
+    // that statically reach it.
+    let mut importer_set: HashMap<NodeIndex, BTreeSet<u32>> = HashMap::new();
+    for &node in &main_reach {
+        importer_set.entry(node).or_default().insert(MAIN_CHUNK_ID);
+    }
+    for (&sp, reachable) in &lazy_reach {
+        let id = lazy_id_of[&sp];
         for &node in reachable {
-            if !main_reachable.contains(&node) {
-                module_consumers.entry(node).or_default().insert(sp);
-            }
+            importer_set.entry(node).or_default().insert(id);
         }
     }
 
-    // Group shared modules by their consumer set
-    let shared_groups: HashMap<BTreeSet<NodeIndex>, Vec<NodeIndex>> = HashMap::new();
+    // Classify each non-worker-reachable module. Per issue #131:
+    //
+    //   npm modules:
+    //     |set| == 1 && set == {Main}    → main
+    //     |set| == 1 && set == {Lazy(x)} → chunk x  (NEW — used to be forced into main)
+    //     |set| >= 2                     → vendor chunk grouped by importer-set
+    //
+    //   non-npm modules (scope deliberately conservative — issue #131 only
+    //   asks for npm vendor splitting):
+    //     Main ∈ set                     → main (preserves "statically reachable from main")
+    //     |set| == 1 && set == {Lazy(x)} → chunk x
+    //     |set| >= 2 (no Main)           → main (folded back, same as today)
+    let mut main_nodes: HashSet<NodeIndex> = HashSet::new();
     let mut lazy_exclusive: HashMap<NodeIndex, Vec<NodeIndex>> = HashMap::new();
-
-    for (&module, consumers) in &module_consumers {
-        if consumers.len() == 1 {
-            let sp = *consumers.iter().next().expect("consumer set is non-empty");
-            lazy_exclusive.entry(sp).or_default().push(module);
+    let mut vendor_groups: BTreeMap<BTreeSet<u32>, Vec<NodeIndex>> = BTreeMap::new();
+    for (&node, set) in &importer_set {
+        let is_npm = graph[node]
+            .components()
+            .any(|c| c.as_os_str() == "node_modules");
+        if is_npm {
+            if set.len() == 1 {
+                let only = *set.iter().next().expect("set non-empty");
+                if only == MAIN_CHUNK_ID {
+                    main_nodes.insert(node);
+                } else {
+                    let sp = non_worker_split_points[(only - 1) as usize];
+                    lazy_exclusive.entry(sp).or_default().push(node);
+                }
+            } else {
+                vendor_groups.entry(set.clone()).or_default().push(node);
+            }
+        } else if set.contains(&MAIN_CHUNK_ID) {
+            main_nodes.insert(node);
+        } else if set.len() == 1 {
+            let only = *set.iter().next().expect("set non-empty");
+            let sp = non_worker_split_points[(only - 1) as usize];
+            lazy_exclusive.entry(sp).or_default().push(node);
         } else {
-            // Modules needed by multiple lazy chunks go to the main chunk
-            // so they can be exported via `./main.js` cross-chunk imports.
-            // Putting them in separate shared chunks would require cross-chunk
-            // import resolution between non-main chunks, which isn't supported yet.
-            main_reachable.insert(module);
+            // Multi-consumer non-npm without Main: fold to main, same as
+            // pre-vendor behavior. Lifting this is out of scope for #131.
+            main_nodes.insert(node);
         }
     }
 
-    // Step 5: Build chunks with topological ordering
+    // Step 5: Build chunks with topological ordering.
 
-    // Main chunk
-    let main_ordered = toposort_subset(graph, *entry_idx, &main_reachable)?;
+    let main_ordered = toposort_subset(graph, *entry_idx, &main_nodes)?;
     let main_modules: Vec<PathBuf> = main_ordered.iter().map(|idx| graph[*idx].clone()).collect();
 
     let mut chunks = vec![Chunk {
@@ -178,22 +230,18 @@ pub fn build_chunk_graph(
 
     let mut dynamic_import_map: HashMap<PathBuf, String> = HashMap::new();
 
-    // Lazy chunks
-    for &sp in &split_points {
+    // Non-worker lazy chunks.
+    for &sp in &non_worker_split_points {
         let sp_path = graph[sp].clone();
 
-        // If the split point is in main_reachable, it stays in main — no lazy chunk
-        if main_reachable.contains(&sp) {
+        // If the split point itself was statically reachable from main, it
+        // stayed in `main_nodes` — no separate lazy chunk for it.
+        if main_nodes.contains(&sp) {
             continue;
         }
 
-        let filename = if worker_split_points.contains(&sp) {
-            worker_chunk_filename_from_path(&sp_path, root_dir)
-        } else {
-            chunk_filename_from_path(&sp_path, root_dir)
-        };
+        let filename = chunk_filename_from_path(&sp_path, root_dir);
 
-        // Modules exclusive to this lazy chunk + the split point itself
         let mut chunk_nodes: HashSet<NodeIndex> = HashSet::new();
         chunk_nodes.insert(sp);
         if let Some(exclusive) = lazy_exclusive.get(&sp) {
@@ -215,57 +263,67 @@ pub fn build_chunk_graph(
         });
     }
 
-    // Shared chunks
-    let mut shared_index = 0;
-    for nodes in shared_groups.values() {
-        let filename = format!("chunk-shared-{shared_index}.js");
-        shared_index += 1;
-
+    // Vendor (shared) chunks: one per unique importer-set.
+    // BTreeMap iteration is deterministic, and we hash the sorted module
+    // path set to produce a stable `chunk-<8hex>.js` filename.
+    let vendor_count = vendor_groups.len();
+    for (_set_key, nodes) in vendor_groups {
         let node_set: HashSet<NodeIndex> = nodes.iter().copied().collect();
-        // Pick any node as "entry" for toposort — use the first in the set
-        let first_node = *nodes.first().expect("shared group is non-empty");
-        let ordered = toposort_subset(graph, first_node, &node_set)?;
+        // Pick the lexicographically smallest module path as the chunk's
+        // toposort root and `entry` field — `toposort_subset_with_cycles`
+        // ignores the root argument and just sorts the subgraph, so any
+        // deterministic choice works.
+        let entry_node = *nodes
+            .iter()
+            .min_by_key(|n| graph[**n].to_string_lossy().to_string())
+            .expect("vendor group is non-empty");
+        let ordered = toposort_subset(graph, entry_node, &node_set)?;
         let modules: Vec<PathBuf> = ordered.iter().map(|idx| graph[*idx].clone()).collect();
-
-        // Use the first module as the chunk entry
-        let chunk_entry = modules.first().cloned().unwrap_or_default();
+        let entry_path = graph[entry_node].clone();
+        let filename = vendor_chunk_filename(&modules);
 
         chunks.push(Chunk {
             kind: ChunkKind::Shared,
             filename,
             modules,
-            entry: chunk_entry,
+            entry: entry_path,
+        });
+    }
+
+    // Worker chunks: inline every statically-reachable module. Workers do
+    // not participate in vendor extraction because they can't import
+    // non-worker chunks (separate ESM realm).
+    for &sp in &worker_split_points_ordered {
+        let sp_path = graph[sp].clone();
+        let filename = worker_chunk_filename_from_path(&sp_path, root_dir);
+        let reach = static_reachable(graph, sp);
+        let ordered = toposort_subset(graph, sp, &reach)?;
+        let modules: Vec<PathBuf> = ordered.iter().map(|idx| graph[*idx].clone()).collect();
+
+        dynamic_import_map.insert(sp_path.clone(), filename.clone());
+
+        chunks.push(Chunk {
+            kind: ChunkKind::Lazy,
+            filename,
+            modules,
+            entry: sp_path,
         });
     }
 
     debug!(
         chunk_count = chunks.len(),
-        lazy_count = split_points.len(),
-        shared_count = shared_index,
+        lazy_count = non_worker_split_points.len(),
+        worker_count = worker_split_points_ordered.len(),
+        vendor_count = vendor_count,
         "built chunk graph"
     );
 
+    let module_to_chunk_idx = build_module_to_chunk_idx(&chunks);
     Ok(ChunkGraph {
         chunks,
         dynamic_import_map,
+        module_to_chunk_idx,
     })
-}
-
-/// Compute the set of nodes reachable from `start` following all edge types.
-fn all_reachable(graph: &DiGraph<PathBuf, ImportKind>, start: NodeIndex) -> HashSet<NodeIndex> {
-    let mut visited = HashSet::new();
-    let mut stack = vec![start];
-
-    while let Some(node) = stack.pop() {
-        if !visited.insert(node) {
-            continue;
-        }
-        for neighbor in graph.neighbors(node) {
-            stack.push(neighbor);
-        }
-    }
-
-    visited
 }
 
 /// Compute the set of nodes reachable from `start` following only static edges.
@@ -530,6 +588,35 @@ fn scc_emit_deps_first(
     if emitted.insert(node) {
         order.push(node);
     }
+}
+
+/// Derive a vendor (shared) chunk filename `chunk-<8hex>.js`.
+///
+/// Hashes the sorted set of canonical module paths in the chunk with
+/// SHA-256, takes the first 8 hex characters. We hash module paths rather
+/// than chunk content because the content depends on the filenames of
+/// OTHER chunks the vendor imports from (cross-chunk `import { x } from
+/// './chunk-aaaa1111.js'`) — bytewise hashing would be circular. Path-set
+/// hashing is stable, deterministic, and only invalidates the filename
+/// when module membership changes, which matches `ng build`'s observed
+/// invalidation behavior.
+fn vendor_chunk_filename(modules: &[PathBuf]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut paths: Vec<String> = modules
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    paths.sort();
+    let mut hasher = Sha256::new();
+    for p in &paths {
+        hasher.update(p.as_bytes());
+        hasher.update(b"\n");
+    }
+    let digest = hasher.finalize();
+    format!(
+        "chunk-{:02x}{:02x}{:02x}{:02x}.js",
+        digest[0], digest[1], digest[2], digest[3]
+    )
 }
 
 /// Derive a worker chunk filename from a worker entry's file path.
@@ -870,11 +957,11 @@ mod tests {
         );
     }
 
+    /// Per issue #131: an npm module reachable from exactly one lazy chunk
+    /// (not from main) inlines into that lazy chunk. Previous behavior forced
+    /// it into main; the vendor-chunk algorithm fixes that.
     #[test]
-    fn test_npm_modules_forced_to_main_chunk() {
-        // main --dynamic--> lazy_component --static--> node_modules/cdk/overlay.mjs
-        // The npm module is only reachable via a dynamic import, but it must
-        // still end up in the main chunk for IIFE wrapping and cross-chunk exports.
+    fn test_npm_module_used_only_by_single_lazy_chunk_inlines() {
         let mut graph = DiGraph::new();
         let npm_mod = graph.add_node(make_path(
             "/root/node_modules/@angular/cdk/fesm2022/overlay.mjs",
@@ -892,25 +979,299 @@ mod tests {
         )
         .expect("should build chunk graph");
 
-        // npm module must be in the main chunk
+        // npm module must NOT be in main
         let main_chunk = &result.chunks[0];
         assert!(
-            main_chunk
+            !main_chunk
                 .modules
                 .iter()
                 .any(|m| m.to_string_lossy().contains("node_modules")),
-            "npm module should be in main chunk"
+            "npm module should NOT be in main (reachable only via lazy chunk)"
         );
+        // npm module must be in the single lazy chunk
+        let lazy_chunk = result
+            .chunks
+            .iter()
+            .find(|c| c.kind == ChunkKind::Lazy)
+            .expect("should have a lazy chunk");
+        assert!(
+            lazy_chunk
+                .modules
+                .iter()
+                .any(|m| m.to_string_lossy().contains("node_modules")),
+            "npm module should be in lazy chunk"
+        );
+        // No vendor chunk for a single-consumer npm.
+        assert!(
+            !result.chunks.iter().any(|c| c.kind == ChunkKind::Shared),
+            "no vendor chunk expected when |importer_set| == 1"
+        );
+    }
 
-        // Lazy chunk must NOT contain the npm module
+    /// Per issue #131: an npm module reachable from ≥2 chunks (no Main)
+    /// moves into a `chunk-<8hex>.js` vendor chunk shared between them.
+    #[test]
+    fn test_npm_module_used_by_two_lazy_chunks_creates_vendor_chunk() {
+        let mut graph = DiGraph::new();
+        let npm_mod = graph.add_node(make_path(
+            "/root/node_modules/@angular/cdk/fesm2022/overlay.mjs",
+        ));
+        let lazy_a = graph.add_node(make_path("/root/src/a/a.component.ts"));
+        let lazy_b = graph.add_node(make_path("/root/src/b/b.component.ts"));
+        let entry = graph.add_node(make_path("/root/src/main.ts"));
+
+        graph.add_edge(entry, lazy_a, ImportKind::Dynamic);
+        graph.add_edge(entry, lazy_b, ImportKind::Dynamic);
+        graph.add_edge(lazy_a, npm_mod, ImportKind::Static);
+        graph.add_edge(lazy_b, npm_mod, ImportKind::Static);
+
+        let result = build_chunk_graph(
+            &graph,
+            &make_path("/root/src/main.ts"),
+            Path::new("/root/src"),
+        )
+        .expect("should build chunk graph");
+
+        // Expect: main + 2 lazy + 1 vendor = 4 chunks
+        assert_eq!(result.chunks.len(), 4);
+
+        let vendor = result
+            .chunks
+            .iter()
+            .find(|c| c.kind == ChunkKind::Shared)
+            .expect("should have a vendor chunk for the shared npm module");
+        assert!(
+            vendor
+                .modules
+                .iter()
+                .any(|m| m.to_string_lossy().contains("overlay.mjs")),
+            "vendor chunk should contain the shared npm module"
+        );
+        // Lazy chunks must NOT contain the npm module (it lives in vendor)
         for chunk in result.chunks.iter().filter(|c| c.kind == ChunkKind::Lazy) {
             assert!(
                 !chunk
                     .modules
                     .iter()
                     .any(|m| m.to_string_lossy().contains("node_modules")),
-                "npm module should NOT be in lazy chunk"
+                "npm module should NOT be in lazy chunk {}",
+                chunk.filename
             );
         }
+        // Main has no npm here either.
+        assert!(!result.chunks[0]
+            .modules
+            .iter()
+            .any(|m| m.to_string_lossy().contains("node_modules")));
+    }
+
+    /// Per issue #131: an npm module reachable from Main AND ≥1 lazy chunk
+    /// moves OUT of main into an eager vendor chunk that main statically
+    /// imports. This is the case the HTML script-tag injector must surface
+    /// — main can't bootstrap until the vendor chunk has loaded.
+    #[test]
+    fn test_npm_module_used_by_main_and_lazy_creates_eager_vendor_chunk() {
+        let mut graph = DiGraph::new();
+        let npm_mod = graph.add_node(make_path(
+            "/root/node_modules/@angular/core/fesm2022/core.mjs",
+        ));
+        let lazy = graph.add_node(make_path("/root/src/admin/admin.component.ts"));
+        let entry = graph.add_node(make_path("/root/src/main.ts"));
+
+        graph.add_edge(entry, npm_mod, ImportKind::Static);
+        graph.add_edge(entry, lazy, ImportKind::Dynamic);
+        graph.add_edge(lazy, npm_mod, ImportKind::Static);
+
+        let result = build_chunk_graph(
+            &graph,
+            &make_path("/root/src/main.ts"),
+            Path::new("/root/src"),
+        )
+        .expect("should build chunk graph");
+
+        // Main must NOT include npm; it's been hoisted to a vendor chunk.
+        let main_chunk = &result.chunks[0];
+        assert!(
+            !main_chunk
+                .modules
+                .iter()
+                .any(|m| m.to_string_lossy().contains("node_modules")),
+            "main should not contain npm — extracted to vendor"
+        );
+        let vendor = result
+            .chunks
+            .iter()
+            .find(|c| c.kind == ChunkKind::Shared)
+            .expect("should have a vendor chunk");
+        assert!(vendor
+            .modules
+            .iter()
+            .any(|m| m.to_string_lossy().contains("core.mjs")));
+    }
+
+    /// Two npm modules with the same importer-set fold into the same vendor
+    /// chunk, not two separate chunks.
+    #[test]
+    fn test_npm_modules_with_identical_importer_set_grouped() {
+        let mut graph = DiGraph::new();
+        let pkg_a = graph.add_node(make_path("/root/node_modules/pkg-a/index.mjs"));
+        let pkg_b = graph.add_node(make_path("/root/node_modules/pkg-b/index.mjs"));
+        let lazy_a = graph.add_node(make_path("/root/src/a/a.component.ts"));
+        let lazy_b = graph.add_node(make_path("/root/src/b/b.component.ts"));
+        let entry = graph.add_node(make_path("/root/src/main.ts"));
+
+        graph.add_edge(entry, lazy_a, ImportKind::Dynamic);
+        graph.add_edge(entry, lazy_b, ImportKind::Dynamic);
+        graph.add_edge(lazy_a, pkg_a, ImportKind::Static);
+        graph.add_edge(lazy_a, pkg_b, ImportKind::Static);
+        graph.add_edge(lazy_b, pkg_a, ImportKind::Static);
+        graph.add_edge(lazy_b, pkg_b, ImportKind::Static);
+
+        let result = build_chunk_graph(
+            &graph,
+            &make_path("/root/src/main.ts"),
+            Path::new("/root/src"),
+        )
+        .expect("should build chunk graph");
+
+        let vendor_chunks: Vec<&Chunk> = result
+            .chunks
+            .iter()
+            .filter(|c| c.kind == ChunkKind::Shared)
+            .collect();
+        assert_eq!(vendor_chunks.len(), 1, "expected one vendor chunk");
+        let vendor = vendor_chunks[0];
+        assert!(vendor
+            .modules
+            .iter()
+            .any(|m| m.to_string_lossy().contains("pkg-a")));
+        assert!(vendor
+            .modules
+            .iter()
+            .any(|m| m.to_string_lossy().contains("pkg-b")));
+    }
+
+    /// Two npm modules with DIFFERENT importer-sets split into two distinct
+    /// vendor chunks — the partition matches webpack's "split point analysis"
+    /// shape and produces ~12 chunks on real Angular apps.
+    #[test]
+    fn test_npm_modules_with_different_importer_sets_split() {
+        let mut graph = DiGraph::new();
+        let pkg_a = graph.add_node(make_path("/root/node_modules/pkg-a/index.mjs"));
+        let pkg_b = graph.add_node(make_path("/root/node_modules/pkg-b/index.mjs"));
+        let lazy_a = graph.add_node(make_path("/root/src/a/a.component.ts"));
+        let lazy_b = graph.add_node(make_path("/root/src/b/b.component.ts"));
+        let lazy_c = graph.add_node(make_path("/root/src/c/c.component.ts"));
+        let entry = graph.add_node(make_path("/root/src/main.ts"));
+
+        graph.add_edge(entry, lazy_a, ImportKind::Dynamic);
+        graph.add_edge(entry, lazy_b, ImportKind::Dynamic);
+        graph.add_edge(entry, lazy_c, ImportKind::Dynamic);
+        // pkg-a is used by a + b
+        graph.add_edge(lazy_a, pkg_a, ImportKind::Static);
+        graph.add_edge(lazy_b, pkg_a, ImportKind::Static);
+        // pkg-b is used by a + c
+        graph.add_edge(lazy_a, pkg_b, ImportKind::Static);
+        graph.add_edge(lazy_c, pkg_b, ImportKind::Static);
+
+        let result = build_chunk_graph(
+            &graph,
+            &make_path("/root/src/main.ts"),
+            Path::new("/root/src"),
+        )
+        .expect("should build chunk graph");
+
+        let vendor_chunks: Vec<&Chunk> = result
+            .chunks
+            .iter()
+            .filter(|c| c.kind == ChunkKind::Shared)
+            .collect();
+        assert_eq!(
+            vendor_chunks.len(),
+            2,
+            "expected two distinct vendor chunks"
+        );
+    }
+
+    /// Filename regex: `chunk-<8hex>.js`.
+    #[test]
+    fn test_vendor_chunk_filename_is_chunk_8hex() {
+        let mut graph = DiGraph::new();
+        let pkg = graph.add_node(make_path("/root/node_modules/pkg/index.mjs"));
+        let lazy_a = graph.add_node(make_path("/root/src/a/a.component.ts"));
+        let lazy_b = graph.add_node(make_path("/root/src/b/b.component.ts"));
+        let entry = graph.add_node(make_path("/root/src/main.ts"));
+        graph.add_edge(entry, lazy_a, ImportKind::Dynamic);
+        graph.add_edge(entry, lazy_b, ImportKind::Dynamic);
+        graph.add_edge(lazy_a, pkg, ImportKind::Static);
+        graph.add_edge(lazy_b, pkg, ImportKind::Static);
+
+        let result = build_chunk_graph(
+            &graph,
+            &make_path("/root/src/main.ts"),
+            Path::new("/root/src"),
+        )
+        .expect("should build chunk graph");
+
+        let vendor = result
+            .chunks
+            .iter()
+            .find(|c| c.kind == ChunkKind::Shared)
+            .expect("vendor chunk");
+        let name = &vendor.filename;
+        assert!(
+            name.starts_with("chunk-")
+                && name.ends_with(".js")
+                && name.len() == "chunk-".len() + 8 + ".js".len(),
+            "expected chunk-<8hex>.js, got {name}"
+        );
+        // Hex digits only.
+        let hex = &name["chunk-".len().."chunk-".len() + 8];
+        assert!(
+            hex.chars().all(|c| c.is_ascii_hexdigit()),
+            "expected 8 hex chars, got {hex}"
+        );
+    }
+
+    /// Determinism: same input → same filenames + module ordering.
+    #[test]
+    fn test_vendor_chunk_partition_is_deterministic() {
+        fn build() -> ChunkGraph {
+            let mut graph = DiGraph::new();
+            let pkg_a = graph.add_node(make_path("/root/node_modules/pkg-a/index.mjs"));
+            let pkg_b = graph.add_node(make_path("/root/node_modules/pkg-b/index.mjs"));
+            let lazy_a = graph.add_node(make_path("/root/src/a/a.component.ts"));
+            let lazy_b = graph.add_node(make_path("/root/src/b/b.component.ts"));
+            let entry = graph.add_node(make_path("/root/src/main.ts"));
+            graph.add_edge(entry, lazy_a, ImportKind::Dynamic);
+            graph.add_edge(entry, lazy_b, ImportKind::Dynamic);
+            graph.add_edge(lazy_a, pkg_a, ImportKind::Static);
+            graph.add_edge(lazy_a, pkg_b, ImportKind::Static);
+            graph.add_edge(lazy_b, pkg_a, ImportKind::Static);
+            graph.add_edge(lazy_b, pkg_b, ImportKind::Static);
+            build_chunk_graph(
+                &graph,
+                &make_path("/root/src/main.ts"),
+                Path::new("/root/src"),
+            )
+            .expect("should build chunk graph")
+        }
+
+        let a = build();
+        let b = build();
+
+        let vendor_a: Vec<&str> = a
+            .chunks
+            .iter()
+            .filter(|c| c.kind == ChunkKind::Shared)
+            .map(|c| c.filename.as_str())
+            .collect();
+        let vendor_b: Vec<&str> = b
+            .chunks
+            .iter()
+            .filter(|c| c.kind == ChunkKind::Shared)
+            .map(|c| c.filename.as_str())
+            .collect();
+        assert_eq!(vendor_a, vendor_b);
     }
 }
