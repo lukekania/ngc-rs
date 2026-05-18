@@ -687,19 +687,40 @@ pub(crate) fn run_build_with_options(
     // Collect bare specifiers from project scanning AND from transformed output
     // (oxc may inject new imports like @oxc-project/runtime/helpers/decorate)
     let npm_span = tracing::info_span!("npm_resolve").entered();
-    let mut bare_specifiers: Vec<String> = file_graph.npm_import_sites.keys().cloned().collect();
+    // `externalDependencies` from angular.json — these are NOT bundled
+    // (their imports stay as bare ESM specifiers for the runtime to
+    // resolve via an import map / CDN). Build the set once and use it
+    // to filter every list we hand to `resolve_npm_dependencies` so the
+    // BFS never walks into an externalised package's modules.
+    let external_specifiers: std::collections::HashSet<String> = angular_project
+        .as_ref()
+        .map(|ap| ap.external_dependencies.iter().cloned().collect())
+        .unwrap_or_default();
+    let is_external = |spec: &str| -> bool {
+        external_specifiers.contains(spec)
+            || external_specifiers.iter().any(|ext| {
+                spec.starts_with(ext.as_str()) && spec[ext.len()..].starts_with('/')
+            })
+    };
+    let mut bare_specifiers: Vec<String> = file_graph
+        .npm_import_sites
+        .keys()
+        .filter(|s| !is_external(s))
+        .cloned()
+        .collect();
     let post_transform_specifiers = scan_transformed_bare_specifiers(&modules, &local_prefixes);
     for spec in post_transform_specifiers {
-        if !bare_specifiers.contains(&spec) {
+        if !bare_specifiers.contains(&spec) && !is_external(&spec) {
             bare_specifiers.push(spec);
         }
     }
     let export_conditions =
         ngc_npm_resolver::package_json::conditions_for_configuration(configuration);
-    let mut npm_resolution = ngc_npm_resolver::resolve_npm_dependencies(
+    let mut npm_resolution = ngc_npm_resolver::resolve_npm_dependencies_with_externals(
         &bare_specifiers,
         &config_dir,
         export_conditions,
+        &external_specifiers,
     )?;
 
     // Merge npm modules into the modules map (they're already JS — no transform needed)
@@ -759,7 +780,7 @@ pub(crate) fn run_build_with_options(
     let prescan_new: Vec<String> = if public_exports.has_specifier_outside(&bare_set) {
         ngc_linker::flatten::scan_introduced_specifiers(&modules, &registry, &public_exports)
             .into_iter()
-            .filter(|s| !bare_set.contains(s))
+            .filter(|s| !bare_set.contains(s) && !is_external(s))
             .collect()
     } else {
         Vec::new()
@@ -771,10 +792,11 @@ pub(crate) fn run_build_with_options(
             prescan_new
         );
         bare_specifiers.extend(prescan_new.iter().cloned());
-        let extra = ngc_npm_resolver::resolve_npm_dependencies(
+        let extra = ngc_npm_resolver::resolve_npm_dependencies_with_externals(
             &prescan_new,
             &config_dir,
             export_conditions,
+            &external_specifiers,
         )?;
         tracing::info!(
             "pre-scan: pulled in {} additional file(s) before flatten",
@@ -854,7 +876,7 @@ pub(crate) fn run_build_with_options(
     let post_link_specifiers = scan_transformed_bare_specifiers(&project_modules, &local_prefixes);
     let mut new_specifiers: Vec<String> = Vec::new();
     for spec in post_link_specifiers {
-        if !bare_specifiers.contains(&spec) {
+        if !bare_specifiers.contains(&spec) && !is_external(&spec) {
             new_specifiers.push(spec);
         }
     }
@@ -865,10 +887,11 @@ pub(crate) fn run_build_with_options(
             new_specifiers
         );
         bare_specifiers.extend(new_specifiers.iter().cloned());
-        let extra = ngc_npm_resolver::resolve_npm_dependencies(
+        let extra = ngc_npm_resolver::resolve_npm_dependencies_with_externals(
             &new_specifiers,
             &config_dir,
             export_conditions,
+            &external_specifiers,
         )?;
         tracing::info!(
             "post-flatten npm resolution pulled in {} file(s)",
@@ -1011,6 +1034,14 @@ pub(crate) fn run_build_with_options(
         drop(define_span);
     }
 
+    // Belt-and-braces: even though the resolver was told to skip externals,
+    // strip them from `bundled_specifiers` so the rewriter never sees an
+    // externalised name in its "local" set. This also handles the edge
+    // case where `inject_oxc_runtime_helpers` adds a specifier later — if
+    // somehow an external name showed up, this last filter keeps the
+    // bundle output correct.
+    bundled_specifiers.retain(|s| !external_specifiers.contains(s));
+
     let bundle_input = BundleInput {
         modules,
         graph,
@@ -1020,6 +1051,7 @@ pub(crate) fn run_build_with_options(
         options: bundle_options,
         per_module_maps,
         bundled_specifiers,
+        external_specifiers,
         export_conditions: export_conditions.iter().map(|s| (*s).to_string()).collect(),
     };
     drop(graph_span);

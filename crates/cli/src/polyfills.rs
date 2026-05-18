@@ -264,6 +264,7 @@ pub fn generate_polyfills(
         options: polyfill_bundle_options,
         per_module_maps,
         bundled_specifiers,
+        external_specifiers: Default::default(),
         export_conditions: export_conditions.iter().map(|s| (*s).to_string()).collect(),
     };
 

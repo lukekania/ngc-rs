@@ -81,6 +81,7 @@ fn worker_new_url_is_bundled_as_separate_chunk_and_rewritten() {
         options: BundleOptions::default(),
         per_module_maps: HashMap::new(),
         bundled_specifiers: Default::default(),
+        external_specifiers: Default::default(),
         export_conditions: Vec::new(),
     };
 
@@ -207,6 +208,7 @@ fn worker_url_in_class_constructor_under_web_worker_dir_is_rewritten() {
         options: BundleOptions::default(),
         per_module_maps: HashMap::new(),
         bundled_specifiers: Default::default(),
+        external_specifiers: Default::default(),
         export_conditions: Vec::new(),
     };
 
@@ -301,6 +303,7 @@ fn worker_url_rewrite_uses_content_hashed_filename() {
         },
         per_module_maps: HashMap::new(),
         bundled_specifiers: Default::default(),
+        external_specifiers: Default::default(),
         export_conditions: Vec::new(),
     };
 

@@ -44,6 +44,36 @@ pub fn resolve_npm_dependencies(
     project_root: &Path,
     conditions: &[&str],
 ) -> NgcResult<NpmResolution> {
+    resolve_npm_dependencies_with_externals(specifiers, project_root, conditions, &HashSet::new())
+}
+
+/// Returns `true` when `specifier` matches one of the externalised package
+/// names — either exactly (`jquery` matches `jquery`) or as a subpath
+/// (`jquery/dist/slim` matches `jquery`). Mirrors esbuild's `--external`
+/// matching used by `@angular/build:application`.
+fn is_external_specifier(specifier: &str, externals: &HashSet<String>) -> bool {
+    if externals.is_empty() {
+        return false;
+    }
+    if externals.contains(specifier) {
+        return true;
+    }
+    externals
+        .iter()
+        .any(|ext| specifier.starts_with(ext) && specifier[ext.len()..].starts_with('/'))
+}
+
+/// Variant of [`resolve_npm_dependencies`] that skips any specifier whose
+/// package name appears in `externals`. The BFS does not walk into those
+/// packages, so their modules never enter the bundle — they stay as bare
+/// runtime imports for the host (browser import map, CDN loader) to
+/// resolve. Used to honour `angular.json`'s `externalDependencies`.
+pub fn resolve_npm_dependencies_with_externals(
+    specifiers: &[String],
+    project_root: &Path,
+    conditions: &[&str],
+    externals: &HashSet<String>,
+) -> NgcResult<NpmResolution> {
     let node_modules = project_root.join("node_modules");
     if !node_modules.is_dir() {
         debug!("no node_modules directory found, skipping npm resolution");
@@ -80,6 +110,7 @@ pub fn resolve_npm_dependencies(
     // probes — fully independent per specifier.
     let initial_entries: Vec<(String, PathBuf)> = specifiers
         .par_iter()
+        .filter(|spec| !is_external_specifier(spec, externals))
         .filter_map(|spec| {
             let outcome = if spec.starts_with('#') {
                 resolve::resolve_subpath_import(spec, None, project_root, conditions)
@@ -134,6 +165,12 @@ pub fn resolve_npm_dependencies(
                 let mut resolved_imports: Vec<ResolvedImport> = Vec::with_capacity(scanned.len());
 
                 for import in &scanned {
+                    // Honour `externalDependencies`: an import targeting an
+                    // externalised package never enters the BFS, so the
+                    // package's modules never reach the bundler.
+                    if is_external_specifier(&import.specifier, externals) {
+                        continue;
+                    }
                     let kind = if import.is_dynamic {
                         ImportKind::Dynamic
                     } else {
@@ -305,6 +342,69 @@ mod tests {
 
         // Should have edges: index->utils (relative), index->beta (bare)
         assert_eq!(result.edges.len(), 2, "should have 2 dependency edges");
+    }
+
+    #[test]
+    fn test_externals_skip_top_level_and_transitive() {
+        // Issue #146: a package listed in `externalDependencies` must NOT
+        // enter the resolution — neither when requested directly nor when
+        // reached transitively from another package.
+        let dir = tempfile::tempdir().unwrap();
+        setup_crawl_fixture(dir.path());
+
+        let mut externals = HashSet::new();
+        externals.insert("beta".to_string());
+
+        let result = resolve_npm_dependencies_with_externals(
+            &["alpha".to_string(), "beta".to_string()],
+            dir.path(),
+            DEV,
+            &externals,
+        )
+        .expect("should resolve");
+
+        // alpha + utils.mjs only — beta is external so its index.mjs must
+        // not appear in modules and `beta` must not show up in resolved.
+        assert_eq!(result.modules.len(), 2, "beta's modules must not be pulled in");
+        assert!(
+            !result.resolved_specifiers.contains("beta"),
+            "external 'beta' must not appear in resolved_specifiers"
+        );
+        assert!(result.resolved_specifiers.contains("alpha"));
+    }
+
+    #[test]
+    fn test_externals_match_subpath() {
+        let dir = tempfile::tempdir().unwrap();
+        // Set up a single package that imports a subpath of an external pkg.
+        let pkg_dir = dir.path().join("node_modules/consumer");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(
+            pkg_dir.join("package.json"),
+            r#"{ "module": "./index.mjs" }"#,
+        )
+        .unwrap();
+        fs::write(
+            pkg_dir.join("index.mjs"),
+            "import slim from 'jquery/dist/jquery.slim';\nexport default slim;\n",
+        )
+        .unwrap();
+
+        let mut externals = HashSet::new();
+        externals.insert("jquery".to_string());
+
+        let result = resolve_npm_dependencies_with_externals(
+            &["consumer".to_string()],
+            dir.path(),
+            DEV,
+            &externals,
+        )
+        .expect("should resolve");
+
+        // Only consumer is pulled in; the subpath import of jquery is
+        // treated as external and never walked.
+        assert_eq!(result.modules.len(), 1);
+        assert!(!result.resolved_specifiers.contains("jquery/dist/jquery.slim"));
     }
 
     #[test]

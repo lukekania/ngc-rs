@@ -135,6 +135,7 @@ fn build_two_lazy_routes_sharing_npm(root: &std::path::Path) -> BundleInput {
         options: BundleOptions::default(),
         per_module_maps: HashMap::new(),
         bundled_specifiers: npm.resolved_specifiers.clone(),
+        external_specifiers: Default::default(),
         export_conditions: Vec::new(),
     }
 }

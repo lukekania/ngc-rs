@@ -134,6 +134,7 @@ fn subpath_import_helper_is_inlined_into_main_chunk() {
         options: BundleOptions::default(),
         per_module_maps: HashMap::new(),
         bundled_specifiers: npm.resolved_specifiers.clone(),
+        external_specifiers: Default::default(),
         export_conditions: Vec::new(),
     };
 
@@ -270,6 +271,7 @@ fn subpath_import_in_lazy_chunk_does_not_leak_to_main_import() {
         options: BundleOptions::default(),
         per_module_maps: HashMap::new(),
         bundled_specifiers: npm.resolved_specifiers.clone(),
+        external_specifiers: Default::default(),
         export_conditions: Vec::new(),
     };
 
@@ -421,6 +423,7 @@ fn subpath_import_const_referenced_from_class_field_survives_tree_shake() {
         },
         per_module_maps: HashMap::new(),
         bundled_specifiers: npm.resolved_specifiers.clone(),
+        external_specifiers: Default::default(),
         export_conditions: Vec::new(),
     };
 
@@ -526,6 +529,7 @@ fn relative_import_const_referenced_from_class_field_survives_tree_shake() {
         },
         per_module_maps: HashMap::new(),
         bundled_specifiers: npm.resolved_specifiers.clone(),
+        external_specifiers: Default::default(),
         export_conditions: Vec::new(),
     };
 
