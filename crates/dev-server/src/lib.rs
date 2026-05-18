@@ -93,6 +93,9 @@ pub struct DevServerConfig {
     /// server mounts at `/`. Mirrors `@angular/build:dev-server`'s
     /// `servePath` option for subpath deploys.
     pub serve_path: Option<String>,
+    /// User-supplied `allowedHosts` patterns. Empty (= default) means
+    /// `auto`: loopback hosts plus the bind host. See [`AllowedHosts`].
+    pub allowed_hosts: Vec<String>,
 }
 
 impl DevServerConfig {
@@ -104,6 +107,7 @@ impl DevServerConfig {
             host: "127.0.0.1".to_string(),
             port: 4200,
             serve_path: None,
+            allowed_hosts: Vec::new(),
         }
     }
 
@@ -124,6 +128,17 @@ impl DevServerConfig {
     /// `/foo/` form so callers don't need to remember to add slashes.
     pub fn with_serve_path(mut self, serve_path: Option<&str>) -> Self {
         self.serve_path = serve_path.and_then(normalize_serve_path);
+        self
+    }
+
+    /// Replace the `allowedHosts` patterns the dev server's Host-header
+    /// check accepts. See [`AllowedHosts`] for the matching semantics.
+    pub fn with_allowed_hosts<I, S>(mut self, hosts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.allowed_hosts = hosts.into_iter().map(Into::into).collect();
         self
     }
 }
@@ -151,6 +166,140 @@ pub fn normalize_serve_path(raw: &str) -> Option<String> {
         None
     } else {
         Some(out)
+    }
+}
+
+/// Decides whether an incoming HTTP request's `Host:` header is permitted.
+///
+/// Mirrors `@angular/build:dev-server`'s `allowedHosts` option (which in
+/// turn matches Vite's `server.allowedHosts`). Loopback hosts
+/// (`localhost`, `127.0.0.1`, `[::1]`) are always accepted regardless of
+/// configuration — local development must always work. On top of that:
+///
+/// * The literal pattern `"all"` disables the check entirely.
+/// * The literal pattern `"auto"` (or an empty configuration) additionally
+///   accepts the bind host, so a server bound to `192.168.1.10` accepts
+///   `Host: 192.168.1.10` without further configuration.
+/// * Anything else is an exact, case-insensitive hostname match. The
+///   port portion of the `Host:` header is stripped before comparison.
+#[derive(Debug, Clone)]
+pub struct AllowedHosts {
+    accept_all: bool,
+    explicit: Vec<String>,
+    bind_host: Option<String>,
+}
+
+impl AllowedHosts {
+    /// Resolve the user-supplied `allowedHosts` patterns against the
+    /// `bind_host` the dev server is listening on.
+    ///
+    /// Empty input is treated as `"auto"` so callers that never opt in
+    /// still get the historical "loopback + bind host" behavior.
+    pub fn resolve(patterns: &[String], bind_host: &str) -> Self {
+        let mut accept_all = false;
+        let mut auto = false;
+        let mut explicit: Vec<String> = Vec::new();
+        let mut any = false;
+        for p in patterns {
+            any = true;
+            let trimmed = p.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let lower = trimmed.to_ascii_lowercase();
+            match lower.as_str() {
+                "all" => accept_all = true,
+                "auto" => auto = true,
+                _ => explicit.push(lower),
+            }
+        }
+        // Default (no patterns supplied) == "auto" — accept the bind host
+        // on top of the loopback defaults so projects that bind to a LAN
+        // IP still respond to that IP without explicit allow-listing.
+        if !any {
+            auto = true;
+        }
+        let bind_host = if auto {
+            normalized_bind_host(bind_host)
+        } else {
+            None
+        };
+        Self {
+            accept_all,
+            explicit,
+            bind_host,
+        }
+    }
+
+    /// Returns `true` when the dev server is configured to accept every
+    /// `Host:` header (i.e. the user passed `"all"`).
+    pub fn accepts_all(&self) -> bool {
+        self.accept_all
+    }
+
+    /// Decide whether a request bearing this `Host:` header value should
+    /// be served. A missing or empty header counts as a mismatch.
+    pub fn is_allowed(&self, host_header: &str) -> bool {
+        if self.accept_all {
+            return true;
+        }
+        let stripped = strip_port(host_header.trim());
+        if stripped.is_empty() {
+            return false;
+        }
+        let host = stripped.to_ascii_lowercase();
+        if is_loopback_host(&host) {
+            return true;
+        }
+        if let Some(bh) = &self.bind_host {
+            if &host == bh {
+                return true;
+            }
+        }
+        self.explicit.iter().any(|p| p == &host)
+    }
+}
+
+/// Lowercase + lookup-normalize a `bind_host` for use in `AllowedHosts`.
+///
+/// Returns `None` when the bind host is a wildcard (`0.0.0.0`, `::`, `[::]`)
+/// or a loopback alias — there's nothing useful to add beyond the
+/// loopback defaults the allowlist already accepts.
+fn normalized_bind_host(bind_host: &str) -> Option<String> {
+    let host = bind_host.trim().to_ascii_lowercase();
+    if host.is_empty()
+        || matches!(host.as_str(), "0.0.0.0" | "::" | "[::]")
+        || is_loopback_host(&host)
+    {
+        return None;
+    }
+    Some(host)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
+}
+
+/// Strip the port from a `Host:` header value, leaving the hostname
+/// (or IP literal) intact.
+///
+/// Handles three shapes:
+///   * `host`            → `host`
+///   * `host:port`       → `host`
+///   * `[v6]:port`       → `[v6]` (brackets preserved so the value can be
+///     compared against the canonical IPv6 loopback literal `[::1]`)
+fn strip_port(host: &str) -> &str {
+    if let Some(rest) = host.strip_prefix('[') {
+        if let Some(end_rel) = rest.find(']') {
+            // end_rel is the position of `]` within `rest`; +2 accounts
+            // for the opening `[` we stripped and the `]` itself.
+            return &host[..end_rel + 2];
+        }
+        return host;
+    }
+    match host.rfind(':') {
+        Some(i) => &host[..i],
+        None => host,
     }
 }
 
@@ -211,9 +360,19 @@ impl DevServer {
         let request_clients = Arc::clone(&clients);
         let serve_path = config.serve_path.clone();
         let serve_path_for_loop = serve_path.clone();
+        let allowed_hosts = Arc::new(AllowedHosts::resolve(&config.allowed_hosts, &config.host));
+        let allowed_hosts_for_loop = Arc::clone(&allowed_hosts);
         let join = thread::Builder::new()
             .name("ngc-dev-server-accept".into())
-            .spawn(move || serve_loop(request_server, root, request_clients, serve_path_for_loop))
+            .spawn(move || {
+                serve_loop(
+                    request_server,
+                    root,
+                    request_clients,
+                    serve_path_for_loop,
+                    allowed_hosts_for_loop,
+                )
+            })
             .map_err(|e| NgcError::ServeError {
                 message: format!("could not spawn accept thread: {e}"),
             })?;
@@ -341,13 +500,22 @@ pub fn sse_frame(event: &DevServerEvent) -> String {
     }
 }
 
-fn serve_loop(server: Arc<Server>, root: PathBuf, clients: SseClients, serve_path: Option<String>) {
+fn serve_loop(
+    server: Arc<Server>,
+    root: PathBuf,
+    clients: SseClients,
+    serve_path: Option<String>,
+    allowed_hosts: Arc<AllowedHosts>,
+) {
     for request in server.incoming_requests() {
         let root = root.clone();
         let clients = Arc::clone(&clients);
         let serve_path = serve_path.clone();
+        let allowed_hosts = Arc::clone(&allowed_hosts);
         thread::spawn(move || {
-            if let Err(e) = handle_request(request, &root, &clients, serve_path.as_deref()) {
+            if let Err(e) =
+                handle_request(request, &root, &clients, serve_path.as_deref(), &allowed_hosts)
+            {
                 tracing::warn!(error = %e, "dev server request failed");
             }
         });
@@ -359,10 +527,16 @@ fn handle_request(
     root: &Path,
     clients: &SseClients,
     serve_path: Option<&str>,
+    allowed_hosts: &AllowedHosts,
 ) -> NgcResult<()> {
     if !matches!(request.method(), Method::Get | Method::Head) {
         let resp = Response::from_string("method not allowed").with_status_code(StatusCode(405));
         return request.respond(resp).map_err(io_err);
+    }
+
+    let host_header = host_header_value(&request);
+    if !allowed_hosts.is_allowed(&host_header) {
+        return respond_disallowed_host(request, &host_header);
     }
 
     let url = request.url().to_string();
@@ -381,6 +555,41 @@ fn handle_request(
     }
 
     serve_static(request, root, stripped, serve_path)
+}
+
+/// Read the request's `Host:` header value, or return the empty string when
+/// the client didn't send one. HTTP/1.1 requires the header, but a misbehaving
+/// client (or a port scanner sending an HTTP/1.0 request) could omit it — in
+/// that case the allow-list check treats it as a mismatch.
+fn host_header_value(request: &tiny_http::Request) -> String {
+    request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Host"))
+        .map(|h| h.value.as_str().to_string())
+        .unwrap_or_default()
+}
+
+/// Render the 403 returned for a `Host:` header that's not in the allow
+/// list. The body is plain text and points the user at the two knobs that
+/// fix it — same wording for the CLI flag and the builder option so a
+/// search of either turns up the same hit.
+fn respond_disallowed_host(request: tiny_http::Request, host_header: &str) -> NgcResult<()> {
+    let display = if host_header.is_empty() {
+        "<missing Host header>".to_string()
+    } else {
+        host_header.to_string()
+    };
+    let body = format!(
+        "ngc-rs dev server: blocked request for host \"{display}\".\n\n\
+         The host is not in the dev server's allowedHosts list.\n\
+         To allow it, either:\n\
+           - add it to `architect.serve.options.allowedHosts` in angular.json, or\n\
+           - pass `--allowed-hosts {display}` to `ngc-rs serve`.\n\
+         Use `\"all\"` to disable the host check entirely.\n"
+    );
+    let resp = Response::from_string(body).with_status_code(StatusCode(403));
+    request.respond(resp).map_err(io_err)
 }
 
 /// Strip the `serve_path` prefix from `path`, returning the remainder
@@ -973,5 +1182,113 @@ mod tests {
         // Other behavior is preserved.
         assert!(script.contains("addEventListener('reload'"));
         assert!(script.contains("addEventListener('build-failed'"));
+    }
+
+    #[test]
+    fn strip_port_handles_bare_hostname() {
+        assert_eq!(strip_port("example.com"), "example.com");
+        assert_eq!(strip_port("localhost"), "localhost");
+    }
+
+    #[test]
+    fn strip_port_drops_port_from_ipv4_and_hostname() {
+        assert_eq!(strip_port("example.com:4200"), "example.com");
+        assert_eq!(strip_port("127.0.0.1:4200"), "127.0.0.1");
+    }
+
+    #[test]
+    fn strip_port_preserves_ipv6_brackets() {
+        assert_eq!(strip_port("[::1]"), "[::1]");
+        assert_eq!(strip_port("[::1]:4200"), "[::1]");
+        assert_eq!(strip_port("[2001:db8::1]:8080"), "[2001:db8::1]");
+    }
+
+    #[test]
+    fn allowed_hosts_default_accepts_loopback_and_bind_host() {
+        let ah = AllowedHosts::resolve(&[], "192.168.1.10");
+        assert!(ah.is_allowed("localhost"));
+        assert!(ah.is_allowed("localhost:4200"));
+        assert!(ah.is_allowed("127.0.0.1"));
+        assert!(ah.is_allowed("[::1]:4200"));
+        assert!(ah.is_allowed("192.168.1.10"));
+        assert!(ah.is_allowed("192.168.1.10:4200"));
+        assert!(!ah.is_allowed("my-app.ngrok.io"));
+        assert!(!ah.is_allowed("evil.example.com"));
+    }
+
+    #[test]
+    fn allowed_hosts_all_accepts_anything() {
+        let ah = AllowedHosts::resolve(&["all".to_string()], "127.0.0.1");
+        assert!(ah.accepts_all());
+        assert!(ah.is_allowed("evil.example.com"));
+        assert!(ah.is_allowed("my-app.ngrok.io:443"));
+        // An empty Host header still counts as accepted when the user
+        // opted in to "all" — that's the documented bypass.
+        assert!(ah.is_allowed(""));
+    }
+
+    #[test]
+    fn allowed_hosts_explicit_matches_exact_hostnames_case_insensitively() {
+        let ah = AllowedHosts::resolve(&["my-app.ngrok.io".to_string()], "127.0.0.1");
+        assert!(ah.is_allowed("my-app.ngrok.io"));
+        assert!(ah.is_allowed("My-App.NgRoK.io"));
+        assert!(ah.is_allowed("my-app.ngrok.io:8443"));
+        assert!(!ah.is_allowed("other.ngrok.io"));
+        assert!(!ah.is_allowed("evil.com"));
+        // Loopback is always accepted on top of explicit entries.
+        assert!(ah.is_allowed("localhost"));
+        assert!(ah.is_allowed("127.0.0.1"));
+    }
+
+    #[test]
+    fn allowed_hosts_explicit_without_auto_does_not_accept_bind_host() {
+        // Without "auto", the bind host is NOT auto-allowed — the user
+        // explicitly listed which non-loopback hosts to trust.
+        let ah = AllowedHosts::resolve(
+            &["my-app.ngrok.io".to_string()],
+            "192.168.1.10",
+        );
+        assert!(!ah.is_allowed("192.168.1.10"));
+        assert!(ah.is_allowed("my-app.ngrok.io"));
+    }
+
+    #[test]
+    fn allowed_hosts_auto_re_enables_bind_host_alongside_explicit_entries() {
+        let ah = AllowedHosts::resolve(
+            &["auto".to_string(), "my-app.ngrok.io".to_string()],
+            "192.168.1.10",
+        );
+        assert!(ah.is_allowed("192.168.1.10"));
+        assert!(ah.is_allowed("my-app.ngrok.io"));
+        assert!(!ah.is_allowed("evil.com"));
+    }
+
+    #[test]
+    fn allowed_hosts_rejects_missing_host_header_by_default() {
+        let ah = AllowedHosts::resolve(&[], "127.0.0.1");
+        assert!(!ah.is_allowed(""));
+        assert!(!ah.is_allowed("   "));
+    }
+
+    #[test]
+    fn allowed_hosts_skips_wildcard_bind_address() {
+        // Binding to 0.0.0.0 doesn't auto-allow "0.0.0.0" as a hostname —
+        // that's never a meaningful Host: header value. Loopback still works.
+        let ah = AllowedHosts::resolve(&[], "0.0.0.0");
+        assert!(ah.is_allowed("localhost"));
+        assert!(ah.is_allowed("127.0.0.1"));
+        assert!(!ah.is_allowed("0.0.0.0"));
+        assert!(!ah.is_allowed("192.168.1.10"));
+    }
+
+    #[test]
+    fn allowed_hosts_ignores_empty_and_whitespace_patterns() {
+        let ah = AllowedHosts::resolve(
+            &["".to_string(), "   ".to_string(), "ok.example".to_string()],
+            "127.0.0.1",
+        );
+        assert!(ah.is_allowed("ok.example"));
+        assert!(ah.is_allowed("localhost"));
+        assert!(!ah.is_allowed("nope.example"));
     }
 }
