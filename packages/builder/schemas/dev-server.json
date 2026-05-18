@@ -63,6 +63,11 @@
     "servePath": {
       "type": "string",
       "description": "URL path prefix to mount the dev server under (e.g. \"/admin/\"). Mirrors @angular/build:dev-server's servePath option for projects deployed behind a subpath. When set, the served index.html is rewritten to use the same value as <base href> unless angular.json already configures one explicitly."
+    },
+    "allowedHosts": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "List of host names the dev server's Host-header check accepts. Loopback hosts (localhost, 127.0.0.1, [::1]) are always allowed. The special value \"all\" disables the check entirely. The special value \"auto\" additionally accepts the configured bind host. Use this to expose the dev server through tunneling proxies (ngrok, Cloudflare Tunnel, GitHub Codespaces) or non-default local hostnames (*.localhost, app.local)."
     }
   },
   "additionalProperties": false

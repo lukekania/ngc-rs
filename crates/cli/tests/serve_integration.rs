@@ -83,6 +83,7 @@ fn serve_help_lists_all_flags() {
         "--host",
         "--open",
         "--serve-path",
+        "--allowed-hosts",
     ] {
         assert!(
             stdout.contains(flag),

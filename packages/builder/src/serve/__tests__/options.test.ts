@@ -100,6 +100,41 @@ describe('translateOptions', () => {
       translateOptions({ ...base, servePath: '' }, '/ws').args,
     ).not.toContain('--serve-path');
   });
+
+  it('forwards a non-empty allowedHosts list as a comma-joined --allowed-hosts arg', () => {
+    const t = translateOptions(
+      { ...base, allowedHosts: ['my-app.ngrok.io', 'app.local'] },
+      '/ws',
+    );
+    const idx = t.args.indexOf('--allowed-hosts');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(t.args[idx + 1]).toBe('my-app.ngrok.io,app.local');
+  });
+
+  it('passes through the "all" sentinel verbatim', () => {
+    const t = translateOptions({ ...base, allowedHosts: ['all'] }, '/ws');
+    const idx = t.args.indexOf('--allowed-hosts');
+    expect(t.args[idx + 1]).toBe('all');
+  });
+
+  it('drops empty / whitespace-only allowedHosts entries and dedupes case-insensitively', () => {
+    const t = translateOptions(
+      {
+        ...base,
+        allowedHosts: ['', '   ', 'foo.example', 'Foo.Example', 'bar.example'],
+      },
+      '/ws',
+    );
+    const idx = t.args.indexOf('--allowed-hosts');
+    expect(t.args[idx + 1]).toBe('foo.example,bar.example');
+  });
+
+  it('omits --allowed-hosts when the list is empty or unset', () => {
+    expect(
+      translateOptions({ ...base, allowedHosts: [] }, '/ws').args,
+    ).not.toContain('--allowed-hosts');
+    expect(translateOptions(base, '/ws').args).not.toContain('--allowed-hosts');
+  });
 });
 
 describe('formatUrl', () => {
