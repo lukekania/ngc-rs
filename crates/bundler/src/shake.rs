@@ -337,106 +337,138 @@ fn resolve_local_specifier(
     None
 }
 
-/// Collect symbol names imported by `consumer_modules` from any module in
-/// `provider_modules`, by parsing each consumer's source for `ImportDeclaration`
-/// statements and resolving their specifiers against the provider set.
+/// Per-provider collection of names consumed cross-chunk.
 ///
-/// Used by the bundler to tell the main-chunk tree-shaker which symbols are
-/// consumed by lazy chunks and must therefore be preserved — such consumption
-/// is invisible when shaking each chunk in isolation, and would otherwise
-/// leave the cross-chunk `export { ... }` block referring to names whose
-/// declarations have been tree-shaken away.
+/// Returns a `Vec<HashSet<String>>` indexed by chunk index. `result[i]` holds
+/// the set of names that modules in *other* chunks import from any module
+/// owned by chunk `i`. Used by the bundler's per-chunk tree-shaker so a
+/// vendor chunk holding `@angular/core` / `rxjs` can drop exports no
+/// consumer references, instead of pinning every name the package declares
+/// just because its entry walk happens to reach them.
 ///
-/// For named and default imports, the specific name is collected. For
-/// namespace imports (`import * as X from '...'`), every exported name of
-/// the target provider module is collected since individual accesses can't
-/// be known statically here.
-pub fn collect_cross_chunk_used_names(
-    consumer_modules: &[PathBuf],
-    provider_modules: &[PathBuf],
+/// `specifier_to_path` resolves bare npm specifiers (`'@angular/core'`) to
+/// the canonical entry-module path so bare-specifier imports can be
+/// attributed to their owning provider chunk. Relative and `#`-subpath
+/// imports flow through [`resolve_local_specifier`] as usual.
+pub fn collect_cross_chunk_used_names_per_provider(
+    chunk_graph: &crate::chunk::ChunkGraph,
     all_code: &HashMap<PathBuf, String>,
     local_prefixes: &[&str],
+    specifier_to_path: &HashMap<String, PathBuf>,
     subpath_ctx: Option<SubpathImportContext<'_>>,
-) -> NgcResult<HashSet<String>> {
-    let provider_set: HashSet<&PathBuf> = provider_modules.iter().collect();
-
-    // Phase A (parallel): parse each consumer and extract the named symbols
-    // it imports from provider modules. The parse dominates, so fanning this
-    // out across rayon workers recovers most of the tree-shake wall time.
-    let per_consumer: Vec<HashSet<String>> = consumer_modules
-        .par_iter()
-        .filter_map(|consumer_path| {
-            all_code
-                .get(consumer_path)
-                .map(|code| (consumer_path, code))
-        })
-        .map(|(consumer_path, code)| -> NgcResult<HashSet<String>> {
-            let info = analyze_module(code, consumer_path)?;
-            let mut local_used: HashSet<String> = HashSet::new();
-            for (specifier, imported_names) in &info.local_imports {
-                let Some(target) = resolve_local_specifier(
-                    specifier,
-                    consumer_path,
-                    provider_modules,
-                    local_prefixes,
-                    subpath_ctx,
-                ) else {
-                    continue;
-                };
-                if !provider_set.contains(&target) {
-                    continue;
-                }
-                for name in imported_names {
-                    if name == "* as " || name.starts_with("* as ") {
-                        // ImportNamespaceSpecifier — `analyze_module` currently
-                        // drops these (returns None). Left defensive; the
-                        // namespace pass below handles the real case.
-                        continue;
-                    }
-                    local_used.insert(name.clone());
-                }
-            }
-            Ok(local_used)
-        })
-        .collect::<NgcResult<Vec<_>>>()?;
-
-    let mut used: HashSet<String> = HashSet::new();
-    for names in per_consumer {
-        used.extend(names);
+) -> NgcResult<Vec<HashSet<String>>> {
+    let n = chunk_graph.chunks.len();
+    let mut result: Vec<HashSet<String>> = vec![HashSet::new(); n];
+    if n == 0 {
+        return Ok(result);
     }
 
-    // Phase B (serial): namespace-import expansion. Kept serial so the
-    // `provider_exports` cache parses each provider at most once even when
-    // several consumers import the same namespace.
+    let module_to_chunk_idx = &chunk_graph.module_to_chunk_idx;
+
+    // Flat (consumer_chunk_idx, consumer_path) list — every module across
+    // every chunk is a potential consumer of names in some other chunk.
+    let consumers: Vec<(usize, PathBuf)> = chunk_graph
+        .chunks
+        .iter()
+        .enumerate()
+        .flat_map(|(idx, chunk)| chunk.modules.iter().map(move |m| (idx, m.clone())))
+        .collect();
+
+    // The full provider candidate set — every module across all chunks.
+    // `resolve_local_specifier` scans this when matching a relative import
+    // path; chunk membership is then read from `module_to_chunk_idx`.
+    let all_provider_paths: Vec<PathBuf> = consumers.iter().map(|(_, p)| p.clone()).collect();
+
+    // Phase A (parallel): for each consumer, parse once and produce a list
+    // of (target_chunk_idx, imported_name) entries. Intra-chunk imports
+    // are dropped here — those are handled by `analyze_unused_exports`'s
+    // per-chunk reachability pass.
+    let per_consumer: Vec<Vec<(usize, String)>> = consumers
+        .par_iter()
+        .filter_map(|(consumer_idx, consumer_path)| {
+            all_code
+                .get(consumer_path)
+                .map(|code| (*consumer_idx, consumer_path.clone(), code))
+        })
+        .map(
+            |(consumer_idx, consumer_path, code)| -> NgcResult<Vec<(usize, String)>> {
+                let info = analyze_module(code, &consumer_path)?;
+                let mut out: Vec<(usize, String)> = Vec::new();
+                for (specifier, imported_names) in &info.local_imports {
+                    let target_path = resolve_local_specifier(
+                        specifier,
+                        &consumer_path,
+                        &all_provider_paths,
+                        local_prefixes,
+                        subpath_ctx,
+                    )
+                    .or_else(|| specifier_to_path.get(specifier).cloned());
+
+                    let Some(target) = target_path else {
+                        continue;
+                    };
+                    let Some(&target_idx) = module_to_chunk_idx.get(&target) else {
+                        continue;
+                    };
+                    if target_idx == consumer_idx {
+                        continue;
+                    }
+                    for name in imported_names {
+                        out.push((target_idx, name.clone()));
+                    }
+                }
+                Ok(out)
+            },
+        )
+        .collect::<NgcResult<Vec<_>>>()?;
+
+    for entries in per_consumer {
+        for (idx, name) in entries {
+            if let Some(set) = result.get_mut(idx) {
+                set.insert(name);
+            }
+        }
+    }
+
+    // Phase B (serial): namespace-import expansion. Each `import * as X
+    // from '...'` in a consumer adds every export of the target module to
+    // the owning chunk's used set. Provider parses are cached so a hot
+    // namespace import is parsed at most once.
     let mut provider_exports: HashMap<PathBuf, HashSet<String>> = HashMap::new();
-    for consumer_path in consumer_modules {
+    for (consumer_idx, consumer_path) in &consumers {
         let Some(code) = all_code.get(consumer_path) else {
             continue;
         };
-        expand_namespace_imports(
+        expand_namespace_imports_per_provider(
             code,
             consumer_path,
-            provider_modules,
+            *consumer_idx,
+            &all_provider_paths,
+            module_to_chunk_idx,
+            specifier_to_path,
             local_prefixes,
             all_code,
             &mut provider_exports,
-            &mut used,
+            &mut result,
             subpath_ctx,
         )?;
     }
 
-    Ok(used)
+    Ok(result)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn expand_namespace_imports(
+fn expand_namespace_imports_per_provider(
     code: &str,
     consumer_path: &Path,
+    consumer_chunk_idx: usize,
     provider_modules: &[PathBuf],
+    module_to_chunk_idx: &HashMap<PathBuf, usize>,
+    specifier_to_path: &HashMap<String, PathBuf>,
     local_prefixes: &[&str],
     all_code: &HashMap<PathBuf, String>,
     provider_exports: &mut HashMap<PathBuf, HashSet<String>>,
-    used: &mut HashSet<String>,
+    per_chunk_used: &mut [HashSet<String>],
     subpath_ctx: Option<SubpathImportContext<'_>>,
 ) -> NgcResult<()> {
     let allocator = Allocator::new();
@@ -460,15 +492,22 @@ fn expand_namespace_imports(
             continue;
         }
         let source = import.source.value.to_string();
-        let Some(target) = resolve_local_specifier(
+        let target = resolve_local_specifier(
             &source,
             consumer_path,
             provider_modules,
             local_prefixes,
             subpath_ctx,
-        ) else {
+        )
+        .or_else(|| specifier_to_path.get(&source).cloned());
+        let Some(target) = target else { continue };
+        let Some(&target_idx) = module_to_chunk_idx.get(&target) else {
             continue;
         };
+        if target_idx == consumer_chunk_idx {
+            continue;
+        }
+
         let exports = match provider_exports.get(&target) {
             Some(e) => e.clone(),
             None => {
@@ -480,7 +519,9 @@ fn expand_namespace_imports(
                 info.exported_names
             }
         };
-        used.extend(exports);
+        if let Some(set) = per_chunk_used.get_mut(target_idx) {
+            set.extend(exports);
+        }
     }
 
     Ok(())
@@ -630,11 +671,13 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_cross_chunk_used_names_dotted_filename() {
+    fn test_collect_cross_chunk_used_names_per_provider_dotted_filename() {
         // Regression: resolve_local_specifier previously used `with_extension`,
         // which treated `.service` as an existing extension and replaced it.
         // Imports like `./foo.service` then failed to resolve against
         // `foo.service.ts` and cross-chunk consumption was missed.
+        use crate::chunk::{Chunk, ChunkGraph, ChunkKind};
+
         let dir = tempfile::tempdir().expect("create temp dir");
         let svc = dir.path().join("analytics.service.ts");
         let comp = dir.path().join("comp.ts");
@@ -648,59 +691,173 @@ mod tests {
         let canon_svc = svc.canonicalize().expect("canon svc");
         let canon_comp = comp.canonicalize().expect("canon comp");
 
-        let mut modules = HashMap::new();
-        modules.insert(
+        let mut all_code = HashMap::new();
+        all_code.insert(
             canon_svc.clone(),
             "export class AnalyticsService {}\n".into(),
         );
-        modules.insert(
+        all_code.insert(
             canon_comp.clone(),
             "import { AnalyticsService } from './analytics.service';\nnew AnalyticsService();\n"
                 .into(),
         );
 
-        let used =
-            collect_cross_chunk_used_names(&[canon_comp], &[canon_svc], &modules, &["."], None)
-                .expect("should collect");
+        let chunks = vec![
+            Chunk {
+                kind: ChunkKind::Main,
+                filename: "main.js".to_string(),
+                modules: vec![canon_svc.clone()],
+                entry: canon_svc.clone(),
+            },
+            Chunk {
+                kind: ChunkKind::Lazy,
+                filename: "lazy.js".to_string(),
+                modules: vec![canon_comp.clone()],
+                entry: canon_comp.clone(),
+            },
+        ];
+        let mut module_to_chunk_idx: HashMap<PathBuf, usize> = HashMap::new();
+        for (idx, chunk) in chunks.iter().enumerate() {
+            for m in &chunk.modules {
+                module_to_chunk_idx.insert(m.clone(), idx);
+            }
+        }
+        let chunk_graph = ChunkGraph {
+            chunks,
+            dynamic_import_map: HashMap::new(),
+            module_to_chunk_idx,
+        };
+
+        let per_provider = collect_cross_chunk_used_names_per_provider(
+            &chunk_graph,
+            &all_code,
+            &["."],
+            &HashMap::new(),
+            None,
+        )
+        .expect("should collect");
         assert!(
-            used.contains("AnalyticsService"),
-            "import of ./foo.service must resolve to foo.service.ts"
+            per_provider[0].contains("AnalyticsService"),
+            "import of ./foo.service must resolve to foo.service.ts: {per_provider:?}"
         );
     }
 
     #[test]
-    fn test_collect_cross_chunk_used_names_named_import() {
-        // A lazy-chunk module imports AnalyticsService from a main-chunk module;
-        // collect_cross_chunk_used_names must surface it. Uses a real tempdir
-        // so resolve_local_specifier's canonicalize step can succeed.
+    fn test_collect_cross_chunk_used_names_per_provider_multi_chunk() {
+        // Three chunks: main (chunk 0), lazy (chunk 1) sourced via dynamic
+        // import, and a vendor chunk (chunk 2) providing an npm-style
+        // module. The lazy chunk imports one name from main and one name
+        // from vendor; main imports nothing externally. Per-provider
+        // result must attribute each import to the correct chunk only.
+        use crate::chunk::{Chunk, ChunkGraph, ChunkKind};
+
         let dir = tempfile::tempdir().expect("create temp dir");
-        let main_svc = dir.path().join("svc.js");
-        let lazy_dir = dir.path().join("lazy");
-        std::fs::create_dir_all(&lazy_dir).expect("create lazy dir");
-        let lazy_comp = lazy_dir.join("comp.js");
-        std::fs::write(&main_svc, "export class AnalyticsService {}\n").expect("write svc");
+        let main_path = dir.path().join("main.js");
+        let svc_path = dir.path().join("svc.js");
+        let lazy_path = dir.path().join("lazy.js");
+        let vendor_path = dir.path().join("vendor_pkg.js");
+
+        std::fs::write(&main_path, "// main entry\n").expect("write main");
+        std::fs::write(&svc_path, "export class MainService {}\n").expect("write svc");
         std::fs::write(
-            &lazy_comp,
-            "import { AnalyticsService } from '../svc';\nnew AnalyticsService();\n",
+            &lazy_path,
+            "import { MainService } from './svc';\n\
+             import { vendorFn } from 'vendor-pkg';\n\
+             new MainService(); vendorFn();\n",
         )
-        .expect("write comp");
+        .expect("write lazy");
+        std::fs::write(
+            &vendor_path,
+            "export const vendorFn = () => 1;\nexport const vendorUnused = () => 2;\n",
+        )
+        .expect("write vendor");
 
-        let canon_svc = main_svc.canonicalize().expect("canon svc");
-        let canon_comp = lazy_comp.canonicalize().expect("canon comp");
+        let canon_main = main_path.canonicalize().expect("canon main");
+        let canon_svc = svc_path.canonicalize().expect("canon svc");
+        let canon_lazy = lazy_path.canonicalize().expect("canon lazy");
+        let canon_vendor = vendor_path.canonicalize().expect("canon vendor");
 
-        let mut modules = HashMap::new();
-        modules.insert(
-            canon_svc.clone(),
-            "export class AnalyticsService {}\n".into(),
+        let mut all_code: HashMap<PathBuf, String> = HashMap::new();
+        all_code.insert(canon_main.clone(), "// main entry\n".into());
+        all_code.insert(canon_svc.clone(), "export class MainService {}\n".into());
+        all_code.insert(
+            canon_lazy.clone(),
+            "import { MainService } from './svc';\n\
+             import { vendorFn } from 'vendor-pkg';\n\
+             new MainService(); vendorFn();\n"
+                .into(),
         );
-        modules.insert(
-            canon_comp.clone(),
-            "import { AnalyticsService } from '../svc';\nnew AnalyticsService();\n".into(),
+        all_code.insert(
+            canon_vendor.clone(),
+            "export const vendorFn = () => 1;\nexport const vendorUnused = () => 2;\n".into(),
         );
 
-        let used =
-            collect_cross_chunk_used_names(&[canon_comp], &[canon_svc], &modules, &["."], None)
-                .expect("should collect");
-        assert!(used.contains("AnalyticsService"));
+        let chunks = vec![
+            Chunk {
+                kind: ChunkKind::Main,
+                filename: "main.js".to_string(),
+                modules: vec![canon_main.clone(), canon_svc.clone()],
+                entry: canon_main.clone(),
+            },
+            Chunk {
+                kind: ChunkKind::Lazy,
+                filename: "lazy.js".to_string(),
+                modules: vec![canon_lazy.clone()],
+                entry: canon_lazy.clone(),
+            },
+            Chunk {
+                kind: ChunkKind::Shared,
+                filename: "vendor.js".to_string(),
+                modules: vec![canon_vendor.clone()],
+                entry: canon_vendor.clone(),
+            },
+        ];
+        let mut module_to_chunk_idx: HashMap<PathBuf, usize> = HashMap::new();
+        for (idx, chunk) in chunks.iter().enumerate() {
+            for m in &chunk.modules {
+                module_to_chunk_idx.insert(m.clone(), idx);
+            }
+        }
+        let chunk_graph = ChunkGraph {
+            chunks,
+            dynamic_import_map: HashMap::new(),
+            module_to_chunk_idx,
+        };
+
+        let mut specifier_to_path: HashMap<String, PathBuf> = HashMap::new();
+        specifier_to_path.insert("vendor-pkg".to_string(), canon_vendor.clone());
+
+        let per_provider = collect_cross_chunk_used_names_per_provider(
+            &chunk_graph,
+            &all_code,
+            &["."],
+            &specifier_to_path,
+            None,
+        )
+        .expect("should collect");
+
+        assert_eq!(per_provider.len(), 3);
+        assert!(
+            per_provider[0].contains("MainService"),
+            "lazy's import of MainService should land in main's set: {per_provider:?}"
+        );
+        assert!(
+            !per_provider[0].contains("vendorFn"),
+            "vendorFn must not be attributed to main"
+        );
+        assert!(
+            per_provider[1].is_empty(),
+            "no one imports from the lazy chunk; its set must be empty: {:?}",
+            per_provider[1]
+        );
+        assert!(
+            per_provider[2].contains("vendorFn"),
+            "lazy's `import {{ vendorFn }} from 'vendor-pkg'` must land in vendor's set: {per_provider:?}"
+        );
+        assert!(
+            !per_provider[2].contains("vendorUnused"),
+            "vendorUnused is never imported — must not be in vendor's set"
+        );
     }
+
 }
