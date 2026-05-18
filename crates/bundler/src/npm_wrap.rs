@@ -539,9 +539,10 @@ mod tests {
         };
         let mut unused: HashSet<String> = HashSet::new();
         unused.insert("unused".to_string());
-        let result =
-            wrap_npm_module(code, "test.js", "__ns_test", Some(&unused), resolve).unwrap();
-        assert!(result.wrapped_code.contains("__exports.used = __ns_impl.used"));
+        let result = wrap_npm_module(code, "test.js", "__ns_test", Some(&unused), resolve).unwrap();
+        assert!(result
+            .wrapped_code
+            .contains("__exports.used = __ns_impl.used"));
         assert!(!result.wrapped_code.contains("__exports.unused"));
     }
 
