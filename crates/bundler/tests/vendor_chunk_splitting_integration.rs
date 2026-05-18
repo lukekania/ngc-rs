@@ -262,6 +262,178 @@ fn lazy_only_vendor_chunk_is_not_initial() {
     );
 }
 
+/// Per-provider shake (issue #171): if a vendor chunk's npm module exports
+/// both a name some other chunk imports and a name no consumer touches, only
+/// the consumed name must survive in the emitted vendor chunk code. Before
+/// per-provider shake, vendor chunks pinned every export the package
+/// declared because `externally_used` was `None` and the entry-walk reached
+/// every name. Now each chunk's tree-shaker gets its own externally-used
+/// set computed from cross-chunk imports.
+#[test]
+fn vendor_chunk_drops_unreferenced_exports() {
+    let temp = tempdir().expect("create temp dir");
+    let root = temp.path();
+
+    fs::write(
+        root.join("tsconfig.json"),
+        r#"{ "include": ["src/**/*.ts"], "exclude": [] }"#,
+    )
+    .expect("write tsconfig");
+
+    fs::write(
+        root.join("package.json"),
+        r#"{ "name": "shake-fixture", "dependencies": { "shake-pkg": "1.0.0" } }"#,
+    )
+    .expect("write package.json");
+
+    let src = root.join("src");
+    fs::create_dir_all(&src).expect("create src");
+    fs::write(
+        src.join("main.ts"),
+        "function loadA(){return import('./route-a');}\n\
+         function loadB(){return import('./route-b');}\n\
+         console.log(loadA, loadB);\n",
+    )
+    .expect("write main.ts");
+    // Both lazy routes import only `usedSentinel` from the npm package.
+    // `unusedSentinel` has no consumer anywhere in the bundle.
+    fs::write(
+        src.join("route-a.ts"),
+        "import { usedSentinel } from 'shake-pkg';\n\
+         export const A = () => usedSentinel('a');\n",
+    )
+    .expect("write route-a.ts");
+    fs::write(
+        src.join("route-b.ts"),
+        "import { usedSentinel } from 'shake-pkg';\n\
+         export const B = () => usedSentinel('b');\n",
+    )
+    .expect("write route-b.ts");
+
+    // The npm package is split: a re-export entry plus an implementation
+    // file. Lexicographic order picks `a-entry.mjs` as the chunk entry, so
+    // `impl.js`'s declarations are subject to per-provider shake (not
+    // pinned by the entry-always-kept rule that protects entry's own
+    // export names).
+    let pkg_dir = root.join("node_modules").join("shake-pkg");
+    fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+    fs::write(
+        pkg_dir.join("package.json"),
+        r#"{ "name": "shake-pkg", "version": "1.0.0", "main": "a-entry.mjs" }"#,
+    )
+    .expect("write pkg package.json");
+    fs::write(
+        pkg_dir.join("a-entry.mjs"),
+        "export { usedSentinel, unusedSentinel } from './impl';\n",
+    )
+    .expect("write a-entry.mjs");
+    fs::write(
+        pkg_dir.join("impl.js"),
+        "export const usedSentinel = (x) => `USED_SENTINEL:${x}`;\n\
+         export const unusedSentinel = (x) => `UNUSED_SENTINEL:${x}`;\n",
+    )
+    .expect("write impl.js");
+
+    let file_graph = resolve_project(&root.join("tsconfig.json")).expect("resolve project");
+    let entry = file_graph
+        .entry_points
+        .iter()
+        .find(|p| p.file_name().is_some_and(|n| n == "main.ts"))
+        .cloned()
+        .expect("main.ts entry");
+    let bare_specs: Vec<String> = file_graph.npm_import_sites.keys().cloned().collect();
+    let npm = resolve_npm_dependencies(&bare_specs, root, DEVELOPMENT_BROWSER_CONDITIONS)
+        .expect("npm resolution");
+
+    let mut graph = file_graph.graph;
+    let mut path_index = file_graph.path_index;
+    for path in npm.modules.keys() {
+        if !path_index.contains_key(path) {
+            let idx = graph.add_node(path.clone());
+            path_index.insert(path.clone(), idx);
+        }
+    }
+    for (spec, sites) in &file_graph.npm_import_sites {
+        if let Some(target_path) = npm.modules.keys().find(|p| {
+            p.to_string_lossy()
+                .contains(&format!("/{spec}/a-entry.mjs"))
+        }) {
+            let to_idx = path_index[target_path];
+            for (from_file, kind) in sites {
+                if let Some(&from_idx) = path_index.get(from_file) {
+                    graph.add_edge(from_idx, to_idx, *kind);
+                }
+            }
+        }
+    }
+    // Wire the re-export edge a-entry.mjs -> impl.js so chunk graph keeps
+    // them in the same vendor partition.
+    let entry_path = npm
+        .modules
+        .keys()
+        .find(|p| p.to_string_lossy().ends_with("/a-entry.mjs"))
+        .cloned()
+        .expect("a-entry.mjs in npm.modules");
+    let impl_path = npm
+        .modules
+        .keys()
+        .find(|p| p.to_string_lossy().ends_with("/impl.js"))
+        .cloned()
+        .expect("impl.js in npm.modules");
+    graph.add_edge(
+        path_index[&entry_path],
+        path_index[&impl_path],
+        ngc_project_resolver::ImportKind::Static,
+    );
+
+    let mut modules: HashMap<PathBuf, String> = HashMap::new();
+    for idx in graph.node_indices() {
+        let path = &graph[idx];
+        let source = npm
+            .modules
+            .get(path)
+            .cloned()
+            .or_else(|| fs::read_to_string(path).ok())
+            .unwrap_or_else(|| panic!("source missing for {}", path.display()));
+        modules.insert(path.clone(), source);
+    }
+
+    let input = BundleInput {
+        modules,
+        graph,
+        entry,
+        local_prefixes: vec![".".to_string()],
+        root_dir: root.to_path_buf(),
+        options: BundleOptions {
+            tree_shake: true,
+            ..BundleOptions::default()
+        },
+        per_module_maps: HashMap::new(),
+        bundled_specifiers: npm.resolved_specifiers.clone(),
+        export_conditions: Vec::new(),
+        external_specifiers: Default::default(),
+    };
+
+    let output = bundle(&input).expect("bundle succeeds");
+
+    let vendor_name = output
+        .chunk_kinds
+        .iter()
+        .find(|(_, k)| **k == ChunkKind::Shared)
+        .map(|(n, _)| n.clone())
+        .expect("vendor chunk");
+    let vendor_code = &output.chunks[&vendor_name];
+
+    assert!(
+        vendor_code.contains("USED_SENTINEL"),
+        "used export must survive in vendor chunk: {vendor_code}"
+    );
+    assert!(
+        !vendor_code.contains("UNUSED_SENTINEL"),
+        "unreferenced export must be tree-shaken from vendor chunk: {vendor_code}"
+    );
+}
+
 /// Determinism: bundling the same input twice produces byte-identical chunk
 /// filenames + content. Vendor naming hashes absolute module paths, so we
 /// build twice in the same temp directory (real builds have a stable project
