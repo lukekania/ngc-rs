@@ -116,6 +116,7 @@ fn defer_deferred_component_is_chunk_split_placeholder_stays_in_main() {
         options: BundleOptions::default(),
         per_module_maps: HashMap::new(),
         bundled_specifiers: Default::default(),
+        external_specifiers: Default::default(),
         export_conditions: Vec::new(),
     };
 

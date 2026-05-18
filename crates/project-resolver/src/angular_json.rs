@@ -160,6 +160,11 @@ pub struct RawBuildOptions {
     /// CDN libraries, polyfill shims that don't fit through `polyfills.ts`).
     /// Each entry is a string path or `{ input, inject, bundleName }` object.
     pub scripts: Option<Vec<RawScriptEntry>>,
+    /// npm package names that should NOT be bundled — their `import` statements
+    /// stay as bare ESM specifiers for the runtime (browser import map, CDN
+    /// loader, etc.) to resolve. Matches `@angular/build:application`'s
+    /// `externalDependencies` option.
+    pub external_dependencies: Option<Vec<String>>,
 }
 
 /// One entry in `architect.build.options.budgets` (or in a per-configuration
@@ -376,6 +381,11 @@ pub struct RawBuildConfiguration {
     /// of the base `define` map: same-key entries replace the base value,
     /// keys that appear only in the base are preserved.
     pub define: Option<HashMap<String, String>>,
+    /// Override for `externalDependencies`. When present, replaces the
+    /// base list (matches `@angular/build:application`'s semantics — the
+    /// configuration value wholly substitutes for the base value rather
+    /// than appending).
+    pub external_dependencies: Option<Vec<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -515,6 +525,13 @@ pub struct ResolvedAngularProject {
     /// entry that shares the same `bundleName`. Empty when no `scripts`
     /// are declared.
     pub scripts: Vec<ResolvedScriptBundle>,
+    /// npm package names declared as `externalDependencies` in
+    /// `angular.json`. Imports matching one of these specifiers stay as
+    /// bare ESM specifiers in the emitted bundle — the package is not
+    /// inlined and the resolver does not BFS into its modules. Matching
+    /// is by exact name or `<name>/...` prefix, mirroring how
+    /// `@angular/build:application` (esbuild) treats package externals.
+    pub external_dependencies: Vec<String>,
 }
 
 /// Type of a resolved size budget.
@@ -816,6 +833,13 @@ pub fn resolve_angular_project(
         .map(|raw_scripts| resolve_scripts(raw_scripts, &base_dir))
         .unwrap_or_default();
 
+    // `externalDependencies` resolution: per-configuration override wholly
+    // replaces the base list when present (matching ng build's behaviour).
+    let external_dependencies = build_config
+        .and_then(|bc| bc.external_dependencies.clone())
+        .or_else(|| options.and_then(|o| o.external_dependencies.clone()))
+        .unwrap_or_default();
+
     debug!(
         project = %name,
         output_path = %output_path.display(),
@@ -847,6 +871,7 @@ pub fn resolve_angular_project(
         budgets,
         define,
         scripts,
+        external_dependencies,
     })
 }
 
@@ -1809,6 +1834,81 @@ mod tests {
         let f = write_temp_json(json);
         let result = resolve_angular_project(f.path(), None, None).unwrap();
         assert!(result.define.is_empty());
+    }
+
+    #[test]
+    fn test_parse_external_dependencies() {
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "architect": {
+                        "build": {
+                            "options": {
+                                "outputPath": "dist",
+                                "tsConfig": "tsconfig.json",
+                                "externalDependencies": ["jquery", "@stripe/stripe-js"]
+                            }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let result = resolve_angular_project(f.path(), None, None).unwrap();
+        assert_eq!(
+            result.external_dependencies,
+            vec!["jquery".to_string(), "@stripe/stripe-js".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_external_dependencies_default_to_empty() {
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "architect": {
+                        "build": {
+                            "options": { "outputPath": "dist", "tsConfig": "tsconfig.json" }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let result = resolve_angular_project(f.path(), None, None).unwrap();
+        assert!(result.external_dependencies.is_empty());
+    }
+
+    #[test]
+    fn test_external_dependencies_configuration_override_replaces_base() {
+        // Per-configuration `externalDependencies` wholly replaces the base
+        // list (matches @angular/build:application).
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "architect": {
+                        "build": {
+                            "options": {
+                                "outputPath": "dist",
+                                "tsConfig": "tsconfig.json",
+                                "externalDependencies": ["jquery"]
+                            },
+                            "configurations": {
+                                "production": {
+                                    "externalDependencies": ["@stripe/stripe-js"]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let result = resolve_angular_project(f.path(), None, Some("production")).unwrap();
+        assert_eq!(
+            result.external_dependencies,
+            vec!["@stripe/stripe-js".to_string()]
+        );
     }
 
     #[test]

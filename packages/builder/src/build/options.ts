@@ -175,11 +175,6 @@ export function translateOptions(
       'The `outputHashing` option is hardcoded by ngc-rs per `--configuration` (production hashes bundles, development does not); the option value is ignored.',
     );
   }
-  if (raw.externalDependencies && raw.externalDependencies.length > 0) {
-    warnings.push(
-      '`externalDependencies` is currently ignored by ngc-rs; all imports are bundled.',
-    );
-  }
   if (Array.isArray(raw.localize)) {
     warnings.push(
       'Selecting a locale subset via `localize` array is not yet honoured by ngc-rs; all locales declared in `angular.json` `i18n.locales` are emitted.',
