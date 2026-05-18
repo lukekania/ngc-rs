@@ -177,8 +177,12 @@ enum Commands {
         /// every `$localize\`...\`` literal in the bundled output. The
         /// source-locale build is moved under
         /// `<out_dir>/<sourceLocale>/`.
-        #[arg(long)]
-        localize: bool,
+        ///
+        /// Pass `--localize` alone to emit every locale declared in
+        /// `i18n.locales`; pass `--localize=en,de` to restrict the output
+        /// to a subset (useful for trimming CI builds).
+        #[arg(long, num_args = 0..=1, value_delimiter = ',')]
+        localize: Option<Vec<String>>,
         /// Treat any template that would fall back to JIT compilation as a
         /// hard error. Mirrors `@angular/build:application`, which has no
         /// JIT fallback. Defaults to on for `--configuration production` and
@@ -203,8 +207,11 @@ enum Commands {
         configuration: Option<String>,
         /// Emit one `<out_dir>/<locale>/` tree per locale defined in
         /// `angular.json`'s `i18n.locales` block.
-        #[arg(long)]
-        localize: bool,
+        ///
+        /// Pass `--localize` alone for all locales, or `--localize=en,de`
+        /// to restrict the output to a subset.
+        #[arg(long, num_args = 0..=1, value_delimiter = ',')]
+        localize: Option<Vec<String>>,
     },
     /// Serve the project: build once, watch for changes, and host the
     /// resulting `dist/` directory over HTTP with live reload. Mirrors
@@ -320,7 +327,7 @@ fn main() {
                 &project,
                 out_dir.as_deref(),
                 configuration.as_deref(),
-                localize,
+                localize.as_deref(),
                 Vec::new(),
                 |_| false,
             ) {
@@ -387,7 +394,7 @@ fn main() {
                 &project,
                 out_dir.as_deref(),
                 configuration.as_deref(),
-                localize,
+                localize.as_deref(),
                 strict_templates,
             ) {
                 Ok(result) => {
@@ -475,11 +482,16 @@ fn init_tracing() {
 }
 
 /// Orchestrate the full build pipeline: resolve → transform → bundle → output.
+///
+/// `localize` mirrors the `--localize` CLI flag: `None` skips locale
+/// fan-out entirely; `Some(&[])` emits every locale declared in
+/// `i18n.locales`; `Some(&["en", "de"])` restricts the output to that
+/// subset.
 fn run_build(
     project: &Path,
     out_dir_override: Option<&Path>,
     configuration: Option<&str>,
-    localize: bool,
+    localize: Option<&[String]>,
     strict_templates: bool,
 ) -> NgcResult<BuildResult> {
     run_build_with_options(
@@ -505,7 +517,7 @@ pub(crate) fn run_build_with_cache(
     project: &Path,
     out_dir_override: Option<&Path>,
     configuration: Option<&str>,
-    localize: bool,
+    localize: Option<&[String]>,
     cache: Option<&mut incremental::BuildCache>,
 ) -> NgcResult<BuildResult> {
     run_build_with_options(
@@ -533,7 +545,7 @@ pub(crate) fn run_build_with_options(
     project: &Path,
     out_dir_override: Option<&Path>,
     configuration: Option<&str>,
-    localize: bool,
+    localize: Option<&[String]>,
     strict_templates: bool,
     mut cache: Option<&mut incremental::BuildCache>,
     base_href_override: Option<&str>,
@@ -1192,7 +1204,7 @@ pub(crate) fn run_build_with_options(
     // every other writer so it sees the final filenames + contents.
     if let Some(ref ap) = angular_project {
         if ap.service_worker {
-            if localize {
+            if localize.is_some() {
                 tracing::warn!(
                     "serviceWorker is enabled but --localize was passed; skipping ngsw.json (per-locale manifests are not yet supported)"
                 );
@@ -1205,8 +1217,10 @@ pub(crate) fn run_build_with_options(
 
     // Step 13: --localize → fan the source-locale build out to
     // `<out_dir>/<sourceLocale>/` and produce a translated copy under
-    // `<out_dir>/<locale>/` for each entry in `i18n.locales`.
-    if localize {
+    // `<out_dir>/<locale>/` for each entry in `i18n.locales`. A non-empty
+    // `subset` filters the emitted locales — useful for trimming CI builds
+    // that only need one or two locales per deploy.
+    if let Some(subset) = localize {
         let i18n = angular_project
             .as_ref()
             .and_then(|ap| ap.i18n.as_ref())
@@ -1215,7 +1229,7 @@ pub(crate) fn run_build_with_options(
                     "--localize was passed but angular.json does not declare a `projects.<name>.i18n` block"
                         .to_string(),
             })?;
-        let localized_files = fan_out_locales(&out_dir, i18n, &output_files)?;
+        let localized_files = fan_out_locales(&out_dir, i18n, subset, &output_files)?;
         output_files = localized_files;
     }
 
@@ -1319,11 +1333,42 @@ pub(crate) fn run_build_with_options(
 /// Move the source-locale build under `<out_dir>/<sourceLocale>/` and
 /// emit a translated copy under `<out_dir>/<locale>/` for every entry in
 /// `i18n.locales`. Returns the new full set of output files.
+///
+/// `subset` filters which locales are emitted. An empty slice emits every
+/// locale (source plus all `i18n.locales` entries); a non-empty slice
+/// restricts the output to the codes listed (validated against
+/// `i18n.source_locale` and the keys of `i18n.locales`).
 fn fan_out_locales(
     out_dir: &Path,
     i18n: &I18nConfig,
+    subset: &[String],
     original_files: &[PathBuf],
 ) -> NgcResult<Vec<PathBuf>> {
+    let include_source: bool;
+    let include_locale: Box<dyn Fn(&str) -> bool>;
+    if subset.is_empty() {
+        include_source = true;
+        include_locale = Box::new(|_: &str| true);
+    } else {
+        // Reject `--localize=foo` when `foo` is neither the source locale
+        // nor one of the declared `i18n.locales` keys — silently skipping
+        // would let typos produce empty `dist/` runs in CI.
+        for code in subset {
+            let known = code == &i18n.source_locale || i18n.locales.contains_key(code.as_str());
+            if !known {
+                return Err(NgcError::ConfigError {
+                    message: format!(
+                        "--localize subset entry `{code}` is not declared in angular.json `i18n.locales` (and is not the source locale `{}`)",
+                        i18n.source_locale
+                    ),
+                });
+            }
+        }
+        include_source = subset.iter().any(|c| c == &i18n.source_locale);
+        let allow: std::collections::BTreeSet<String> = subset.iter().cloned().collect();
+        include_locale = Box::new(move |code: &str| allow.contains(code));
+    }
+
     // Materialize file contents from the original (source-locale) build so
     // we can write them back into per-locale directories without worrying
     // about the source-locale move clobbering them.
@@ -1345,10 +1390,15 @@ fn fan_out_locales(
 
     let mut new_outputs: Vec<PathBuf> = Vec::new();
 
-    let source_dir = out_dir.join(&i18n.source_locale);
-    write_locale_tree(&source_dir, &sources, None, &mut new_outputs)?;
+    if include_source {
+        let source_dir = out_dir.join(&i18n.source_locale);
+        write_locale_tree(&source_dir, &sources, None, &mut new_outputs)?;
+    }
 
     for entry in i18n.locales.values() {
+        if !include_locale(entry.locale.as_str()) {
+            continue;
+        }
         let translations = match &entry.translation_path {
             Some(path) => Some(localize::parse_xliff(path)?),
             None => None,

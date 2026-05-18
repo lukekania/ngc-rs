@@ -76,14 +76,25 @@ describe('translateOptions (build)', () => {
     expect(unset.args).not.toContain('--strict-templates');
   });
 
-  it('appends --localize and warns when localize is an array (subset not yet honoured)', () => {
+  it('serializes a localize array as --localize=en,de (subset)', () => {
     const t = translateOptions(
       { ...minimal, localize: ['en', 'de'] },
       '/ws',
       null,
     );
+    expect(t.args).toContain('--localize=en,de');
+    expect(t.args).not.toContain('--localize');
+    expect(t.warnings.some((w) => w.includes('locale subset'))).toBe(false);
+  });
+
+  it('treats an empty localize array as `--localize` (all locales)', () => {
+    const t = translateOptions(
+      { ...minimal, localize: [] },
+      '/ws',
+      null,
+    );
     expect(t.args).toContain('--localize');
-    expect(t.warnings.some((w) => w.includes('locale subset'))).toBe(true);
+    expect(t.args.some((a) => a.startsWith('--localize='))).toBe(false);
   });
 
   it('accepts non-empty scripts arrays without error', () => {
