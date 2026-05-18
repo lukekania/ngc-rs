@@ -443,6 +443,116 @@ fn unprefixed_request_returns_404_when_serve_path_set() {
     assert_eq!(http_get(fx.server.addr(), "/__ngc_reload").status, 404);
 }
 
+fn http_get_with_host(
+    addr: std::net::SocketAddr,
+    path: &str,
+    host_header: &str,
+) -> HttpResponse {
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    let req =
+        format!("GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).expect("write");
+    stream.flush().expect("flush");
+
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line).expect("status line");
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .expect("status code");
+
+    let mut headers = Vec::new();
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("header line");
+        if line == "\r\n" || line.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = line.trim_end_matches("\r\n").split_once(':') {
+            headers.push((k.trim().to_string(), v.trim().to_string()));
+        }
+    }
+    let mut body = Vec::new();
+    reader.read_to_end(&mut body).expect("body");
+    HttpResponse {
+        status,
+        headers,
+        body,
+    }
+}
+
+fn allowed_hosts_fixture(patterns: &[&str]) -> Fixture {
+    let root = TempDir::new().expect("tempdir");
+    write_file(
+        root.path(),
+        "index.html",
+        b"<html><body><h1>hi</h1></body></html>",
+    );
+    let cfg = DevServerConfig::new(root.path())
+        .with_port(0)
+        .with_allowed_hosts(patterns.iter().copied());
+    let (_tx, rx) = channel::<DevServerEvent>();
+    let server = DevServer::start(cfg, rx).expect("start dev server");
+    Fixture {
+        server,
+        _root: root,
+    }
+}
+
+#[test]
+fn default_allowed_hosts_accept_loopback_and_403_others() {
+    let fx = allowed_hosts_fixture(&[]);
+    assert_eq!(http_get_with_host(fx.server.addr(), "/", "localhost").status, 200);
+    assert_eq!(http_get_with_host(fx.server.addr(), "/", "127.0.0.1").status, 200);
+    assert_eq!(http_get_with_host(fx.server.addr(), "/", "[::1]").status, 200);
+    let blocked = http_get_with_host(fx.server.addr(), "/", "my-app.ngrok.io");
+    assert_eq!(blocked.status, 403);
+    let body = std::str::from_utf8(&blocked.body).unwrap_or("");
+    assert!(
+        body.contains("my-app.ngrok.io") && body.contains("allowedHosts"),
+        "403 body should name the host and point at allowedHosts: {body}"
+    );
+}
+
+#[test]
+fn explicit_allowed_host_lets_ngrok_traffic_through() {
+    let fx = allowed_hosts_fixture(&["my-app.ngrok.io"]);
+    assert_eq!(
+        http_get_with_host(fx.server.addr(), "/", "my-app.ngrok.io").status,
+        200
+    );
+    // Port stripping: a tunneling proxy may forward Host with a port.
+    assert_eq!(
+        http_get_with_host(fx.server.addr(), "/", "my-app.ngrok.io:8443").status,
+        200
+    );
+    // Loopback still works.
+    assert_eq!(http_get_with_host(fx.server.addr(), "/", "localhost").status, 200);
+    // Anything else is still blocked.
+    assert_eq!(
+        http_get_with_host(fx.server.addr(), "/", "other.ngrok.io").status,
+        403
+    );
+}
+
+#[test]
+fn allowed_hosts_all_disables_check() {
+    let fx = allowed_hosts_fixture(&["all"]);
+    assert_eq!(
+        http_get_with_host(fx.server.addr(), "/", "anything.example.com").status,
+        200
+    );
+    assert_eq!(
+        http_get_with_host(fx.server.addr(), "/", "my-app.ngrok.io").status,
+        200
+    );
+}
+
 #[test]
 fn prefixed_sse_channel_is_reachable_under_prefix() {
     let fx = prefixed_fixture("/admin/");

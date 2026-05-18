@@ -15,6 +15,7 @@ export interface DevServerOptions extends json.JsonObject {
   define: { [key: string]: string } | null;
   watch: boolean | null;
   servePath: string | null;
+  allowedHosts: string[] | null;
 }
 
 export interface TranslatedServeArgs {
@@ -79,6 +80,10 @@ export function translateOptions(
   if (servePath) {
     args.push('--serve-path', servePath);
   }
+  const allowedHosts = normalizeAllowedHosts(raw.allowedHosts);
+  if (allowedHosts.length > 0) {
+    args.push('--allowed-hosts', allowedHosts.join(','));
+  }
 
   return {
     args,
@@ -110,6 +115,35 @@ function normalizeServePath(raw: string | null | undefined): string | null {
   let out = trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
   if (!out.endsWith('/')) {
     out = `${out}/`;
+  }
+  return out;
+}
+
+// Strip empty/whitespace-only entries and dedupe (case-insensitive on the
+// host portion) so the downstream CLI receives a clean comma-joined list.
+// Order of distinct entries is preserved, since order shouldn't matter for
+// a set-membership check but stable args make `--help` traces easier to
+// diff between runs.
+function normalizeAllowedHosts(raw: string[] | null | undefined): string[] {
+  if (!raw || raw.length === 0) {
+    return [];
+  }
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== 'string') {
+      continue;
+    }
+    const trimmed = entry.trim();
+    if (!trimmed) {
+      continue;
+    }
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    out.push(trimmed);
   }
   return out;
 }

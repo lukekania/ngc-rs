@@ -235,6 +235,16 @@ enum Commands {
         /// to use the same value as its `<base href>`.
         #[arg(long = "serve-path")]
         serve_path: Option<String>,
+        /// Comma-separated list of host names the dev server's
+        /// `Host:`-header check accepts. Loopback hosts (`localhost`,
+        /// `127.0.0.1`, `[::1]`) are always allowed. Pass `all` to
+        /// disable the check entirely, or `auto` to additionally accept
+        /// the configured bind host. Use this when fronting the dev
+        /// server with a tunneling proxy (ngrok, Cloudflare Tunnel,
+        /// GitHub Codespaces) or a non-default local hostname
+        /// (`*.localhost`, `app.local`).
+        #[arg(long = "allowed-hosts", value_delimiter = ',', num_args = 0..)]
+        allowed_hosts: Vec<String>,
     },
     /// Extract translatable messages from every component template in the
     /// project and emit a translation file (XLIFF 2.0 by default; XLIFF 1.2
@@ -335,6 +345,7 @@ fn main() {
             host,
             open,
             serve_path,
+            allowed_hosts,
         } => {
             if let Err(e) = serve_cmd::run(
                 &project,
@@ -343,6 +354,7 @@ fn main() {
                 port,
                 open,
                 serve_path.as_deref(),
+                &allowed_hosts,
             ) {
                 eprintln!("{} {e}", "Error:".red().bold());
                 process::exit(1);
