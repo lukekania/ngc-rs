@@ -25,11 +25,12 @@ pub fn run(
     project: &Path,
     out_dir_override: Option<&Path>,
     configuration: Option<&str>,
-    localize: bool,
+    localize: Option<&[String]>,
     subscribers: Vec<Arc<dyn ngc_watch::WatchSubscriber>>,
     should_stop: impl FnMut(usize) -> bool,
 ) -> NgcResult<()> {
     let mut cache = BuildCache::new();
+    let localize_owned: Option<Vec<String>> = localize.map(|s| s.to_vec());
 
     // Initial build to populate the cache. `run_build_with_cache` always
     // disables `strict_templates` — `watch` is a dev workflow, so JIT
@@ -39,7 +40,7 @@ pub fn run(
         project,
         out_dir_override,
         configuration,
-        localize,
+        localize_owned.as_deref(),
         Some(&mut cache),
     )?;
     eprintln!(
@@ -76,7 +77,7 @@ pub fn run(
             &project_path,
             out_dir_path.as_deref(),
             configuration.as_deref(),
-            localize,
+            localize_owned.as_deref(),
             Some(&mut cache),
         )?;
         eprintln!(
