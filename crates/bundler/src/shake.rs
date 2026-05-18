@@ -859,5 +859,4 @@ mod tests {
             "vendorUnused is never imported — must not be in vendor's set"
         );
     }
-
 }

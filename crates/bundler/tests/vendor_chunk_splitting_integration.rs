@@ -353,11 +353,10 @@ fn vendor_chunk_drops_unreferenced_exports() {
         }
     }
     for (spec, sites) in &file_graph.npm_import_sites {
-        if let Some(target_path) = npm
-            .modules
-            .keys()
-            .find(|p| p.to_string_lossy().contains(&format!("/{spec}/a-entry.mjs")))
-        {
+        if let Some(target_path) = npm.modules.keys().find(|p| {
+            p.to_string_lossy()
+                .contains(&format!("/{spec}/a-entry.mjs"))
+        }) {
             let to_idx = path_index[target_path];
             for (from_file, kind) in sites {
                 if let Some(&from_idx) = path_index.get(from_file) {
