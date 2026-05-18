@@ -23,8 +23,12 @@ pub struct IvyOutput {
 /// A single level in the template scope hierarchy.
 #[derive(Debug, Clone)]
 enum ScopeEntry {
-    /// An `@if`/`@else`/`@switch` embedded view — no local variables.
-    Conditional,
+    /// An `@if`/`@else if`/`@else`/`@switch` embedded view. `alias` is `Some`
+    /// when an `@if (expr; as <alias>)` / `@else if (expr; as <alias>)` clause
+    /// names the truthy value — that value is delivered to the inner template
+    /// as its `_ctx` parameter, and nested scopes can read it via
+    /// `ɵɵnextContext()`.
+    Conditional { alias: Option<String> },
     /// An `@for` embedded view — declares an item variable from `$implicit`.
     Repeater { item_name: String },
 }
@@ -1272,11 +1276,21 @@ impl IvyCodegen {
         );
         self.child_counter += 1;
 
+        // `@if (expr; as alias)` exposes the truthy `expr` value as `alias`
+        // inside the body. The alias becomes this branch's template `_ctx`
+        // (Angular's `ɵɵconditional` semantics: its second arg is delivered
+        // to the matching embedded view as `_ctx`).
+        let if_alias = extract_block_alias(&block.condition).map(|s| s.to_string());
+
         // Extract root element tag name and attributes for the conditional host element.
         // Angular 21 passes the first child's tag and consts index to conditionalCreate
         // so the container is backed by a real DOM element with proper attributes.
         let (root_tag, root_attrs_idx) = get_root_element_info(&block.children, self);
-        let child = self.generate_child_template(&child_fn_name, &block.children);
+        let child = self.generate_child_template_with_alias(
+            &child_fn_name,
+            &block.children,
+            if_alias.as_deref(),
+        );
         match (root_tag, root_attrs_idx) {
             (Some(ref tag), Some(idx)) => {
                 self.creation.push(format!(
@@ -1311,8 +1325,13 @@ impl IvyCodegen {
                 .insert("\u{0275}\u{0275}conditionalCreate".to_string());
             let ei_slot = self.slot_index;
             self.slot_index += 1;
+            let ei_alias = extract_block_alias(&branch.condition).map(|s| s.to_string());
             let (ei_tag, ei_attrs) = get_root_element_info(&branch.children, self);
-            let child = self.generate_child_template(&fn_name, &branch.children);
+            let child = self.generate_child_template_with_alias(
+                &fn_name,
+                &branch.children,
+                ei_alias.as_deref(),
+            );
             match (ei_tag, ei_attrs) {
                 (Some(ref tag), Some(idx)) => self.creation.push(format!(
                     "\u{0275}\u{0275}conditionalCreate({ei_slot}, {fn_name}, {}, {}, '{tag}', {idx});",
@@ -1327,7 +1346,12 @@ impl IvyCodegen {
                     child.decls, child.vars
                 )),
             }
-            else_if_slots.push((branch.condition.clone(), fn_name.clone(), ei_slot));
+            else_if_slots.push((
+                branch.condition.clone(),
+                fn_name.clone(),
+                ei_slot,
+                ei_alias,
+            ));
             self.child_templates.push(child);
         }
 
@@ -1362,17 +1386,36 @@ impl IvyCodegen {
             self.child_templates.push(child);
         }
 
-        // Update block: conditional with absolute slot indices
+        // Update block: conditional with absolute slot indices.
+        //
+        // For each branch we compile the (alias-stripped) condition through
+        // `compile_binding_expr` so pipes inside the condition (e.g.
+        // `state$ | async; as s`) register `ɵɵpipe(...)` at this parent
+        // template's slot space and resolve via `ɵɵpipeBind*` at runtime.
+        // The same compiled form is reused as `ɵɵconditional`'s second arg
+        // so the matching branch's `_ctx` carries the truthy value.
         self.add_advance(slot);
-        let cond_expr = build_conditional_expr(
-            &block.condition,
-            slot,
-            &else_if_slots,
-            &else_slot_info,
-            &self.local_vars,
-        );
-        self.update
-            .push(format!("\u{0275}\u{0275}conditional({cond_expr});"));
+        let mut compiled_branches: Vec<(String, Option<String>, u32)> = Vec::new();
+        let if_stripped = strip_block_alias(&block.condition).to_string();
+        let if_compiled = self.compile_binding_expr(&if_stripped);
+        compiled_branches.push((if_compiled, if_alias, slot));
+        for (cond_raw, _fn_name, ei_slot, ei_alias) in &else_if_slots {
+            let stripped = strip_block_alias(cond_raw).to_string();
+            let compiled = self.compile_binding_expr(&stripped);
+            compiled_branches.push((compiled, ei_alias.clone(), *ei_slot));
+        }
+
+        let any_alias = compiled_branches.iter().any(|(_, a, _)| a.is_some());
+        let test_chain = build_test_chain(&compiled_branches, else_slot_info.as_ref());
+        if any_alias {
+            let alias_chain = build_alias_value_chain(&compiled_branches);
+            self.update.push(format!(
+                "\u{0275}\u{0275}conditional({test_chain}, {alias_chain});"
+            ));
+        } else {
+            self.update
+                .push(format!("\u{0275}\u{0275}conditional({test_chain});"));
+        }
         self.var_count += 1;
     }
 
@@ -1546,6 +1589,20 @@ impl IvyCodegen {
         fn_name: &str,
         children: &[TemplateNode],
     ) -> ChildTemplate {
+        self.generate_child_template_with_alias(fn_name, children, None)
+    }
+
+    /// Like `generate_child_template`, but for an `@if (expr; as <alias>)` /
+    /// `@else if (expr; as <alias>)` body: the alias becomes the template
+    /// function's `_ctx` parameter so `{{ alias.x }}` inside the body resolves
+    /// to the truthy expression value at runtime, and references from nested
+    /// scopes walk back via `ɵɵnextContext()` to reach it.
+    fn generate_child_template_with_alias(
+        &mut self,
+        fn_name: &str,
+        children: &[TemplateNode],
+        alias: Option<&str>,
+    ) -> ChildTemplate {
         // Save parent state.  Note: self.consts is NOT saved/restored — all
         // templates within a component share one consts array (tView.consts),
         // so child template entries must accumulate in the same vec.
@@ -1558,7 +1615,19 @@ impl IvyCodegen {
         let parent_lets = self.let_declarations.clone();
         let parent_refs = std::mem::take(&mut self.template_refs);
         let parent_ref_elements = std::mem::take(&mut self.template_ref_elements);
-        self.scope_stack.push(ScopeEntry::Conditional);
+        // `local_vars` is normally inherited by children (so a parent `@let`
+        // remains visible). For aliased `@if` we need to insert the alias and
+        // make sure it does NOT leak into sibling templates — snapshot here
+        // and restore at the end. Without an alias, keep the historic
+        // shared-mutation behavior so we don't regress sibling-template
+        // resolution.
+        let parent_locals = alias.map(|_| self.local_vars.clone());
+        if let Some(name) = alias {
+            self.local_vars.insert(name.to_string());
+        }
+        self.scope_stack.push(ScopeEntry::Conditional {
+            alias: alias.map(|n| n.to_string()),
+        });
         // Reset namespace_state for this child template function (its runtime
         // namespace flag starts as HTML). The stack is left intact so nested
         // elements inherit the outer context's namespace.
@@ -1569,10 +1638,10 @@ impl IvyCodegen {
         self.var_count = 0;
         self.pipe_var_offset = 0;
         self.last_update_slot = None;
-        // Don't clear let_declarations, local_vars, or consts — children
-        // inherit parent scope and share the component-level consts array.
-        // template_refs, however, is scoped per-template: refs live in a
-        // specific LView's slot space and can't cross TView boundaries.
+        // Don't clear let_declarations or consts — children inherit parent
+        // scope and share the component-level consts array. template_refs,
+        // however, is scoped per-template: refs live in a specific LView's
+        // slot space and can't cross TView boundaries.
 
         self.generate_nodes(children);
 
@@ -1583,9 +1652,15 @@ impl IvyCodegen {
         // in the update block and ɵɵrestoreView + ɵɵnextContext in listeners.
         let has_listeners = self.creation.iter().any(|s| s.contains("listener"));
 
-        // Use `_ctx` as parameter name since we rebind `ctx` via ɵɵnextContext()
-        // in the update block.  Using `ctx` for both would be a const redeclaration.
-        let mut code = format!("function {fn_name}(rf, _ctx) {{\n");
+        // For `@if (expr; as alias)`, use the alias as the function parameter
+        // name so the body's references resolve to the truthy expression
+        // value directly (the value Angular passes as `ɵɵconditional`'s
+        // second arg becomes this template's `_ctx`). Otherwise keep the
+        // generic `_ctx` name — we rebind `ctx` via `ɵɵnextContext()` in the
+        // update block, so using `ctx` for both would be a const
+        // redeclaration.
+        let ctx_param = alias.unwrap_or("_ctx");
+        let mut code = format!("function {fn_name}(rf, {ctx_param}) {{\n");
         if !self.creation.is_empty() {
             code.push_str("  if (rf & 1) {\n");
             if has_listeners {
@@ -1644,6 +1719,9 @@ impl IvyCodegen {
         self.update = parent_update;
         self.let_declarations = parent_lets;
         self.template_refs = parent_refs;
+        if let Some(locals) = parent_locals {
+            self.local_vars = locals;
+        }
         let child_ref_elements =
             std::mem::replace(&mut self.template_ref_elements, parent_ref_elements);
         self.namespace_state = parent_ns_state;
@@ -2297,6 +2375,7 @@ impl IvyCodegen {
         let mut code = String::new();
         let depth = self.scope_stack.len();
         let mut levels_consumed = 0;
+        let body_text = self.update.join("\n");
 
         // Walk the scope stack from innermost (current) to outermost.
         // The stack represents [outermost, ..., innermost], so we iterate in reverse.
@@ -2328,8 +2407,33 @@ impl IvyCodegen {
                 ScopeEntry::Repeater { .. } => {
                     // i=0: this is the current @for scope — item accessed via _ctx.$implicit
                 }
-                ScopeEntry::Conditional => {
-                    // Skip — no variables to extract from conditional scopes
+                ScopeEntry::Conditional {
+                    alias: Some(alias_name),
+                } if i > 0 => {
+                    // ANCESTOR @if with `; as alias`. The aliased value is the
+                    // ancestor template's own `_ctx`, so `ɵɵnextContext()` from
+                    // here yields it directly (no `$implicit` indirection like
+                    // @for). Only emit when the body actually reads the alias.
+                    if identifier_used_in(&body_text, alias_name) {
+                        let steps = i - levels_consumed;
+                        if steps == 1 {
+                            code.push_str(&format!(
+                                "    const {alias_name} = \u{0275}\u{0275}nextContext();\n"
+                            ));
+                        } else if steps > 1 {
+                            code.push_str(&format!(
+                                "    const {alias_name} = \u{0275}\u{0275}nextContext({steps});\n"
+                            ));
+                        }
+                        if steps > 0 {
+                            levels_consumed = i;
+                        }
+                    }
+                }
+                ScopeEntry::Conditional { .. } => {
+                    // Skip — current scope's alias (if any) is bound as the
+                    // template function parameter, and non-aliased
+                    // conditionals contribute no variables.
                 }
             }
         }
@@ -2402,7 +2506,28 @@ impl IvyCodegen {
                     }
                     levels_consumed = i;
                 }
-                ScopeEntry::Conditional => {
+                ScopeEntry::Conditional {
+                    alias: Some(alias_name),
+                } if i > 0 => {
+                    // Ancestor `@if (...; as alias)` — its `_ctx` IS the alias
+                    // value, so a single `ɵɵnextContext()` (relative to the
+                    // levels already consumed) yields it. The listener body
+                    // closure captures it for later use.
+                    let steps = i - levels_consumed;
+                    if steps == 1 {
+                        code.push_str(&format!(
+                            "const {alias_name} = \u{0275}\u{0275}nextContext(); "
+                        ));
+                    } else if steps > 1 {
+                        code.push_str(&format!(
+                            "const {alias_name} = \u{0275}\u{0275}nextContext({steps}); "
+                        ));
+                    }
+                    if steps > 0 {
+                        levels_consumed = i;
+                    }
+                }
+                ScopeEntry::Conditional { .. } => {
                     // No implicit variable — still counts toward navigation depth.
                 }
             }
@@ -3294,55 +3419,76 @@ fn collect_ctx_rewrites(
     }
 }
 
-/// Build a conditional expression for @if chains using absolute slot indices.
-fn build_conditional_expr(
-    condition: &str,
-    if_slot: u32,
-    else_ifs: &[(String, String, u32)],
-    else_info: &Option<(String, u32)>,
-    locals: &BTreeSet<String>,
+/// Build `ɵɵconditional`'s first argument: a chained ternary that selects the
+/// matching template slot. `branches` is `[(compiled_expr, alias?, slot), …]`
+/// in source order (`@if`, then `@else if`s). When `else_info` is `Some`, its
+/// slot is used as the fallback; otherwise the chain falls through to `-1`.
+fn build_test_chain(
+    branches: &[(String, Option<String>, u32)],
+    else_info: Option<&(String, u32)>,
 ) -> String {
-    let mut expr = format!(
-        "{} ? {} : ",
-        ctx_expr_with_locals(strip_block_alias(condition), locals),
-        if_slot
-    );
-
-    for (cond, _fn_name, slot) in else_ifs {
-        expr.push_str(&format!(
-            "{} ? {} : ",
-            ctx_expr_with_locals(strip_block_alias(cond), locals),
-            slot
-        ));
+    let mut expr = String::new();
+    for (compiled, _alias, slot) in branches {
+        expr.push_str(&format!("{compiled} ? {slot} : "));
     }
-
     if let Some((_fn, slot)) = else_info {
-        expr.push_str(&format!("{}", slot));
+        expr.push_str(&slot.to_string());
     } else {
         expr.push_str("-1");
     }
+    expr
+}
 
+/// Build `ɵɵconditional`'s second argument: a chained ternary that yields the
+/// matching branch's truthy condition value (for branches that named an
+/// alias via `; as <alias>`) or `null` (for branches that did not). The
+/// chain shape mirrors `build_test_chain` so the same branch index lights up
+/// both arguments in lock-step.
+fn build_alias_value_chain(branches: &[(String, Option<String>, u32)]) -> String {
+    let mut expr = String::new();
+    for (compiled, alias, _slot) in branches {
+        let value = if alias.is_some() { compiled.as_str() } else { "null" };
+        expr.push_str(&format!("{compiled} ? {value} : "));
+    }
+    expr.push_str("null");
     expr
 }
 
 /// Strip the `; as <alias>` suffix from an `@if` / `@else if` control-flow
-/// expression so the codegen emits valid JavaScript for `ɵɵconditional(...)`.
-///
-/// Angular's grammar allows `@if (expr; as alias) { ... }` to expose the
-/// truthy value of `expr` as `alias` inside the body. The pest grammar
-/// captures the whole `expr; as alias` as a single condition string; without
-/// this strip the codegen emits `ɵɵconditional(expr; as alias ? slot : -1)`
-/// which is not valid JS and causes the bundler's tree-shake parse to fail.
-///
-/// Note: this is a Phase-1 fix that only stops the build from breaking. The
-/// alias binding itself (so `{{ alias.name }}` inside the body actually
-/// resolves at runtime) is tracked as a separate follow-up.
+/// expression so the codegen can compile it as a plain JavaScript expression
+/// for `ɵɵconditional(...)`. Pairs with [`extract_block_alias`], which
+/// recovers the alias name itself.
 fn strip_block_alias(condition: &str) -> &str {
     let trimmed = condition.trim();
     if let Some(idx) = find_alias_separator(trimmed) {
         trimmed[..idx].trim()
     } else {
         trimmed
+    }
+}
+
+/// Recover the alias name from a `@if (expr; as <alias>)` /
+/// `@else if (expr; as <alias>)` control-flow condition, or return `None`
+/// for plain conditions. Used together with [`strip_block_alias`] to drive
+/// alias binding: the alias becomes the matching template's `_ctx`
+/// parameter, and references inside the body resolve to that parameter
+/// (directly in the body, via `ɵɵnextContext()` from nested scopes).
+fn extract_block_alias(condition: &str) -> Option<&str> {
+    let trimmed = condition.trim();
+    let idx = find_alias_separator(trimmed)?;
+    let after = trimmed[idx + 1..].trim_start();
+    let rest = after.strip_prefix("as")?.trim_start();
+    if rest.is_empty() {
+        return None;
+    }
+    let end = rest
+        .find(|c: char| !is_js_ident_continue(c))
+        .unwrap_or(rest.len());
+    let name = &rest[..end];
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
     }
 }
 
@@ -4031,6 +4177,23 @@ mod tests {
         // `;asfoo` is not an alias clause — the `as` must be followed by
         // whitespace.
         assert_eq!(strip_block_alias("foo;ascending"), "foo;ascending");
+    }
+
+    #[test]
+    fn extract_block_alias_picks_up_name() {
+        assert_eq!(extract_block_alias("item(); as it"), Some("it"));
+        assert_eq!(extract_block_alias("state$ | async; as s"), Some("s"));
+        assert_eq!(extract_block_alias("a && b; as x"), Some("x"));
+        assert_eq!(extract_block_alias("foo;as bar"), Some("bar"));
+    }
+
+    #[test]
+    fn extract_block_alias_returns_none_without_alias_clause() {
+        assert_eq!(extract_block_alias("ctx.x"), None);
+        assert_eq!(extract_block_alias("a && b"), None);
+        // Inside parens / strings — `find_alias_separator` skips these.
+        assert_eq!(extract_block_alias("f(a; as b)"), None);
+        assert_eq!(extract_block_alias("'a; as b'"), None);
     }
 
     fn test_component() -> ExtractedComponent {
@@ -5468,6 +5631,143 @@ mod tests {
         assert!(
             !body.contains("\u{0275}\u{0275}nextContext"),
             "no parent reference → ɵɵnextContext must not be emitted: {body}"
+        );
+    }
+
+    /// Combine the component's defineComponent block and all child template
+    /// functions into one searchable string — `@if` codegen lives in
+    /// `child_template_functions`, not `static_fields`.
+    fn full_emit(output: &IvyOutput) -> String {
+        let mut s = output.static_fields.join("\n");
+        s.push('\n');
+        s.push_str(&output.child_template_functions.join("\n"));
+        s
+    }
+
+    /// `@if (expr; as alias)` must:
+    ///   1. bind the alias as the inner template function's `_ctx` parameter,
+    ///   2. leave body references to the alias unprefixed (no `ctx.<alias>`),
+    ///   3. pass the truthy expression value as `ɵɵconditional`'s second arg.
+    #[test]
+    fn if_block_alias_binds_to_inner_ctx_param() {
+        let output = compile_template("@if (item(); as it) { {{ it.name }} }");
+        let dc = full_emit(&output);
+        assert!(
+            dc.contains("function TestComponent_Conditional_0_Template(rf, it)"),
+            "alias must rename the embedded view's _ctx parameter: {dc}"
+        );
+        assert!(
+            dc.contains("\u{0275}\u{0275}textInterpolate(it.name);"),
+            "alias references must resolve to the param, not ctx.<alias>: {dc}"
+        );
+        assert!(
+            !dc.contains("ctx.it."),
+            "must not fall back to ctx.<alias>.<field> on the parent: {dc}"
+        );
+        assert!(
+            dc.contains("\u{0275}\u{0275}conditional(ctx.item() ? 0 : -1, ctx.item() ? ctx.item() : null);"),
+            "ɵɵconditional must receive the truthy value as its second arg: {dc}"
+        );
+    }
+
+    /// Plain `@if` (no alias) must keep the historic single-argument
+    /// `ɵɵconditional(...)` emission — adding a second argument would shift
+    /// `_ctx` to whatever value we pass, breaking sibling templates that
+    /// don't expect it.
+    #[test]
+    fn if_block_without_alias_keeps_single_arg_conditional() {
+        let output = compile_template("@if (show) { <p>hi</p> }");
+        let dc = full_emit(&output);
+        assert!(
+            dc.contains("function TestComponent_Conditional_0_Template(rf, _ctx)"),
+            "no-alias branch must keep `_ctx` parameter name: {dc}"
+        );
+        assert!(
+            dc.contains("\u{0275}\u{0275}conditional(ctx.show ? 0 : -1);"),
+            "no-alias branch must emit single-arg ɵɵconditional: {dc}"
+        );
+    }
+
+    /// `@else if (expr; as alias)` must bind its own alias independently of
+    /// the `@if` branch.
+    #[test]
+    fn else_if_block_alias_binds_per_branch() {
+        let output = compile_template(
+            "@if (a; as ax) { {{ ax.foo }} } @else if (b; as bx) { {{ bx.bar }} }",
+        );
+        let dc = full_emit(&output);
+        assert!(
+            dc.contains("function TestComponent_Conditional_0_Template(rf, ax)"),
+            "@if branch's alias must be its template param: {dc}"
+        );
+        assert!(
+            dc.contains("function TestComponent_ConditionalElseIf_1_Template(rf, bx)"),
+            "@else if branch's alias must be its template param: {dc}"
+        );
+        // The slot ternary stays in source order; the alias-value chain
+        // resolves each branch's compiled expression in lock-step.
+        assert!(
+            dc.contains("\u{0275}\u{0275}conditional(ctx.a ? 0 : ctx.b ? 1 : -1, ctx.a ? ctx.a : ctx.b ? ctx.b : null);"),
+            "alias-value chain must match the slot chain branch-for-branch: {dc}"
+        );
+    }
+
+    /// References to the alias from a nested template (e.g. `@switch` inside
+    /// the `@if` body) must walk back via `ɵɵnextContext()` — the @if's
+    /// embedded view holds the alias as its `_ctx`, and nested scopes
+    /// don't have the alias as their own function parameter.
+    #[test]
+    fn if_block_alias_reaches_nested_scopes_via_next_context() {
+        let output = compile_template(
+            "@if (state(); as s) { @switch (s.k) { @case ('a') { {{ s.v }} } } }",
+        );
+        let dc = full_emit(&output);
+        // The @switch case's template binds `s` from the @if's embedded view.
+        assert!(
+            dc.contains("const s = \u{0275}\u{0275}nextContext();"),
+            "nested case must extract the outer alias via nextContext(): {dc}"
+        );
+        assert!(
+            dc.contains("\u{0275}\u{0275}textInterpolate(s.v);"),
+            "alias references in nested scopes must stay unprefixed: {dc}"
+        );
+        assert!(
+            !dc.contains("ctx.s.") && !dc.contains("ctx.s "),
+            "must not fall back to ctx.<alias>.<field> from nested scopes: {dc}"
+        );
+    }
+
+    /// Pipes inside an `@if` condition (e.g. `state$ | async; as s`) must
+    /// register `ɵɵpipe(...)` at the parent template and reuse the same
+    /// `ɵɵpipeBind1(...)` form for both `ɵɵconditional` arguments, so the
+    /// alias receives the resolved (subscribed) value — not the raw
+    /// observable.
+    #[test]
+    fn if_block_alias_compiles_pipe_in_condition() {
+        let output = compile_template("@if (state$ | async; as s) { {{ s.value }} }");
+        let dc = full_emit(&output);
+        assert!(
+            output.ivy_imports.contains("\u{0275}\u{0275}pipeBind1"),
+            "async pipe in @if condition must register pipeBind1: imports={:?}",
+            output.ivy_imports
+        );
+        assert!(
+            dc.contains("\u{0275}\u{0275}pipe(") && dc.contains(", 'async')"),
+            "async pipe in @if condition must register a pipe slot: {dc}"
+        );
+        assert!(
+            dc.contains("function TestComponent_Conditional_0_Template(rf, s)"),
+            "alias `s` must be the inner template param: {dc}"
+        );
+        // Both ɵɵconditional args reuse the pipeBind1 form so the alias and
+        // the slot decision see the same resolved value.
+        let conditional_call = dc
+            .lines()
+            .find(|l| l.contains("\u{0275}\u{0275}conditional("))
+            .expect("ɵɵconditional call must be emitted");
+        assert!(
+            conditional_call.matches("\u{0275}\u{0275}pipeBind1").count() >= 3,
+            "ɵɵconditional must reuse pipeBind1 across test and alias-value chains: {conditional_call}"
         );
     }
 }
