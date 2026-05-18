@@ -163,24 +163,40 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
         .map(|c| c.filename.clone())
         .collect();
 
-    // Lazy chunks consume symbols from main cross-chunk; those consumptions
-    // are invisible to the per-chunk shake analysis. Precompute the union
-    // before fan-out so the main chunk's analyze_unused_exports preserves
-    // them.
-    let externally_used: Option<HashSet<String>> = if input.options.tree_shake {
-        let mut lazy_consumers: Vec<PathBuf> = Vec::new();
-        for chunk in &chunk_graph.chunks[1..] {
-            lazy_consumers.extend(chunk.modules.iter().cloned());
+    // Every chunk consumes symbols from other chunks (main from lazy, lazy
+    // from main, lazy from vendor, ...) — those consumptions are invisible
+    // to per-chunk shake analysis. Precompute the per-provider used-name
+    // set before fan-out so each chunk's analyze_unused_exports preserves
+    // exactly what its consumers reach into.
+    //
+    // For bare npm specifiers (e.g. `'@angular/core'`), build a
+    // specifier → canonical-entry-path map by composing the bare-spec →
+    // namespace and namespace → owning-path lookups we already computed.
+    // Without this, the shake walker can't attribute an `import { X } from
+    // '@angular/core'` to its vendor chunk and the chunk falls back to
+    // pinning every export the package declares.
+    let externally_used_per_chunk: Vec<HashSet<String>> = if input.options.tree_shake {
+        let mut ns_to_path: HashMap<&str, &PathBuf> = HashMap::new();
+        for (path, ns) in &all_file_to_ns {
+            ns_to_path.insert(ns.as_str(), path);
         }
-        Some(shake::collect_cross_chunk_used_names(
-            &lazy_consumers,
-            &main_chunk.modules,
+        let specifier_to_path: HashMap<String, PathBuf> = specifier_to_namespace
+            .iter()
+            .filter_map(|(spec, ns)| {
+                ns_to_path
+                    .get(ns.as_str())
+                    .map(|path| (spec.clone(), (*path).clone()))
+            })
+            .collect();
+        shake::collect_cross_chunk_used_names_per_provider(
+            &chunk_graph,
             &input.modules,
             &prefix_refs,
+            &specifier_to_path,
             subpath_ctx,
-        )?)
+        )?
     } else {
-        None
+        vec![HashSet::new(); chunk_graph.chunks.len()]
     };
 
     // Process every chunk (main + lazy/shared) in a single rayon fan-out.
@@ -194,13 +210,8 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
         .par_iter()
         .enumerate()
         .map(|(idx, chunk)| -> NgcResult<(String, ChunkBundleResult)> {
-            let is_main = idx == 0;
             let unused_exports = if input.options.tree_shake {
-                let externally_used_ref = if is_main {
-                    externally_used.as_ref()
-                } else {
-                    None
-                };
+                let externally_used_ref = externally_used_per_chunk.get(idx);
                 shake::analyze_unused_exports(
                     &chunk.modules,
                     &input.modules,
@@ -648,10 +659,12 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<ChunkBundleResult> {
                     // or another — cross-chunk refs become imports at the
                     // chunk's top, emitted in the post-process pass.
                     let namespace = &file_to_namespace[module_path];
+                    let module_unused = p.unused_exports.get(module_path);
                     let wrapped = crate::npm_wrap::wrap_npm_module(
                         js_code,
                         &file_name,
                         namespace,
+                        module_unused,
                         |specifier| {
                             if specifier.starts_with('.') {
                                 let from_dir = module_path.parent()?;
