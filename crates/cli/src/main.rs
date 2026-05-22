@@ -1243,27 +1243,12 @@ pub(crate) fn run_build_with_options(
         output_files.push(lp);
     }
 
-    // Step 12.5: Service worker manifest (`ngsw.json`) when the project opts
-    // in via `architect.build.options.serviceWorker`. Hashing runs *after*
-    // every other writer so it sees the final filenames + contents.
-    if let Some(ref ap) = angular_project {
-        if ap.service_worker {
-            if localize.is_some() {
-                tracing::warn!(
-                    "serviceWorker is enabled but --localize was passed; skipping ngsw.json (per-locale manifests are not yet supported)"
-                );
-            } else {
-                let ngsw_paths = generate_service_worker(ap, &out_dir, &config_dir)?;
-                output_files.extend(ngsw_paths);
-            }
-        }
-    }
-
-    // Step 13: --localize → fan the source-locale build out to
+    // Step 12.5: --localize → fan the source-locale build out to
     // `<out_dir>/<sourceLocale>/` and produce a translated copy under
     // `<out_dir>/<locale>/` for each entry in `i18n.locales`. A non-empty
     // `subset` filters the emitted locales — useful for trimming CI builds
     // that only need one or two locales per deploy.
+    let localized = localize.is_some();
     if let Some(subset) = localize {
         let i18n = angular_project
             .as_ref()
@@ -1275,6 +1260,44 @@ pub(crate) fn run_build_with_options(
             })?;
         let localized_files = fan_out_locales(&out_dir, i18n, subset, &output_files)?;
         output_files = localized_files;
+    }
+
+    // Step 13: Service worker manifest (`ngsw.json`) when the project opts in
+    // via `architect.build.options.serviceWorker`. Hashing runs *after* every
+    // other writer (including locale fan-out) so it sees the final filenames +
+    // contents. With `--localize` each locale subdirectory is its own PWA
+    // deploy root, so we emit one manifest per `<out_dir>/<locale>/` — asset
+    // hashes are naturally per-locale (translated bundles differ byte-for-byte).
+    if let Some(ref ap) = angular_project {
+        if ap.service_worker {
+            if localized {
+                for entry in std::fs::read_dir(&out_dir).map_err(|e| NgcError::Io {
+                    path: out_dir.clone(),
+                    source: e,
+                })? {
+                    let entry = entry.map_err(|e| NgcError::Io {
+                        path: out_dir.clone(),
+                        source: e,
+                    })?;
+                    let locale_dir = entry.path();
+                    let is_dir = entry
+                        .file_type()
+                        .map_err(|e| NgcError::Io {
+                            path: locale_dir.clone(),
+                            source: e,
+                        })?
+                        .is_dir();
+                    if !is_dir {
+                        continue;
+                    }
+                    let ngsw_paths = generate_service_worker(ap, &locale_dir, &config_dir)?;
+                    output_files.extend(ngsw_paths);
+                }
+            } else {
+                let ngsw_paths = generate_service_worker(ap, &out_dir, &config_dir)?;
+                output_files.extend(ngsw_paths);
+            }
+        }
     }
 
     // Stat each written path and tag it with its OutputKind. Failed stats
@@ -3581,5 +3604,191 @@ mod tests {
         for url in app_urls.iter().chain(media_urls.iter()) {
             assert!(table.contains_key(*url), "missing hash for {url}");
         }
+    }
+
+    /// End-to-end fixture: a localized build (`--localize`) with
+    /// `serviceWorker: true` must emit one `ngsw.json` per locale
+    /// subdirectory, each carrying deploy-root-relative URLs and asset
+    /// hashes computed from that locale's own (translated) tree.
+    #[test]
+    fn test_service_worker_pipeline_localized_fixture() {
+        use ngc_project_resolver::angular_json::resolve_angular_project;
+        use sha1::{Digest, Sha1};
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path();
+
+        // angular.json: serviceWorker on + an i18n block declaring one
+        // translation locale (`fr`) alongside the `en` source locale.
+        std::fs::write(
+            root.join("angular.json"),
+            r#"{
+                "projects": {
+                    "pwa": {
+                        "root": "",
+                        "sourceRoot": "src",
+                        "i18n": {
+                            "sourceLocale": "en",
+                            "locales": { "fr": "src/locale/messages.fr.xlf" }
+                        },
+                        "architect": {
+                            "build": {
+                                "options": {
+                                    "outputPath": "dist/pwa",
+                                    "tsConfig": "tsconfig.json",
+                                    "serviceWorker": true,
+                                    "ngswConfigPath": "ngsw-config.json"
+                                }
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            root.join("ngsw-config.json"),
+            r#"{
+                "index": "/index.html",
+                "assetGroups": [
+                    {
+                        "name": "app",
+                        "installMode": "prefetch",
+                        "resources": { "files": ["/index.html", "/*.js", "/*.css"] }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        // Translation file mapping the `greeting` message to French so the
+        // `fr` bundle diverges byte-for-byte from `en` — the precise reason
+        // each locale needs its own manifest with its own hashes.
+        std::fs::create_dir_all(root.join("src").join("locale")).unwrap();
+        std::fs::write(
+            root.join("src").join("locale").join("messages.fr.xlf"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<xliff version="2.0" xmlns="urn:oasis:names:tc:xliff:document:2.0" srcLang="en" trgLang="fr">
+  <file id="ngc.template" original="ng.template">
+    <unit id="greeting">
+      <segment>
+        <source>Hello</source>
+        <target>Bonjour</target>
+      </segment>
+    </unit>
+  </file>
+</xliff>"#,
+        )
+        .unwrap();
+
+        // Pre-populate the flat source-locale dist tree, as the bundler would.
+        let dist = root.join("dist").join("pwa");
+        std::fs::create_dir_all(&dist).unwrap();
+        let index_bytes = b"<!doctype html><title>pwa</title>".to_vec();
+        let style_bytes = b"body { color: red; }".to_vec();
+        std::fs::write(dist.join("index.html"), &index_bytes).unwrap();
+        std::fs::write(
+            dist.join("main-ABCDE.js"),
+            "var x = $localize`:@@greeting:Hello`;",
+        )
+        .unwrap();
+        std::fs::write(dist.join("styles-FGHIJ.css"), &style_bytes).unwrap();
+        let original_files = vec![
+            dist.join("index.html"),
+            dist.join("main-ABCDE.js"),
+            dist.join("styles-FGHIJ.css"),
+        ];
+
+        let project = resolve_angular_project(&root.join("angular.json"), Some("pwa"), None)
+            .expect("resolve angular project");
+        assert!(project.service_worker);
+        let i18n = project.i18n.as_ref().expect("i18n block parsed");
+
+        // Fan the flat build out into `dist/pwa/en/` and `dist/pwa/fr/`.
+        fan_out_locales(&dist, i18n, &[], &original_files).expect("fan_out_locales");
+
+        // Generate one manifest per locale subdir — mirrors the build pipeline.
+        for locale in ["en", "fr"] {
+            let paths = generate_service_worker(&project, &dist.join(locale), root)
+                .expect("generate_service_worker");
+            assert!(
+                !paths.is_empty(),
+                "{locale}: should write at least ngsw.json"
+            );
+        }
+
+        let expect_sha1 = |bytes: &[u8]| -> String {
+            let mut h = Sha1::new();
+            h.update(bytes);
+            h.finalize().iter().fold(String::new(), |mut acc, b| {
+                acc.push_str(&format!("{b:02x}"));
+                acc
+            })
+        };
+
+        for locale in ["en", "fr"] {
+            let manifest_path = dist.join(locale).join("ngsw.json");
+            assert!(manifest_path.is_file(), "{locale}/ngsw.json must exist");
+            let manifest: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap())
+                    .expect("ngsw.json parses as JSON");
+
+            let groups = manifest["assetGroups"].as_array().expect("assetGroups");
+            let urls: Vec<&str> = groups[0]["urls"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            // URLs are relative to the locale deploy root — no `/en/` prefix.
+            assert!(
+                urls.contains(&"/index.html"),
+                "{locale}: missing /index.html"
+            );
+            assert!(
+                urls.contains(&"/main-ABCDE.js"),
+                "{locale}: missing /main-ABCDE.js"
+            );
+            assert!(
+                urls.contains(&"/styles-FGHIJ.css"),
+                "{locale}: missing /styles-FGHIJ.css"
+            );
+            assert!(
+                !urls.iter().any(|u| u.starts_with(&format!("/{locale}/"))),
+                "{locale}: URLs must be deploy-root-relative, got {urls:?}"
+            );
+
+            // hashTable entries must equal the SHA-1 of this locale's bytes.
+            let table = manifest["hashTable"].as_object().expect("hashTable");
+            let main_bytes = std::fs::read(dist.join(locale).join("main-ABCDE.js")).unwrap();
+            assert_eq!(
+                table["/main-ABCDE.js"].as_str().unwrap(),
+                expect_sha1(&main_bytes),
+                "{locale}: main.js hash must match its own tree"
+            );
+            assert_eq!(
+                table["/index.html"].as_str().unwrap(),
+                expect_sha1(&index_bytes)
+            );
+        }
+
+        // The translated `fr` bundle differs from `en`, so the two manifests
+        // must record different hashes for the same URL — correct cache busting.
+        let main_hash = |locale: &str| -> String {
+            let m: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(dist.join(locale).join("ngsw.json")).unwrap(),
+            )
+            .unwrap();
+            m["hashTable"]["/main-ABCDE.js"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_ne!(
+            main_hash("en"),
+            main_hash("fr"),
+            "translated bundle must hash differently per locale"
+        );
     }
 }
