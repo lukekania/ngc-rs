@@ -252,6 +252,16 @@ enum Commands {
         /// (`*.localhost`, `app.local`).
         #[arg(long = "allowed-hosts", value_delimiter = ',', num_args = 0..)]
         allowed_hosts: Vec<String>,
+        /// Custom HTTP response headers to emit on every served response,
+        /// as a JSON object of header name → string value (e.g.
+        /// `--headers '{"Cross-Origin-Opener-Policy":"same-origin"}'`).
+        /// Mirrors the `headers` option of `@angular/build:dev-server`,
+        /// for serving production-like security headers (CSP, COOP),
+        /// CORS headers, or cache-control overrides in dev. Headers the
+        /// server sets itself (`Content-Type`, `Cache-Control`) are not
+        /// overridden by these.
+        #[arg(long = "headers")]
+        headers: Option<String>,
     },
     /// Extract translatable messages from every component template in the
     /// project and emit a translation file (XLIFF 2.0 by default; XLIFF 1.2
@@ -298,6 +308,32 @@ enum ExtractFormat {
     /// ARB (Application Resource Bundle) — accepted for parity but
     /// currently rejected with a clear error (out of scope for this release).
     Arb,
+}
+
+/// Parse the `serve --headers` JSON object into ordered name/value pairs.
+///
+/// Accepts a JSON object whose values are all strings, e.g.
+/// `{"Cross-Origin-Opener-Policy":"same-origin"}`. `None` (flag omitted)
+/// yields an empty list. A non-object, malformed JSON, or a non-string
+/// value is a hard error so a typo in `angular.json`'s `headers` surfaces
+/// immediately rather than being silently dropped.
+fn parse_header_overrides(raw: Option<&str>) -> Result<Vec<(String, String)>, String> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| format!("--headers is not valid JSON: {e}"))?;
+    let serde_json::Value::Object(map) = value else {
+        return Err("--headers must be a JSON object of header name to string value".to_string());
+    };
+    let mut out = Vec::with_capacity(map.len());
+    for (name, val) in map {
+        match val {
+            serde_json::Value::String(s) => out.push((name, s)),
+            _ => return Err(format!("--headers value for \"{name}\" must be a string")),
+        }
+    }
+    Ok(out)
 }
 
 fn main() {
@@ -353,7 +389,15 @@ fn main() {
             open,
             serve_path,
             allowed_hosts,
+            headers,
         } => {
+            let parsed_headers = match parse_header_overrides(headers.as_deref()) {
+                Ok(h) => h,
+                Err(e) => {
+                    eprintln!("{} {e}", "Error:".red().bold());
+                    process::exit(1);
+                }
+            };
             if let Err(e) = serve_cmd::run(
                 &project,
                 Some(&configuration),
@@ -362,6 +406,7 @@ fn main() {
                 open,
                 serve_path.as_deref(),
                 &allowed_hosts,
+                &parsed_headers,
             ) {
                 eprintln!("{} {e}", "Error:".red().bold());
                 process::exit(1);
@@ -3789,6 +3834,50 @@ mod tests {
             main_hash("en"),
             main_hash("fr"),
             "translated bundle must hash differently per locale"
+        );
+    }
+
+    #[test]
+    fn parse_header_overrides_none_yields_empty() {
+        assert_eq!(parse_header_overrides(None).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn parse_header_overrides_parses_a_json_object() {
+        let parsed = parse_header_overrides(Some(
+            r#"{"Cross-Origin-Opener-Policy":"same-origin","X-Frame-Options":"DENY"}"#,
+        ))
+        .unwrap();
+        // serde_json's Map iterates keys in sorted order.
+        assert_eq!(
+            parsed,
+            vec![
+                (
+                    "Cross-Origin-Opener-Policy".to_string(),
+                    "same-origin".to_string()
+                ),
+                ("X-Frame-Options".to_string(), "DENY".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_header_overrides_rejects_malformed_json() {
+        assert!(parse_header_overrides(Some("{not json")).is_err());
+    }
+
+    #[test]
+    fn parse_header_overrides_rejects_non_object_json() {
+        let err = parse_header_overrides(Some(r#"["X-Foo"]"#)).unwrap_err();
+        assert!(err.contains("JSON object"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_header_overrides_rejects_non_string_values() {
+        let err = parse_header_overrides(Some(r#"{"X-Foo":123}"#)).unwrap_err();
+        assert!(
+            err.contains("X-Foo") && err.contains("string"),
+            "got: {err}"
         );
     }
 }

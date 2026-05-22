@@ -135,6 +135,60 @@ describe('translateOptions', () => {
     ).not.toContain('--allowed-hosts');
     expect(translateOptions(base, '/ws').args).not.toContain('--allowed-hosts');
   });
+
+  it('forwards a headers map as a JSON --headers arg', () => {
+    const t = translateOptions(
+      {
+        ...base,
+        headers: { 'Cross-Origin-Opener-Policy': 'same-origin' },
+      },
+      '/ws',
+    );
+    const idx = t.args.indexOf('--headers');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(JSON.parse(t.args[idx + 1])).toEqual({
+      'Cross-Origin-Opener-Policy': 'same-origin',
+    });
+  });
+
+  it('forwards multiple headers in a single --headers arg', () => {
+    const t = translateOptions(
+      {
+        ...base,
+        headers: { 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' },
+      },
+      '/ws',
+    );
+    const idx = t.args.indexOf('--headers');
+    expect(JSON.parse(t.args[idx + 1])).toEqual({
+      'X-Frame-Options': 'DENY',
+      'X-Content-Type-Options': 'nosniff',
+    });
+  });
+
+  it('trims header names and drops empty-name / non-string entries', () => {
+    const t = translateOptions(
+      {
+        ...base,
+        headers: {
+          '  X-Trim  ': 'ok',
+          '': 'dropped',
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          'X-Bad': 123 as any,
+        },
+      },
+      '/ws',
+    );
+    const idx = t.args.indexOf('--headers');
+    expect(JSON.parse(t.args[idx + 1])).toEqual({ 'X-Trim': 'ok' });
+  });
+
+  it('omits --headers when the map is empty or unset', () => {
+    expect(
+      translateOptions({ ...base, headers: {} }, '/ws').args,
+    ).not.toContain('--headers');
+    expect(translateOptions(base, '/ws').args).not.toContain('--headers');
+  });
 });
 
 describe('formatUrl', () => {

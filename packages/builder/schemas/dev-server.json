@@ -68,6 +68,11 @@
       "type": "array",
       "items": { "type": "string" },
       "description": "List of host names the dev server's Host-header check accepts. Loopback hosts (localhost, 127.0.0.1, [::1]) are always allowed. The special value \"all\" disables the check entirely. The special value \"auto\" additionally accepts the configured bind host. Use this to expose the dev server through tunneling proxies (ngrok, Cloudflare Tunnel, GitHub Codespaces) or non-default local hostnames (*.localhost, app.local)."
+    },
+    "headers": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Custom HTTP response headers emitted on every served response (static assets, the SPA-fallback index.html, and the SSE live-reload stream). Use this to serve production-like security headers (CSP, Cross-Origin-Opener-Policy), CORS headers, or cache-control overrides in dev. Headers the dev server sets itself (Content-Type, Cache-Control) are not overridden. Headers are not added to proxy-forwarded responses, which keep their upstream headers."
     }
   },
   "additionalProperties": false

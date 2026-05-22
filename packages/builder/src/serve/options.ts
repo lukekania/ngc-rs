@@ -16,6 +16,7 @@ export interface DevServerOptions extends json.JsonObject {
   watch: boolean | null;
   servePath: string | null;
   allowedHosts: string[] | null;
+  headers: { [key: string]: string } | null;
 }
 
 export interface TranslatedServeArgs {
@@ -84,6 +85,10 @@ export function translateOptions(
   if (allowedHosts.length > 0) {
     args.push('--allowed-hosts', allowedHosts.join(','));
   }
+  const headers = normalizeHeaders(raw.headers);
+  if (headers !== null) {
+    args.push('--headers', headers);
+  }
 
   return {
     args,
@@ -146,6 +151,34 @@ function normalizeAllowedHosts(raw: string[] | null | undefined): string[] {
     out.push(trimmed);
   }
   return out;
+}
+
+// Serialize the dev-server `headers` map into a compact JSON object string
+// for the `--headers` CLI flag (the shape the Rust side parses). Header
+// names are trimmed; entries with an empty name or a non-string value are
+// dropped — the Rust side would reject the latter anyway, and dropping
+// here keeps a stray null/number in angular.json from failing the build.
+// Returns null when nothing survives so the caller can omit the flag.
+function normalizeHeaders(
+  raw: { [key: string]: string } | null | undefined,
+): string | null {
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+  const out: { [key: string]: string } = {};
+  let count = 0;
+  for (const [key, value] of Object.entries(raw)) {
+    if (typeof value !== 'string') {
+      continue;
+    }
+    const name = key.trim();
+    if (!name) {
+      continue;
+    }
+    out[name] = value;
+    count++;
+  }
+  return count > 0 ? JSON.stringify(out) : null;
 }
 
 function parseConfigurationFromBuildTarget(buildTarget?: string): string | null {

@@ -443,17 +443,12 @@ fn unprefixed_request_returns_404_when_serve_path_set() {
     assert_eq!(http_get(fx.server.addr(), "/__ngc_reload").status, 404);
 }
 
-fn http_get_with_host(
-    addr: std::net::SocketAddr,
-    path: &str,
-    host_header: &str,
-) -> HttpResponse {
+fn http_get_with_host(addr: std::net::SocketAddr, path: &str, host_header: &str) -> HttpResponse {
     let mut stream = TcpStream::connect(addr).expect("connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("read timeout");
-    let req =
-        format!("GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n");
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).expect("write");
     stream.flush().expect("flush");
 
@@ -507,9 +502,18 @@ fn allowed_hosts_fixture(patterns: &[&str]) -> Fixture {
 #[test]
 fn default_allowed_hosts_accept_loopback_and_403_others() {
     let fx = allowed_hosts_fixture(&[]);
-    assert_eq!(http_get_with_host(fx.server.addr(), "/", "localhost").status, 200);
-    assert_eq!(http_get_with_host(fx.server.addr(), "/", "127.0.0.1").status, 200);
-    assert_eq!(http_get_with_host(fx.server.addr(), "/", "[::1]").status, 200);
+    assert_eq!(
+        http_get_with_host(fx.server.addr(), "/", "localhost").status,
+        200
+    );
+    assert_eq!(
+        http_get_with_host(fx.server.addr(), "/", "127.0.0.1").status,
+        200
+    );
+    assert_eq!(
+        http_get_with_host(fx.server.addr(), "/", "[::1]").status,
+        200
+    );
     let blocked = http_get_with_host(fx.server.addr(), "/", "my-app.ngrok.io");
     assert_eq!(blocked.status, 403);
     let body = std::str::from_utf8(&blocked.body).unwrap_or("");
@@ -532,7 +536,10 @@ fn explicit_allowed_host_lets_ngrok_traffic_through() {
         200
     );
     // Loopback still works.
-    assert_eq!(http_get_with_host(fx.server.addr(), "/", "localhost").status, 200);
+    assert_eq!(
+        http_get_with_host(fx.server.addr(), "/", "localhost").status,
+        200
+    );
     // Anything else is still blocked.
     assert_eq!(
         http_get_with_host(fx.server.addr(), "/", "other.ngrok.io").status,
@@ -582,4 +589,134 @@ fn prefixed_sse_channel_is_reachable_under_prefix() {
         }
     }
     assert!(saw_event_stream);
+}
+
+/// Build a fixture whose dev server is configured with the given custom
+/// response `headers`.
+fn headers_fixture(headers: &[(&str, &str)]) -> Fixture {
+    let root = TempDir::new().expect("tempdir");
+    write_file(
+        root.path(),
+        "index.html",
+        b"<html><body><h1>hi</h1></body></html>",
+    );
+    write_file(root.path(), "main.js", b"console.log('hello');");
+
+    let cfg = DevServerConfig::new(root.path())
+        .with_port(0)
+        .with_headers(headers.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+    let (_tx, rx) = channel::<DevServerEvent>();
+    let server = DevServer::start(cfg, rx).expect("start dev server");
+    Fixture {
+        server,
+        _root: root,
+    }
+}
+
+#[test]
+fn custom_headers_are_emitted_on_static_assets() {
+    let fx = headers_fixture(&[("Cross-Origin-Opener-Policy", "same-origin")]);
+    let resp = http_get(fx.server.addr(), "/main.js");
+    assert_eq!(resp.status, 200);
+    assert_eq!(
+        resp.header("Cross-Origin-Opener-Policy"),
+        Some("same-origin")
+    );
+}
+
+#[test]
+fn custom_headers_are_emitted_on_index_html() {
+    let fx = headers_fixture(&[("Cross-Origin-Opener-Policy", "same-origin")]);
+    let resp = http_get(fx.server.addr(), "/");
+    assert_eq!(resp.status, 200);
+    assert_eq!(
+        resp.header("Cross-Origin-Opener-Policy"),
+        Some("same-origin")
+    );
+}
+
+#[test]
+fn custom_headers_are_emitted_on_spa_fallback() {
+    let fx = headers_fixture(&[("X-Frame-Options", "DENY")]);
+    // A deep client-side route resolves to no file and falls back to
+    // index.html — the custom headers must ride along.
+    let resp = http_get(fx.server.addr(), "/users/42/profile");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.header("X-Frame-Options"), Some("DENY"));
+}
+
+#[test]
+fn multiple_custom_headers_are_all_emitted() {
+    let fx = headers_fixture(&[
+        ("X-Frame-Options", "DENY"),
+        ("X-Content-Type-Options", "nosniff"),
+    ]);
+    let resp = http_get(fx.server.addr(), "/main.js");
+    assert_eq!(resp.header("X-Frame-Options"), Some("DENY"));
+    assert_eq!(resp.header("X-Content-Type-Options"), Some("nosniff"));
+}
+
+#[test]
+fn custom_content_type_header_does_not_clobber_the_real_one() {
+    // A user `Content-Type` entry must never override the MIME type the
+    // server picked for the served file.
+    let fx = headers_fixture(&[("Content-Type", "text/plain")]);
+    let resp = http_get(fx.server.addr(), "/main.js");
+    assert_eq!(resp.status, 200);
+    let ct = resp.header("Content-Type").expect("content-type");
+    assert!(
+        ct.starts_with("application/javascript"),
+        "user Content-Type clobbered the server's: {ct}"
+    );
+}
+
+#[test]
+fn custom_cache_control_header_does_not_clobber_the_dev_server_one() {
+    // Live reload depends on responses not being cached; a user
+    // `Cache-Control` entry must not override the dev server's `no-cache`.
+    let fx = headers_fixture(&[("Cache-Control", "max-age=31536000")]);
+    let resp = http_get(fx.server.addr(), "/main.js");
+    assert_eq!(resp.header("Cache-Control"), Some("no-cache"));
+}
+
+#[test]
+fn no_custom_headers_keeps_responses_unchanged() {
+    let fx = headers_fixture(&[]);
+    let resp = http_get(fx.server.addr(), "/main.js");
+    assert_eq!(resp.status, 200);
+    assert!(resp.header("Cross-Origin-Opener-Policy").is_none());
+}
+
+#[test]
+fn custom_headers_are_emitted_on_the_sse_stream() {
+    let fx = headers_fixture(&[("Cross-Origin-Opener-Policy", "same-origin")]);
+    let mut stream = TcpStream::connect(fx.server.addr()).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    let req = "GET /__ngc_reload HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/event-stream\r\n\r\n";
+    stream.write_all(req.as_bytes()).expect("write");
+    stream.flush().expect("flush");
+
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line).expect("status line");
+    assert!(status_line.contains("200"), "got {status_line}");
+
+    let mut saw_header = false;
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).expect("header");
+        if n == 0 || line == "\r\n" {
+            break;
+        }
+        if line
+            .to_ascii_lowercase()
+            .starts_with("cross-origin-opener-policy:")
+        {
+            assert!(line.to_ascii_lowercase().contains("same-origin"));
+            saw_header = true;
+        }
+    }
+    assert!(saw_header, "custom header missing from SSE response head");
 }
