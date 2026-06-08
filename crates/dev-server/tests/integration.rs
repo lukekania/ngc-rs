@@ -720,3 +720,205 @@ fn custom_headers_are_emitted_on_the_sse_stream() {
     }
     assert!(saw_header, "custom header missing from SSE response head");
 }
+
+// ----------------------------------------------------------------------------
+// HTTPS / TLS (#142)
+//
+// These tests stand up a dev server with a throwaway self-signed certificate
+// and drive it through a rustls client that skips certificate verification —
+// the equivalent of clicking through the browser's untrusted-certificate
+// warning. They confirm both ordinary static serving and the long-lived SSE
+// live-reload stream work once the connection is wrapped in TLS.
+// ----------------------------------------------------------------------------
+
+mod tls {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpStream;
+    use std::sync::mpsc::channel;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use ngc_dev_server::{
+        DevServer, DevServerConfig, DevServerEvent, TlsConfig, LIVE_RELOAD_SCRIPT,
+    };
+    use rustls::{ClientConfig, ClientConnection, StreamOwned};
+    use tempfile::TempDir;
+
+    struct TlsFixture {
+        server: DevServer,
+        _root: TempDir,
+    }
+
+    impl TlsFixture {
+        fn new() -> Self {
+            let root = TempDir::new().expect("tempdir");
+            std::fs::write(
+                root.path().join("index.html"),
+                b"<html><body><h1>secure</h1></body></html>",
+            )
+            .expect("write index");
+            let tls = TlsConfig::self_signed(&["127.0.0.1".to_string()]).expect("self-signed");
+            let cfg = DevServerConfig::new(root.path())
+                .with_port(0)
+                .with_tls(Some(tls));
+            let (_tx, rx) = channel::<DevServerEvent>();
+            let server = DevServer::start(cfg, rx).expect("start tls dev server");
+            Self {
+                server,
+                _root: root,
+            }
+        }
+    }
+
+    // A certificate verifier that accepts everything — the test cert is
+    // self-signed and not in any trust store, which is exactly the dev
+    // workflow this feature targets.
+    struct NoVerify;
+
+    impl rustls::client::ServerCertVerifier for NoVerify {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::Certificate,
+            _intermediates: &[rustls::Certificate],
+            _server_name: &rustls::ServerName,
+            _scts: &mut dyn Iterator<Item = &[u8]>,
+            _ocsp_response: &[u8],
+            _now: std::time::SystemTime,
+        ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::ServerCertVerified::assertion())
+        }
+    }
+
+    fn tls_stream(addr: std::net::SocketAddr) -> StreamOwned<ClientConnection, TcpStream> {
+        let config = ClientConfig::builder()
+            .with_safe_defaults()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth();
+        let server_name = rustls::ServerName::try_from("localhost").expect("server name");
+        let conn = ClientConnection::new(Arc::new(config), server_name).expect("client conn");
+        let sock = TcpStream::connect(addr).expect("connect");
+        sock.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        StreamOwned::new(conn, sock)
+    }
+
+    #[test]
+    fn serves_index_over_https_with_injected_live_reload_script() {
+        let fx = TlsFixture::new();
+        let mut stream = tls_stream(fx.server.addr());
+        let req = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        stream.write_all(req.as_bytes()).expect("write");
+        stream.flush().expect("flush");
+
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).expect("read response");
+        let text = String::from_utf8_lossy(&raw);
+
+        let status_line = text.lines().next().expect("status line");
+        assert!(status_line.contains("200"), "status was {status_line}");
+        // The SPA index is served and the live-reload client is injected,
+        // proving TLS framing of an ordinary file response works.
+        assert!(text.contains("<h1>secure</h1>"), "body missing app markup");
+        assert!(
+            text.contains(LIVE_RELOAD_SCRIPT),
+            "live-reload script not injected over https"
+        );
+    }
+
+    #[test]
+    fn scheme_reports_https_when_tls_enabled() {
+        let fx = TlsFixture::new();
+        assert_eq!(fx.server.scheme(), "https");
+    }
+
+    #[test]
+    fn sse_live_reload_stream_works_over_https() {
+        let fx = TlsFixture::new();
+        let stream = tls_stream(fx.server.addr());
+        let mut writer = stream;
+        let req =
+            "GET /__ngc_reload HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n";
+        writer.write_all(req.as_bytes()).expect("write");
+        writer.flush().expect("flush");
+
+        let mut reader = BufReader::new(writer);
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line).expect("status line");
+        assert!(status_line.contains("200"), "status was {status_line}");
+
+        let mut saw_event_stream = false;
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).expect("header");
+            if n == 0 || line == "\r\n" {
+                break;
+            }
+            if line.to_ascii_lowercase().contains("text/event-stream") {
+                saw_event_stream = true;
+            }
+        }
+        assert!(
+            saw_event_stream,
+            "missing event-stream content type over tls"
+        );
+
+        let mut connected = String::new();
+        reader.read_line(&mut connected).expect("connected");
+        assert!(connected.starts_with(": connected"), "got {connected:?}");
+        let mut blank = String::new();
+        reader.read_line(&mut blank).expect("blank");
+
+        std::thread::sleep(Duration::from_millis(100));
+        fx.server.trigger_reload().expect("trigger reload");
+
+        let mut event = String::new();
+        reader.read_line(&mut event).expect("event line");
+        assert_eq!(event, "event: reload\n");
+        let mut data = String::new();
+        reader.read_line(&mut data).expect("data line");
+        assert_eq!(data, "data: rebuild\n");
+    }
+
+    #[test]
+    fn serves_over_https_with_explicit_cert_and_key() {
+        // Mint a cert/key pair and feed the raw PEM through `from_pem` — the
+        // path explicit sslKey/sslCert files take — then confirm the server
+        // comes up and serves over TLS.
+        let ck = rcgen_pair();
+        let root = TempDir::new().expect("tempdir");
+        std::fs::write(
+            root.path().join("index.html"),
+            b"<html><body>ok</body></html>",
+        )
+        .expect("write index");
+        let cfg = DevServerConfig::new(root.path())
+            .with_port(0)
+            .with_tls(Some(TlsConfig::from_pem(ck.0, ck.1)));
+        let (_tx, rx) = channel::<DevServerEvent>();
+        let server = DevServer::start(cfg, rx).expect("start with explicit pem");
+
+        let mut stream = tls_stream(server.addr());
+        let req = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        stream.write_all(req.as_bytes()).expect("write");
+        stream.flush().expect("flush");
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).expect("read");
+        let text = String::from_utf8_lossy(&raw);
+        assert!(text.lines().next().unwrap_or("").contains("200"));
+    }
+
+    // Generate a (cert_pem, key_pem) pair the same way the production
+    // self-signed path does, but expose the raw PEM so the test can feed it
+    // through `TlsConfig::from_pem`.
+    fn rcgen_pair() -> (Vec<u8>, Vec<u8>) {
+        let ck = rcgen::generate_simple_self_signed(vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+        ])
+        .expect("rcgen");
+        (
+            ck.cert.pem().into_bytes(),
+            ck.signing_key.serialize_pem().into_bytes(),
+        )
+    }
+}

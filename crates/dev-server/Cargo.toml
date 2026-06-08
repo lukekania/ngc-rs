@@ -10,10 +10,13 @@ publish = false
 
 [dependencies]
 ngc-diagnostics = { path = "../diagnostics" }
+rcgen = "0.14.8"
 serde_json = "1.0"
-tiny_http = "0.12"
+tiny_http = { version = "0.12", features = ["ssl-rustls"] }
 tracing = "0.1"
 
 [dev-dependencies]
+rcgen = "0.14.8"
+rustls = { version = "0.20", features = ["dangerous_configuration"] }
 serde_json = "1.0"
 tempfile = "3"

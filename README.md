@@ -116,11 +116,16 @@ When an `angular.json` is found, ngc-rs reads styles, assets, polyfills, and fil
 
 ### `ngc-rs serve`
 
-Build the project, watch for source changes, and host `dist/` over HTTP with live reload — the `ng serve` equivalent for everyday Angular development:
+Build the project, watch for source changes, and host `dist/` over HTTP (or HTTPS) with live reload — the `ng serve` equivalent for everyday Angular development:
 
 ```sh
 ngc-rs serve --project tsconfig.app.json
 ngc-rs serve --project tsconfig.app.json --host 0.0.0.0 --port 4300 --open
+
+# HTTPS with an auto-generated self-signed certificate (browsers show the
+# usual untrusted-certificate warning), or pass your own cert/key:
+ngc-rs serve --project tsconfig.app.json --ssl
+ngc-rs serve --project tsconfig.app.json --ssl --ssl-key dev.key --ssl-cert dev.crt
 ```
 
 ## Benchmark comparison
