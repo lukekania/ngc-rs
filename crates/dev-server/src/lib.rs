@@ -27,6 +27,7 @@
 //!   mounts a full-page error overlay (dismissible with `Esc`) showing the
 //!   build error and source location.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -60,6 +61,18 @@ pub enum DevServerEvent {
         /// Monotonic cache-buster appended to the swapped stylesheet href.
         timestamp: u64,
     },
+    /// A successful rebuild that changed only a single component's template
+    /// and/or styles. HMR clients re-fetch that component's update module
+    /// from `/@ng/component?c=<id>&t=<timestamp>` and call
+    /// `ɵɵreplaceMetadata` to swap it in place — no reload, state preserved.
+    /// `id` is the percent-encoded `relpath@ClassName` the compiler embeds in
+    /// the component's HMR initializer. Only emitted when HMR is enabled.
+    ComponentUpdate {
+        /// Percent-encoded component id (`encodeURIComponent("relpath@Class")`).
+        id: String,
+        /// Monotonic cache-buster matching the `t` query param on the fetch.
+        timestamp: u64,
+    },
     /// A rebuild failed — connected browsers should display an error
     /// overlay with the message and (when available) the offending file
     /// and source coordinates.
@@ -87,6 +100,14 @@ impl From<ReloadEvent> for DevServerEvent {
         DevServerEvent::Reload
     }
 }
+
+/// Shared registry of per-component HMR update modules, keyed by the
+/// percent-encoded component id (`encodeURIComponent("relpath@Class")`).
+/// The build pipeline replaces its contents after each rebuild; the
+/// `/@ng/component?c=<id>` endpoint reads it to serve the update module a
+/// running app dynamically imports. Cloning shares the same underlying map
+/// (`Arc`), so the serve loop and the build callback see each other's writes.
+pub type ComponentUpdates = Arc<Mutex<HashMap<String, String>>>;
 
 /// Configuration for [`DevServer`].
 #[derive(Debug, Clone)]
@@ -117,6 +138,10 @@ pub struct DevServerConfig {
     /// the long-lived SSE live-reload stream — is wrapped in TLS. Mirrors
     /// `@angular/build:dev-server`'s `ssl`/`sslKey`/`sslCert` options.
     pub tls: Option<TlsConfig>,
+    /// Registry of per-component HMR update modules served at
+    /// `/@ng/component?c=<id>`. Empty by default (live reload only); the
+    /// `serve` command shares a handle and populates it on each HMR rebuild.
+    pub component_updates: ComponentUpdates,
 }
 
 impl DevServerConfig {
@@ -131,7 +156,16 @@ impl DevServerConfig {
             allowed_hosts: Vec::new(),
             headers: Vec::new(),
             tls: None,
+            component_updates: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Share an external [`ComponentUpdates`] registry so the build pipeline
+    /// can publish per-component HMR update modules the `/@ng/component`
+    /// endpoint then serves. Pass a handle you retain a clone of.
+    pub fn with_component_updates(mut self, updates: ComponentUpdates) -> Self {
+        self.component_updates = updates;
+        self
     }
 
     /// Override the bind host.
@@ -571,6 +605,7 @@ impl DevServer {
         let allowed_hosts = Arc::new(AllowedHosts::resolve(&config.allowed_hosts, &config.host));
         let allowed_hosts_for_loop = Arc::clone(&allowed_hosts);
         let custom_headers = Arc::new(CustomHeaders::resolve(&config.headers));
+        let component_updates = Arc::clone(&config.component_updates);
         let join = thread::Builder::new()
             .name("ngc-dev-server-accept".into())
             .spawn(move || {
@@ -581,6 +616,7 @@ impl DevServer {
                     serve_path_for_loop,
                     allowed_hosts_for_loop,
                     custom_headers,
+                    component_updates,
                 )
             })
             .map_err(|e| NgcError::ServeError {
@@ -708,6 +744,12 @@ pub fn sse_frame(event: &DevServerEvent) -> String {
         DevServerEvent::CssUpdate { timestamp } => {
             format!("event: css-update\ndata: {{\"timestamp\":{timestamp}}}\n\n")
         }
+        DevServerEvent::ComponentUpdate { id, timestamp } => {
+            // `id` is already percent-encoded JS-identifier-safe text, but
+            // route it through serde so any stray quote can't break the JSON.
+            let payload = serde_json::json!({ "id": id, "timestamp": timestamp });
+            format!("event: angular:component-update\ndata: {payload}\n\n")
+        }
         DevServerEvent::BuildFailed {
             message,
             file,
@@ -725,6 +767,7 @@ pub fn sse_frame(event: &DevServerEvent) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_loop(
     server: Arc<Server>,
     root: PathBuf,
@@ -732,6 +775,7 @@ fn serve_loop(
     serve_path: Option<String>,
     allowed_hosts: Arc<AllowedHosts>,
     headers: Arc<CustomHeaders>,
+    component_updates: ComponentUpdates,
 ) {
     for request in server.incoming_requests() {
         let root = root.clone();
@@ -739,6 +783,7 @@ fn serve_loop(
         let serve_path = serve_path.clone();
         let allowed_hosts = Arc::clone(&allowed_hosts);
         let headers = Arc::clone(&headers);
+        let component_updates = Arc::clone(&component_updates);
         thread::spawn(move || {
             if let Err(e) = handle_request(
                 request,
@@ -747,6 +792,7 @@ fn serve_loop(
                 serve_path.as_deref(),
                 &allowed_hosts,
                 &headers,
+                &component_updates,
             ) {
                 tracing::warn!(error = %e, "dev server request failed");
             }
@@ -754,6 +800,7 @@ fn serve_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_request(
     request: tiny_http::Request,
     root: &Path,
@@ -761,6 +808,7 @@ fn handle_request(
     serve_path: Option<&str>,
     allowed_hosts: &AllowedHosts,
     headers: &CustomHeaders,
+    component_updates: &ComponentUpdates,
 ) -> NgcResult<()> {
     if !matches!(request.method(), Method::Get | Method::Head) {
         let resp = Response::from_string("method not allowed").with_status_code(StatusCode(405));
@@ -787,7 +835,54 @@ fn handle_request(
         return handle_sse(request, clients, headers);
     }
 
+    if stripped == "/@ng/component" {
+        return handle_component_update(request, &url, component_updates, headers);
+    }
+
     serve_static(request, root, stripped, serve_path, headers)
+}
+
+/// Serve a per-component HMR update module for `GET /@ng/component?c=<id>`.
+///
+/// The `c` query value is the percent-encoded component id the compiler
+/// embedded in the component's HMR initializer; it's used verbatim as the
+/// registry key (the running app sends exactly what was embedded). When no
+/// module is registered for the id, an empty `200` is returned — the running
+/// app's loader guards on `m.default`, so an empty module is a safe no-op
+/// (mirrors `@angular/build`'s component middleware).
+fn handle_component_update(
+    request: tiny_http::Request,
+    url: &str,
+    component_updates: &ComponentUpdates,
+    headers: &CustomHeaders,
+) -> NgcResult<()> {
+    let Some(id) = query_param(url, "c") else {
+        let resp = Response::from_string("missing c parameter").with_status_code(StatusCode(400));
+        return request.respond(resp).map_err(io_err);
+    };
+    let code = component_updates
+        .lock()
+        .ok()
+        .and_then(|map| map.get(id).cloned())
+        .unwrap_or_default();
+    let mut resp = Response::from_data(code.into_bytes());
+    resp.add_header(header("Content-Type", "text/javascript")?);
+    resp.add_header(header("Cache-Control", "no-cache")?);
+    headers.apply(&mut resp, &["Content-Type", "Cache-Control"]);
+    request.respond(resp).map_err(io_err)
+}
+
+/// Extract a raw (still percent-encoded) query parameter value from a URL.
+///
+/// Returns the substring after `<name>=` up to the next `&`. The value is
+/// **not** percent-decoded: component ids are stored and matched in their
+/// encoded form, so decoding here would break the registry lookup.
+fn query_param<'a>(url: &'a str, name: &str) -> Option<&'a str> {
+    let query = url.split_once('?')?.1;
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == name).then_some(v)
+    })
 }
 
 /// Read the request's `Host:` header value, or return the empty string when
@@ -1087,7 +1182,18 @@ pub fn mime_for(path: &Path) -> &'static str {
 /// Malformed `data:` payloads (non-JSON, missing keys) are tolerated and
 /// fall back to a generic "build failed" message rather than crashing the
 /// listener.
-pub const LIVE_RELOAD_SCRIPT: &str = r#"<script>(function(){try{var ID='__ngc_rs_overlay__';function dismiss(){var n=document.getElementById(ID);if(n){n.remove();}window.__ngcRsOverlay=null;}function show(payload){dismiss();var data={};try{data=JSON.parse(payload)||{};}catch(_){}var msg=typeof data.message==='string'&&data.message?data.message:'ngc-rs rebuild failed';var loc='';if(typeof data.file==='string'&&data.file){loc=data.file;if(typeof data.line==='number'){loc+=':'+data.line;if(typeof data.column==='number'){loc+=':'+data.column;}}}var overlay=document.createElement('div');overlay.id=ID;overlay.setAttribute('role','alert');overlay.style.cssText='position:fixed;inset:0;z-index:2147483647;background:rgba(20,20,20,0.92);color:#ff6b6b;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:14px;line-height:1.5;padding:32px;overflow:auto;white-space:pre-wrap;word-break:break-word;';var header=document.createElement('div');header.textContent='ngc-rs build failed';header.style.cssText='font-weight:bold;font-size:16px;margin-bottom:16px;color:#ff8a8a;';overlay.appendChild(header);if(loc){var locEl=document.createElement('div');locEl.textContent=loc;locEl.style.cssText='color:#ffd166;margin-bottom:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';overlay.appendChild(locEl);}var body=document.createElement('pre');body.textContent=msg;body.style.cssText='margin:0;color:#ff6b6b;white-space:pre-wrap;word-break:break-word;';overlay.appendChild(body);var hint=document.createElement('div');hint.textContent='Press Esc to dismiss · overlay reappears on next failed rebuild';hint.style.cssText='margin-top:24px;color:#888;font-size:12px;';overlay.appendChild(hint);(document.body||document.documentElement).appendChild(overlay);window.__ngcRsOverlay=overlay;}function onKey(e){if(e.key==='Escape'){dismiss();}}document.addEventListener('keydown',onKey);function swapCss(t){var links=document.querySelectorAll('link[rel="stylesheet"]');for(var i=0;i < links.length;i++){(function(link){var href=link.getAttribute('href');if(!href){return;}var base=href.split('?')[0];if(!/(^|\/)styles\.css$/.test(base)){return;}var next=link.cloneNode(false);next.setAttribute('href',base+'?ngcss='+t);next.addEventListener('load',function(){if(link.parentNode){link.parentNode.removeChild(link);}});next.addEventListener('error',function(){if(next.parentNode){next.parentNode.removeChild(next);}});link.parentNode.insertBefore(next,link.nextSibling);})(links[i]);}}var s=new EventSource('/__ngc_reload');s.addEventListener('reload',function(){dismiss();location.reload();});s.addEventListener('build-failed',function(e){show(e.data);});s.addEventListener('css-update',function(e){var t=0;try{t=(JSON.parse(e.data)||{}).timestamp||0;}catch(_){}if(!t){t=(new Date()).getTime();}dismiss();swapCss(t);});}catch(e){console.warn('[ngc-rs] live reload unavailable',e);}})();</script>"#;
+pub const LIVE_RELOAD_SCRIPT: &str = r#"<script>(function(){try{var ID='__ngc_rs_overlay__';function dismiss(){var n=document.getElementById(ID);if(n){n.remove();}window.__ngcRsOverlay=null;}function show(payload){dismiss();var data={};try{data=JSON.parse(payload)||{};}catch(_){}var msg=typeof data.message==='string'&&data.message?data.message:'ngc-rs rebuild failed';var loc='';if(typeof data.file==='string'&&data.file){loc=data.file;if(typeof data.line==='number'){loc+=':'+data.line;if(typeof data.column==='number'){loc+=':'+data.column;}}}var overlay=document.createElement('div');overlay.id=ID;overlay.setAttribute('role','alert');overlay.style.cssText='position:fixed;inset:0;z-index:2147483647;background:rgba(20,20,20,0.92);color:#ff6b6b;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:14px;line-height:1.5;padding:32px;overflow:auto;white-space:pre-wrap;word-break:break-word;';var header=document.createElement('div');header.textContent='ngc-rs build failed';header.style.cssText='font-weight:bold;font-size:16px;margin-bottom:16px;color:#ff8a8a;';overlay.appendChild(header);if(loc){var locEl=document.createElement('div');locEl.textContent=loc;locEl.style.cssText='color:#ffd166;margin-bottom:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';overlay.appendChild(locEl);}var body=document.createElement('pre');body.textContent=msg;body.style.cssText='margin:0;color:#ff6b6b;white-space:pre-wrap;word-break:break-word;';overlay.appendChild(body);var hint=document.createElement('div');hint.textContent='Press Esc to dismiss · overlay reappears on next failed rebuild';hint.style.cssText='margin-top:24px;color:#888;font-size:12px;';overlay.appendChild(hint);(document.body||document.documentElement).appendChild(overlay);window.__ngcRsOverlay=overlay;}function onKey(e){if(e.key==='Escape'){dismiss();}}document.addEventListener('keydown',onKey);function swapCss(t){var links=document.querySelectorAll('link[rel="stylesheet"]');for(var i=0;i < links.length;i++){(function(link){var href=link.getAttribute('href');if(!href){return;}var base=href.split('?')[0];if(!/(^|\/)styles\.css$/.test(base)){return;}var next=link.cloneNode(false);next.setAttribute('href',base+'?ngcss='+t);next.addEventListener('load',function(){if(link.parentNode){link.parentNode.removeChild(link);}});next.addEventListener('error',function(){if(next.parentNode){next.parentNode.removeChild(next);}});link.parentNode.insertBefore(next,link.nextSibling);})(links[i]);}}var hmrHandlers={};function emitHmr(ev,d){var a=hmrHandlers[ev]||[];for(var i=0;i < a.length;i++){try{a[i](d);}catch(err){console.error('[ngc-rs] hmr handler error',err);}}}window.__ngcHmr={on:function(ev,cb){(hmrHandlers[ev]=hmrHandlers[ev]||[]).push(cb);},off:function(ev,cb){var a=hmrHandlers[ev];if(a){var i=a.indexOf(cb);if(i>=0){a.splice(i,1);}}},send:function(){}};var s=new EventSource('/__ngc_reload');s.addEventListener('reload',function(){dismiss();location.reload();});s.addEventListener('build-failed',function(e){show(e.data);});s.addEventListener('css-update',function(e){var t=0;try{t=(JSON.parse(e.data)||{}).timestamp||0;}catch(_){}if(!t){t=(new Date()).getTime();}dismiss();swapCss(t);});s.addEventListener('angular:component-update',function(e){var d={};try{d=JSON.parse(e.data)||{};}catch(_){}dismiss();emitHmr('angular:component-update',d);});}catch(e){console.warn('[ngc-rs] live reload unavailable',e);}})();</script>"#;
+
+/// Module-scope prelude prepended to the entry chunk (`main.js`) when HMR is
+/// enabled. The per-component HMR initializers the compiler emits reference
+/// `import.meta.hot`, which only exists inside a module's `import.meta`; this
+/// binds it to the event bus the injected [`LIVE_RELOAD_SCRIPT`] publishes on
+/// `window.__ngcHmr`. The inline script runs before the deferred module, so
+/// `window.__ngcHmr` is already defined when this line executes. A no-op stub
+/// is used as a fallback so the bundle never throws if live reload failed to
+/// initialise.
+pub const HMR_RUNTIME_PRELUDE: &str =
+    "import.meta.hot=globalThis.__ngcHmr||{on:function(){},off:function(){},send:function(){}};\n";
 
 /// Insert the live-reload client script into an HTML byte buffer.
 ///
@@ -1289,6 +1395,42 @@ mod tests {
             !handler_body.contains("location.reload"),
             "css-update handler must not reload the page"
         );
+    }
+
+    #[test]
+    fn sse_frame_for_component_update_emits_angular_event() {
+        let frame = sse_frame(&DevServerEvent::ComponentUpdate {
+            id: "src%2Fapp%2Fapp.component.ts%40AppComponent".to_string(),
+            timestamp: 42,
+        });
+        assert!(frame.starts_with("event: angular:component-update\n"));
+        let data_line = frame.lines().nth(1).expect("data line");
+        let json: serde_json::Value =
+            serde_json::from_str(data_line.strip_prefix("data: ").expect("data: prefix"))
+                .expect("component-update payload is JSON");
+        assert_eq!(json["id"], "src%2Fapp%2Fapp.component.ts%40AppComponent");
+        assert_eq!(json["timestamp"], 42);
+        assert!(frame.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn query_param_extracts_raw_encoded_value() {
+        let url = "/@ng/component?c=src%2Fapp%40App&t=17";
+        assert_eq!(query_param(url, "c"), Some("src%2Fapp%40App"));
+        assert_eq!(query_param(url, "t"), Some("17"));
+        assert_eq!(query_param(url, "missing"), None);
+        assert_eq!(query_param("/@ng/component", "c"), None);
+    }
+
+    #[test]
+    fn live_reload_script_exposes_hmr_bus() {
+        // The injected client must publish the `__ngcHmr` bus and dispatch
+        // component-update events to registered handlers.
+        assert!(LIVE_RELOAD_SCRIPT.contains("window.__ngcHmr"));
+        assert!(LIVE_RELOAD_SCRIPT.contains("addEventListener('angular:component-update'"));
+        // The runtime prelude binds import.meta.hot to that bus.
+        assert!(HMR_RUNTIME_PRELUDE.contains("import.meta.hot"));
+        assert!(HMR_RUNTIME_PRELUDE.contains("globalThis.__ngcHmr"));
     }
 
     #[test]

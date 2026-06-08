@@ -17,8 +17,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
 use std::sync::Arc;
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use colored::Colorize;
-use ngc_dev_server::{DevServer, DevServerConfig, DevServerEvent, TlsConfig};
+use ngc_dev_server::{
+    ComponentUpdates, DevServer, DevServerConfig, DevServerEvent, TlsConfig, HMR_RUNTIME_PRELUDE,
+};
 use ngc_diagnostics::{NgcError, NgcResult};
 use ngc_watch::{Watcher, WatcherConfig};
 
@@ -174,6 +179,17 @@ pub(crate) fn run_with_stop(
         initial.output_files.len(),
     );
 
+    // Shared registry of per-component HMR update modules served at
+    // `/@ng/component`. Empty until the compiler emits update modules; we
+    // share one handle between the dev server and the rebuild callback.
+    let component_updates: ComponentUpdates = Arc::new(Mutex::new(HashMap::new()));
+
+    // When HMR is on, bind `import.meta.hot` inside the entry module so the
+    // per-component initializers can register update handlers.
+    if hmr_enabled {
+        inject_hmr_runtime(&out_dir);
+    }
+
     let (event_tx, event_rx) = channel::<DevServerEvent>();
     let cfg = DevServerConfig::new(&out_dir)
         .with_host(host.to_string())
@@ -181,7 +197,8 @@ pub(crate) fn run_with_stop(
         .with_serve_path(normalized_serve_path.as_deref())
         .with_allowed_hosts(allowed_hosts.iter().cloned())
         .with_headers(headers.iter().cloned())
-        .with_tls(tls);
+        .with_tls(tls)
+        .with_component_updates(Arc::clone(&component_updates));
     let server = DevServer::start(cfg, event_rx)?;
     let scheme = server.scheme();
     let url = match server.serve_path() {
@@ -207,6 +224,7 @@ pub(crate) fn run_with_stop(
     let project_path = project.to_path_buf();
     let configuration_owned = configuration.map(|s| s.to_string());
     let serve_path_owned = normalized_serve_path.clone();
+    let out_dir_owned = out_dir.clone();
     // Monotonic cache-buster for the swapped `styles.css` href on CSS-only
     // updates; must change every rebuild so the browser re-fetches.
     let mut hmr_tick: u64 = 0;
@@ -234,6 +252,10 @@ pub(crate) fn run_with_stop(
                     result.modules_bundled,
                     dirty.len()
                 );
+                // Re-bind `import.meta.hot` in the freshly written entry chunk.
+                if hmr_enabled {
+                    inject_hmr_runtime(&out_dir_owned);
+                }
                 // CSS-only fast path: when HMR is on and every changed file is
                 // a global stylesheet entry, swap `styles.css` in place
                 // instead of reloading (preserving component/form state).
@@ -292,6 +314,33 @@ pub(crate) fn build_failure_event(err: &NgcError) -> DevServerEvent {
 /// across symlinks.
 fn canonical_or_owned(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Prepend the HMR runtime prelude to the entry chunk (`main.js`) so the
+/// per-component HMR initializers can resolve `import.meta.hot`. The build
+/// rewrites `main.js` from scratch each cycle, so this runs after every
+/// successful build. A guard skips the work if the prelude is already present
+/// (defensive — a fresh build never has it). Failures are logged and ignored:
+/// a missing entry chunk just means HMR initializers won't bind, which
+/// degrades to live reload rather than breaking the served app.
+fn inject_hmr_runtime(out_dir: &Path) {
+    let main_js = out_dir.join("main.js");
+    let existing = match std::fs::read_to_string(&main_js) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(path = %main_js.display(), error = %e, "no entry chunk to inject HMR runtime into");
+            return;
+        }
+    };
+    if existing.starts_with(HMR_RUNTIME_PRELUDE) {
+        return;
+    }
+    let mut patched = String::with_capacity(HMR_RUNTIME_PRELUDE.len() + existing.len());
+    patched.push_str(HMR_RUNTIME_PRELUDE);
+    patched.push_str(&existing);
+    if let Err(e) = std::fs::write(&main_js, patched) {
+        tracing::debug!(path = %main_js.display(), error = %e, "could not inject HMR runtime");
+    }
 }
 
 /// True when a rebuild's `dirty` set is non-empty and every changed file is a

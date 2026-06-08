@@ -119,6 +119,45 @@ fn get_root_returns_index_html_with_injected_client() {
 }
 
 #[test]
+fn component_endpoint_serves_registered_update_module() {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    let root = TempDir::new().expect("tempdir");
+    write_file(root.path(), "index.html", b"<html><body></body></html>");
+    let registry: ngc_dev_server::ComponentUpdates = Arc::new(Mutex::new(HashMap::new()));
+    let id = "src%2Fapp%2Fapp.component.ts%40AppComponent";
+    registry
+        .lock()
+        .unwrap()
+        .insert(id.to_string(), "export default function(){}".to_string());
+
+    let cfg = DevServerConfig::new(root.path())
+        .with_port(0)
+        .with_component_updates(Arc::clone(&registry));
+    let (_tx, rx) = channel::<DevServerEvent>();
+    let server = DevServer::start(cfg, rx).expect("start dev server");
+
+    // Registered id → the update module, as text/javascript.
+    let resp = http_get(server.addr(), &format!("/@ng/component?c={id}&t=99"));
+    assert_eq!(resp.status, 200);
+    assert!(resp
+        .header("Content-Type")
+        .expect("content-type")
+        .starts_with("text/javascript"));
+    assert_eq!(resp.body, b"export default function(){}");
+
+    // Unknown id → empty 200 (the running app guards on m.default).
+    let resp = http_get(server.addr(), "/@ng/component?c=nope&t=1");
+    assert_eq!(resp.status, 200);
+    assert!(resp.body.is_empty());
+
+    // Missing `c` → 400.
+    let resp = http_get(server.addr(), "/@ng/component");
+    assert_eq!(resp.status, 400);
+}
+
+#[test]
 fn get_index_html_directly_also_injects_client() {
     let fx = Fixture::new();
     let resp = http_get(fx.server.addr(), "/index.html");
