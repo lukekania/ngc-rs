@@ -27,6 +27,7 @@ use crate::watch_cmd::{is_ts_path, watch_root};
 
 /// Run the `serve` subcommand: bring up the dev server, drive the watcher,
 /// and block until Ctrl+C.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     project: &Path,
     configuration: Option<&str>,
@@ -35,6 +36,7 @@ pub fn run(
     open: bool,
     serve_path: Option<&str>,
     allowed_hosts: &[String],
+    headers: &[(String, String)],
 ) -> NgcResult<()> {
     run_with_stop(
         project,
@@ -44,6 +46,7 @@ pub fn run(
         open,
         serve_path,
         allowed_hosts,
+        headers,
         install_ctrlc,
     )
 }
@@ -61,6 +64,7 @@ pub(crate) fn run_with_stop(
     open: bool,
     serve_path: Option<&str>,
     allowed_hosts: &[String],
+    headers: &[(String, String)],
     install_stop: impl FnOnce(Arc<AtomicBool>),
 ) -> NgcResult<()> {
     let out_dir = crate::resolve_out_dir(project, None, configuration)?;
@@ -95,7 +99,8 @@ pub(crate) fn run_with_stop(
         .with_host(host.to_string())
         .with_port(port)
         .with_serve_path(normalized_serve_path.as_deref())
-        .with_allowed_hosts(allowed_hosts.iter().cloned());
+        .with_allowed_hosts(allowed_hosts.iter().cloned())
+        .with_headers(headers.iter().cloned());
     let server = DevServer::start(cfg, event_rx)?;
     let url = match server.serve_path() {
         Some(prefix) => format!("http://{}{}", server.addr(), prefix),

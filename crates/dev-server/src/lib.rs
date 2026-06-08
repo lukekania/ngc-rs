@@ -96,6 +96,12 @@ pub struct DevServerConfig {
     /// User-supplied `allowedHosts` patterns. Empty (= default) means
     /// `auto`: loopback hosts plus the bind host. See [`AllowedHosts`].
     pub allowed_hosts: Vec<String>,
+    /// Custom HTTP response headers to emit on every served response
+    /// (static assets, the SPA-fallback `index.html`, and the SSE
+    /// live-reload stream). Mirrors `@angular/build:dev-server`'s
+    /// `headers` option. Header names the server sets itself are never
+    /// overridden by these — see [`CustomHeaders`].
+    pub headers: Vec<(String, String)>,
 }
 
 impl DevServerConfig {
@@ -108,6 +114,7 @@ impl DevServerConfig {
             port: 4200,
             serve_path: None,
             allowed_hosts: Vec::new(),
+            headers: Vec::new(),
         }
     }
 
@@ -139,6 +146,22 @@ impl DevServerConfig {
         S: Into<String>,
     {
         self.allowed_hosts = hosts.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Replace the custom response headers emitted on every served
+    /// response. See [`CustomHeaders`] for how reserved headers (the ones
+    /// the server sets itself) are protected from being clobbered.
+    pub fn with_headers<I, K, V>(mut self, headers: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.headers = headers
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
         self
     }
 }
@@ -303,6 +326,88 @@ fn strip_port(host: &str) -> &str {
     }
 }
 
+/// Custom HTTP response headers emitted on every served response.
+///
+/// Mirrors `@angular/build:dev-server`'s `headers` option, letting a
+/// project configure production-like security headers (CSP,
+/// `Cross-Origin-Opener-Policy`, …), CORS headers, or cache-control
+/// overrides for the dev server.
+///
+/// Two invariants matter:
+///
+/// * **Validated once.** Each name/value pair is checked against
+///   `tiny_http`'s header parser at construction time; an invalid entry is
+///   dropped with a warning rather than failing every request.
+/// * **Never clobbers server headers.** Headers the dev server sets itself
+///   (the response `Content-Type`, the `Cache-Control` on static files,
+///   and the SSE stream's `Connection` / `Access-Control-Allow-Origin`)
+///   take precedence — a user `headers` entry for one of those names is
+///   skipped for that response so the server stays correct.
+#[derive(Debug, Clone, Default)]
+pub struct CustomHeaders {
+    headers: Vec<(String, String)>,
+}
+
+impl CustomHeaders {
+    /// Validate and retain the user-supplied `headers` map. Entries with a
+    /// blank name, or a name/value `tiny_http` rejects, are dropped with a
+    /// `warn` so a typo in `angular.json` is visible without taking the
+    /// whole dev server down.
+    pub fn resolve(raw: &[(String, String)]) -> Self {
+        let mut headers = Vec::with_capacity(raw.len());
+        for (name, value) in raw {
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            if Header::from_bytes(name.as_bytes(), value.as_bytes()).is_err() {
+                tracing::warn!(header = %name, "ignoring invalid custom response header");
+                continue;
+            }
+            headers.push((name.to_string(), value.clone()));
+        }
+        Self { headers }
+    }
+
+    /// `true` when no custom headers are configured.
+    pub fn is_empty(&self) -> bool {
+        self.headers.is_empty()
+    }
+
+    /// Add every configured header to `resp`, skipping any whose name
+    /// matches (case-insensitively) an entry in `reserved` — those the
+    /// server already set and must not let a user value clobber.
+    fn apply<R: std::io::Read>(&self, resp: &mut Response<R>, reserved: &[&str]) {
+        for (name, value) in &self.headers {
+            if reserved.iter().any(|r| r.eq_ignore_ascii_case(name)) {
+                continue;
+            }
+            // Pre-validated in `resolve`, so `from_bytes` can't fail here;
+            // ignore the (impossible) error rather than propagating it.
+            if let Ok(h) = Header::from_bytes(name.as_bytes(), value.as_bytes()) {
+                resp.add_header(h);
+            }
+        }
+    }
+
+    /// Render the configured headers as raw `Name: value\r\n` lines for the
+    /// hand-written SSE response head, skipping any reserved name. The
+    /// returned string is empty when nothing applies.
+    fn header_lines(&self, reserved: &[&str]) -> String {
+        let mut out = String::new();
+        for (name, value) in &self.headers {
+            if reserved.iter().any(|r| r.eq_ignore_ascii_case(name)) {
+                continue;
+            }
+            out.push_str(name);
+            out.push_str(": ");
+            out.push_str(value);
+            out.push_str("\r\n");
+        }
+        out
+    }
+}
+
 /// Handle to a running dev server.
 ///
 /// Dropping the handle stops the server and closes any open SSE connections.
@@ -362,6 +467,7 @@ impl DevServer {
         let serve_path_for_loop = serve_path.clone();
         let allowed_hosts = Arc::new(AllowedHosts::resolve(&config.allowed_hosts, &config.host));
         let allowed_hosts_for_loop = Arc::clone(&allowed_hosts);
+        let custom_headers = Arc::new(CustomHeaders::resolve(&config.headers));
         let join = thread::Builder::new()
             .name("ngc-dev-server-accept".into())
             .spawn(move || {
@@ -371,6 +477,7 @@ impl DevServer {
                     request_clients,
                     serve_path_for_loop,
                     allowed_hosts_for_loop,
+                    custom_headers,
                 )
             })
             .map_err(|e| NgcError::ServeError {
@@ -506,16 +613,23 @@ fn serve_loop(
     clients: SseClients,
     serve_path: Option<String>,
     allowed_hosts: Arc<AllowedHosts>,
+    headers: Arc<CustomHeaders>,
 ) {
     for request in server.incoming_requests() {
         let root = root.clone();
         let clients = Arc::clone(&clients);
         let serve_path = serve_path.clone();
         let allowed_hosts = Arc::clone(&allowed_hosts);
+        let headers = Arc::clone(&headers);
         thread::spawn(move || {
-            if let Err(e) =
-                handle_request(request, &root, &clients, serve_path.as_deref(), &allowed_hosts)
-            {
+            if let Err(e) = handle_request(
+                request,
+                &root,
+                &clients,
+                serve_path.as_deref(),
+                &allowed_hosts,
+                &headers,
+            ) {
                 tracing::warn!(error = %e, "dev server request failed");
             }
         });
@@ -528,6 +642,7 @@ fn handle_request(
     clients: &SseClients,
     serve_path: Option<&str>,
     allowed_hosts: &AllowedHosts,
+    headers: &CustomHeaders,
 ) -> NgcResult<()> {
     if !matches!(request.method(), Method::Get | Method::Head) {
         let resp = Response::from_string("method not allowed").with_status_code(StatusCode(405));
@@ -551,10 +666,10 @@ fn handle_request(
     };
 
     if stripped == "/__ngc_reload" {
-        return handle_sse(request, clients);
+        return handle_sse(request, clients, headers);
     }
 
-    serve_static(request, root, stripped, serve_path)
+    serve_static(request, root, stripped, serve_path, headers)
 }
 
 /// Read the request's `Host:` header value, or return the empty string when
@@ -624,18 +739,32 @@ fn strip_serve_path<'a>(path: &'a str, serve_path: Option<&str>) -> Option<&'a s
     None
 }
 
-fn handle_sse(request: tiny_http::Request, clients: &SseClients) -> NgcResult<()> {
-    let response_head = b"HTTP/1.1 200 OK\r\n\
-Content-Type: text/event-stream\r\n\
-Cache-Control: no-cache\r\n\
-Connection: keep-alive\r\n\
-Access-Control-Allow-Origin: *\r\n\
-\r\n\
-: connected\n\n";
+fn handle_sse(
+    request: tiny_http::Request,
+    clients: &SseClients,
+    headers: &CustomHeaders,
+) -> NgcResult<()> {
+    // The SSE stream sets these itself; a user `headers` entry for any of
+    // them is skipped so the event-stream contract stays intact.
+    const SSE_RESERVED: &[&str] = &[
+        "Content-Type",
+        "Cache-Control",
+        "Connection",
+        "Access-Control-Allow-Origin",
+    ];
+    let mut response_head = String::from(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: text/event-stream\r\n\
+         Cache-Control: no-cache\r\n\
+         Connection: keep-alive\r\n\
+         Access-Control-Allow-Origin: *\r\n",
+    );
+    response_head.push_str(&headers.header_lines(SSE_RESERVED));
+    response_head.push_str("\r\n: connected\n\n");
 
     let mut writer = request.into_writer();
     writer
-        .write_all(response_head)
+        .write_all(response_head.as_bytes())
         .and_then(|_| writer.flush())
         .map_err(|e| NgcError::ServeError {
             message: format!("could not start SSE stream: {e}"),
@@ -653,6 +782,7 @@ fn serve_static(
     root: &Path,
     url_path: &str,
     serve_path: Option<&str>,
+    headers: &CustomHeaders,
 ) -> NgcResult<()> {
     let decoded = decode_path(url_path);
     let candidate = match resolve_under_root(root, &decoded) {
@@ -664,8 +794,8 @@ fn serve_static(
     };
 
     match pick_file(&candidate) {
-        Some(file_path) => respond_with_file(request, &file_path, serve_path),
-        None => spa_fallback(request, root, serve_path),
+        Some(file_path) => respond_with_file(request, &file_path, serve_path, headers),
+        None => spa_fallback(request, root, serve_path, headers),
     }
 }
 
@@ -686,10 +816,11 @@ fn spa_fallback(
     request: tiny_http::Request,
     root: &Path,
     serve_path: Option<&str>,
+    headers: &CustomHeaders,
 ) -> NgcResult<()> {
     let index = root.join("index.html");
     if index.is_file() {
-        respond_with_file(request, &index, serve_path)
+        respond_with_file(request, &index, serve_path, headers)
     } else {
         let resp = Response::from_string("not found").with_status_code(StatusCode(404));
         request.respond(resp).map_err(io_err)
@@ -700,6 +831,7 @@ fn respond_with_file(
     request: tiny_http::Request,
     path: &Path,
     serve_path: Option<&str>,
+    headers: &CustomHeaders,
 ) -> NgcResult<()> {
     let bytes = std::fs::read(path).map_err(|e| NgcError::Io {
         path: path.to_path_buf(),
@@ -716,6 +848,10 @@ fn respond_with_file(
     let mut resp = Response::from_data(body);
     resp.add_header(header("Content-Type", mime)?);
     resp.add_header(header("Cache-Control", "no-cache")?);
+    // Apply user-configured headers last, but never let them clobber the
+    // `Content-Type` (correct for the file) or the dev-server
+    // `Cache-Control` (live reload depends on responses not being cached).
+    headers.apply(&mut resp, &["Content-Type", "Cache-Control"]);
     request.respond(resp).map_err(io_err)
 }
 
@@ -1244,10 +1380,7 @@ mod tests {
     fn allowed_hosts_explicit_without_auto_does_not_accept_bind_host() {
         // Without "auto", the bind host is NOT auto-allowed — the user
         // explicitly listed which non-loopback hosts to trust.
-        let ah = AllowedHosts::resolve(
-            &["my-app.ngrok.io".to_string()],
-            "192.168.1.10",
-        );
+        let ah = AllowedHosts::resolve(&["my-app.ngrok.io".to_string()], "192.168.1.10");
         assert!(!ah.is_allowed("192.168.1.10"));
         assert!(ah.is_allowed("my-app.ngrok.io"));
     }
@@ -1290,5 +1423,64 @@ mod tests {
         assert!(ah.is_allowed("ok.example"));
         assert!(ah.is_allowed("localhost"));
         assert!(!ah.is_allowed("nope.example"));
+    }
+
+    fn pair(name: &str, value: &str) -> (String, String) {
+        (name.to_string(), value.to_string())
+    }
+
+    #[test]
+    fn custom_headers_empty_by_default() {
+        assert!(CustomHeaders::default().is_empty());
+        assert!(CustomHeaders::resolve(&[]).is_empty());
+    }
+
+    #[test]
+    fn custom_headers_resolve_keeps_valid_entries() {
+        let ch = CustomHeaders::resolve(&[
+            pair("X-Frame-Options", "DENY"),
+            pair("Cross-Origin-Opener-Policy", "same-origin"),
+        ]);
+        assert!(!ch.is_empty());
+        assert_eq!(ch.headers.len(), 2);
+    }
+
+    #[test]
+    fn custom_headers_resolve_drops_blank_names() {
+        let ch = CustomHeaders::resolve(&[pair("", "x"), pair("   ", "y"), pair("X-Ok", "z")]);
+        assert_eq!(ch.headers.len(), 1);
+        assert_eq!(ch.headers[0].0, "X-Ok");
+    }
+
+    #[test]
+    fn custom_headers_resolve_drops_invalid_names() {
+        // A non-ASCII header name cannot be represented on the wire and is
+        // dropped rather than failing every request.
+        let ch = CustomHeaders::resolve(&[pair("Föö", "bar")]);
+        assert!(ch.is_empty());
+    }
+
+    #[test]
+    fn custom_headers_header_lines_skips_reserved_names() {
+        let ch = CustomHeaders::resolve(&[
+            pair("Content-Type", "text/evil"),
+            pair("X-Frame-Options", "DENY"),
+        ]);
+        let lines = ch.header_lines(&["Content-Type", "Cache-Control"]);
+        assert!(!lines.to_ascii_lowercase().contains("content-type"));
+        assert!(lines.contains("X-Frame-Options: DENY\r\n"));
+    }
+
+    #[test]
+    fn custom_headers_header_lines_reserved_match_is_case_insensitive() {
+        let ch = CustomHeaders::resolve(&[pair("content-type", "x")]);
+        assert!(ch.header_lines(&["Content-Type"]).is_empty());
+    }
+
+    #[test]
+    fn devserver_config_with_headers_stores_pairs() {
+        let cfg = DevServerConfig::new("/tmp/dist").with_headers([("X-A", "1"), ("X-B", "2")]);
+        assert_eq!(cfg.headers.len(), 2);
+        assert_eq!(cfg.headers[0], ("X-A".to_string(), "1".to_string()));
     }
 }
