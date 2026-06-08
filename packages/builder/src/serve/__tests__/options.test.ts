@@ -51,16 +51,53 @@ describe('translateOptions', () => {
     expect(t.args[portIdx + 1]).toBe('0');
   });
 
-  it('rejects ssl=true with a clear error', () => {
+  it('forwards --ssl and uses an https url when ssl is true without key/cert', () => {
+    const t = translateOptions({ ...base, ssl: true }, '/ws');
+    expect(t.args).toContain('--ssl');
+    expect(t.args).not.toContain('--ssl-key');
+    expect(t.args).not.toContain('--ssl-cert');
+    expect(t.url).toBe('https://localhost:4200/');
+  });
+
+  it('forwards resolved --ssl-key/--ssl-cert when both are provided', () => {
+    const t = translateOptions(
+      { ...base, ssl: true, sslKey: 'certs/dev.key', sslCert: 'certs/dev.crt' },
+      '/ws',
+    );
+    expect(t.args).toContain('--ssl');
+    const keyIdx = t.args.indexOf('--ssl-key');
+    const certIdx = t.args.indexOf('--ssl-cert');
+    expect(t.args[keyIdx + 1]).toBe('/ws/certs/dev.key');
+    expect(t.args[certIdx + 1]).toBe('/ws/certs/dev.crt');
+    expect(t.url).toBe('https://localhost:4200/');
+  });
+
+  it('throws when only one of sslKey/sslCert is provided', () => {
     expect(() =>
-      translateOptions({ ...base, ssl: true }, '/ws'),
+      translateOptions({ ...base, ssl: true, sslKey: '/k' }, '/ws'),
+    ).toThrow(OptionTranslationError);
+    expect(() =>
+      translateOptions({ ...base, ssl: true, sslCert: '/c' }, '/ws'),
     ).toThrow(OptionTranslationError);
   });
 
-  it('rejects sslKey/sslCert', () => {
+  it('rejects ssl combined with proxyConfig', () => {
     expect(() =>
-      translateOptions({ ...base, sslKey: '/k' }, '/ws'),
+      translateOptions(
+        { ...base, ssl: true, proxyConfig: 'proxy.conf.json' },
+        '/ws',
+      ),
     ).toThrow(OptionTranslationError);
+  });
+
+  it('ignores sslKey/sslCert and stays on http when ssl is not enabled', () => {
+    const t = translateOptions(
+      { ...base, sslKey: 'certs/dev.key', sslCert: 'certs/dev.crt' },
+      '/ws',
+    );
+    expect(t.args).not.toContain('--ssl');
+    expect(t.args).not.toContain('--ssl-key');
+    expect(t.url).toBe('http://localhost:4200/');
   });
 
   it('honors a custom project tsconfig', () => {
@@ -201,6 +238,14 @@ describe('formatUrl', () => {
   it('appends a servePath when provided', () => {
     expect(formatUrl('localhost', 4200, '/admin/')).toBe(
       'http://localhost:4200/admin/',
+    );
+  });
+  it('uses the https scheme when requested', () => {
+    expect(formatUrl('localhost', 4200, null, 'https')).toBe(
+      'https://localhost:4200/',
+    );
+    expect(formatUrl('app.local', 8080, '/admin/', 'https')).toBe(
+      'https://app.local:8080/admin/',
     );
   });
 });

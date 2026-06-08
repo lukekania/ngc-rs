@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use ngc_diagnostics::{NgcError, NgcResult};
-use tiny_http::{Header, Method, Response, Server, StatusCode};
+use tiny_http::{Header, Method, Response, Server, SslConfig, StatusCode};
 
 /// An event the dev server fans out to connected browsers over SSE.
 ///
@@ -102,6 +102,11 @@ pub struct DevServerConfig {
     /// `headers` option. Header names the server sets itself are never
     /// overridden by these — see [`CustomHeaders`].
     pub headers: Vec<(String, String)>,
+    /// TLS material to serve over HTTPS. When `None` (the default) the
+    /// server speaks plain HTTP. When `Some`, every connection — including
+    /// the long-lived SSE live-reload stream — is wrapped in TLS. Mirrors
+    /// `@angular/build:dev-server`'s `ssl`/`sslKey`/`sslCert` options.
+    pub tls: Option<TlsConfig>,
 }
 
 impl DevServerConfig {
@@ -115,6 +120,7 @@ impl DevServerConfig {
             serve_path: None,
             allowed_hosts: Vec::new(),
             headers: Vec::new(),
+            tls: None,
         }
     }
 
@@ -163,6 +169,86 @@ impl DevServerConfig {
             .map(|(k, v)| (k.into(), v.into()))
             .collect();
         self
+    }
+
+    /// Serve over HTTPS using the supplied [`TlsConfig`]. Passing `None`
+    /// (the default) keeps the server on plain HTTP.
+    pub fn with_tls(mut self, tls: Option<TlsConfig>) -> Self {
+        self.tls = tls;
+        self
+    }
+}
+
+/// PEM-encoded TLS material used to serve the dev server over HTTPS.
+///
+/// Construct one either from caller-supplied certificate and key files
+/// ([`TlsConfig::from_pem`]) or by minting a throwaway self-signed
+/// certificate for local development ([`TlsConfig::self_signed`]). The bytes
+/// are handed to `tiny_http`'s `ssl-rustls` backend, which performs the TLS
+/// handshake for every accepted connection.
+#[derive(Clone)]
+pub struct TlsConfig {
+    /// PEM-encoded certificate (chain).
+    cert_pem: Vec<u8>,
+    /// PEM-encoded private key.
+    key_pem: Vec<u8>,
+}
+
+impl TlsConfig {
+    /// Wrap caller-supplied PEM bytes (e.g. read from `sslCert`/`sslKey`
+    /// files) without inspecting them — `tiny_http` validates the material
+    /// when the server is created and surfaces a clear error if either is
+    /// malformed.
+    pub fn from_pem(cert_pem: Vec<u8>, key_pem: Vec<u8>) -> Self {
+        Self { cert_pem, key_pem }
+    }
+
+    /// Generate a throwaway self-signed certificate covering `hosts` plus the
+    /// loopback names (`localhost`, `127.0.0.1`, `::1`), matching what
+    /// `@angular/build:dev-server` does when `ssl: true` is set without an
+    /// explicit key/cert. Browsers will show the usual "untrusted
+    /// certificate" warning the first time.
+    ///
+    /// Each host string is added as an IP SAN when it parses as an IP
+    /// address and a DNS SAN otherwise, so `--host 192.168.1.10` produces a
+    /// certificate the browser accepts for that address.
+    pub fn self_signed(hosts: &[String]) -> NgcResult<Self> {
+        let mut sans: Vec<String> = vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+            "::1".to_string(),
+        ];
+        for host in hosts {
+            let trimmed = host.trim();
+            // Skip blanks and wildcard binds — `0.0.0.0`/`::` are never a
+            // hostname the browser connects to, and the loopback SANs above
+            // already cover local development.
+            if trimmed.is_empty() || matches!(trimmed, "0.0.0.0" | "::" | "[::]") {
+                continue;
+            }
+            let normalized = trimmed.trim_start_matches('[').trim_end_matches(']');
+            if !sans.iter().any(|s| s == normalized) {
+                sans.push(normalized.to_string());
+            }
+        }
+        let cert = rcgen::generate_simple_self_signed(sans).map_err(|e| NgcError::ServeError {
+            message: format!("could not generate self-signed certificate: {e}"),
+        })?;
+        Ok(Self {
+            cert_pem: cert.cert.pem().into_bytes(),
+            key_pem: cert.signing_key.serialize_pem().into_bytes(),
+        })
+    }
+}
+
+// Hand-written so the private key never lands in a `Debug` dump (e.g. when
+// `DevServerConfig` is logged).
+impl std::fmt::Debug for TlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsConfig")
+            .field("cert_pem", &format_args!("{} bytes", self.cert_pem.len()))
+            .field("key_pem", &"<redacted>")
+            .finish()
     }
 }
 
@@ -417,6 +503,7 @@ pub struct DevServer {
     server: Arc<Server>,
     accept_join: Option<JoinHandle<()>>,
     serve_path: Option<String>,
+    is_tls: bool,
 }
 
 impl DevServer {
@@ -449,9 +536,15 @@ impl DevServer {
             message: format!("could not read local address: {e}"),
         })?;
 
-        let server = Server::from_listener(listener, None).map_err(|e| NgcError::ServeError {
-            message: format!("tiny_http server init failed: {e}"),
-        })?;
+        let is_tls = config.tls.is_some();
+        let ssl_config = config.tls.as_ref().map(|t| SslConfig {
+            certificate: t.cert_pem.clone(),
+            private_key: t.key_pem.clone(),
+        });
+        let server =
+            Server::from_listener(listener, ssl_config).map_err(|e| NgcError::ServeError {
+                message: format!("tiny_http server init failed: {e}"),
+            })?;
         let server = Arc::new(server);
 
         let clients: SseClients = Arc::new(Mutex::new(Vec::new()));
@@ -492,6 +585,7 @@ impl DevServer {
             server,
             accept_join: Some(join),
             serve_path,
+            is_tls,
         })
     }
 
@@ -505,6 +599,17 @@ impl DevServer {
     /// or `None` when the server is mounted at `/`.
     pub fn serve_path(&self) -> Option<&str> {
         self.serve_path.as_deref()
+    }
+
+    /// The URL scheme the server answers on: `"https"` when TLS is enabled,
+    /// `"http"` otherwise. Use this to build a browser-facing URL that
+    /// matches the wire protocol.
+    pub fn scheme(&self) -> &'static str {
+        if self.is_tls {
+            "https"
+        } else {
+            "http"
+        }
     }
 
     /// Send a reload event to all connected browsers without going through
@@ -1482,5 +1587,47 @@ mod tests {
         let cfg = DevServerConfig::new("/tmp/dist").with_headers([("X-A", "1"), ("X-B", "2")]);
         assert_eq!(cfg.headers.len(), 2);
         assert_eq!(cfg.headers[0], ("X-A".to_string(), "1".to_string()));
+    }
+
+    #[test]
+    fn devserver_config_tls_defaults_to_none() {
+        assert!(DevServerConfig::new("/tmp/dist").tls.is_none());
+    }
+
+    #[test]
+    fn devserver_config_with_tls_stores_material() {
+        let tls = TlsConfig::from_pem(b"CERT".to_vec(), b"KEY".to_vec());
+        let cfg = DevServerConfig::new("/tmp/dist").with_tls(Some(tls));
+        let stored = cfg.tls.expect("tls present");
+        assert_eq!(stored.cert_pem, b"CERT");
+        assert_eq!(stored.key_pem, b"KEY");
+    }
+
+    #[test]
+    fn tls_self_signed_emits_pem_for_cert_and_key() {
+        let tls = TlsConfig::self_signed(&["app.local".to_string()]).expect("generate");
+        let cert = String::from_utf8(tls.cert_pem.clone()).expect("utf8 cert");
+        let key = String::from_utf8(tls.key_pem.clone()).expect("utf8 key");
+        assert!(cert.contains("BEGIN CERTIFICATE"));
+        assert!(cert.contains("END CERTIFICATE"));
+        assert!(key.contains("PRIVATE KEY"));
+    }
+
+    #[test]
+    fn tls_self_signed_skips_blank_and_wildcard_hosts() {
+        // Should not error on wildcard/blank binds — they're dropped and the
+        // loopback SANs still cover local development.
+        let tls =
+            TlsConfig::self_signed(&["0.0.0.0".to_string(), "".to_string(), "::".to_string()])
+                .expect("generate");
+        assert!(!tls.cert_pem.is_empty());
+    }
+
+    #[test]
+    fn tls_config_debug_redacts_private_key() {
+        let tls = TlsConfig::from_pem(b"CERTBYTES".to_vec(), b"SECRETKEY".to_vec());
+        let rendered = format!("{tls:?}");
+        assert!(rendered.contains("redacted"));
+        assert!(!rendered.contains("SECRETKEY"));
     }
 }

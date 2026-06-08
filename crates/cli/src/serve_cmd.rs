@@ -18,7 +18,7 @@ use std::sync::mpsc::channel;
 use std::sync::Arc;
 
 use colored::Colorize;
-use ngc_dev_server::{DevServer, DevServerConfig, DevServerEvent};
+use ngc_dev_server::{DevServer, DevServerConfig, DevServerEvent, TlsConfig};
 use ngc_diagnostics::{NgcError, NgcResult};
 use ngc_watch::{Watcher, WatcherConfig};
 
@@ -37,6 +37,9 @@ pub fn run(
     serve_path: Option<&str>,
     allowed_hosts: &[String],
     headers: &[(String, String)],
+    ssl: bool,
+    ssl_key: Option<&Path>,
+    ssl_cert: Option<&Path>,
 ) -> NgcResult<()> {
     run_with_stop(
         project,
@@ -47,8 +50,58 @@ pub fn run(
         serve_path,
         allowed_hosts,
         headers,
+        ssl,
+        ssl_key,
+        ssl_cert,
         install_ctrlc,
     )
+}
+
+/// Resolve the `--ssl`/`--ssl-key`/`--ssl-cert` flags into an optional
+/// [`TlsConfig`].
+///
+/// * `ssl` off → `None` (plain HTTP), and supplying a key/cert path without
+///   `--ssl` is rejected so a typo doesn't silently serve over HTTP.
+/// * `ssl` on with both a key and cert path → load that PEM material.
+/// * `ssl` on with only one of the two → an error, since both halves are
+///   required.
+/// * `ssl` on with neither → mint a throwaway self-signed certificate for
+///   the bind host (matching `@angular/build:dev-server`).
+fn resolve_tls(
+    ssl: bool,
+    ssl_key: Option<&Path>,
+    ssl_cert: Option<&Path>,
+    host: &str,
+) -> NgcResult<Option<TlsConfig>> {
+    if !ssl {
+        if ssl_key.is_some() || ssl_cert.is_some() {
+            return Err(NgcError::ServeError {
+                message: "--ssl-key/--ssl-cert require --ssl to be set".to_string(),
+            });
+        }
+        return Ok(None);
+    }
+
+    match (ssl_key, ssl_cert) {
+        (Some(key_path), Some(cert_path)) => {
+            let key_pem = std::fs::read(key_path).map_err(|source| NgcError::Io {
+                path: key_path.to_path_buf(),
+                source,
+            })?;
+            let cert_pem = std::fs::read(cert_path).map_err(|source| NgcError::Io {
+                path: cert_path.to_path_buf(),
+                source,
+            })?;
+            Ok(Some(TlsConfig::from_pem(cert_pem, key_pem)))
+        }
+        (None, None) => Ok(Some(TlsConfig::self_signed(&[host.to_string()])?)),
+        (Some(_), None) => Err(NgcError::ServeError {
+            message: "--ssl-key was set without --ssl-cert; both are required".to_string(),
+        }),
+        (None, Some(_)) => Err(NgcError::ServeError {
+            message: "--ssl-cert was set without --ssl-key; both are required".to_string(),
+        }),
+    }
 }
 
 /// Variant of [`run`] that lets the caller decide how the shutdown flag is
@@ -65,8 +118,13 @@ pub(crate) fn run_with_stop(
     serve_path: Option<&str>,
     allowed_hosts: &[String],
     headers: &[(String, String)],
+    ssl: bool,
+    ssl_key: Option<&Path>,
+    ssl_cert: Option<&Path>,
     install_stop: impl FnOnce(Arc<AtomicBool>),
 ) -> NgcResult<()> {
+    let tls = resolve_tls(ssl, ssl_key, ssl_cert, host)?;
+
     let out_dir = crate::resolve_out_dir(project, None, configuration)?;
     let mut cache = BuildCache::new();
 
@@ -100,11 +158,13 @@ pub(crate) fn run_with_stop(
         .with_port(port)
         .with_serve_path(normalized_serve_path.as_deref())
         .with_allowed_hosts(allowed_hosts.iter().cloned())
-        .with_headers(headers.iter().cloned());
+        .with_headers(headers.iter().cloned())
+        .with_tls(tls);
     let server = DevServer::start(cfg, event_rx)?;
+    let scheme = server.scheme();
     let url = match server.serve_path() {
-        Some(prefix) => format!("http://{}{}", server.addr(), prefix),
-        None => format!("http://{}", server.addr()),
+        Some(prefix) => format!("{scheme}://{}{}", server.addr(), prefix),
+        None => format!("{scheme}://{}", server.addr()),
     };
     eprintln!(
         "{} {}",
@@ -333,6 +393,60 @@ mod tests {
             panic!("expected BuildFailed variant");
         };
         assert_eq!(file.as_deref(), Some(Path::new("/proj/src/app.ts")));
+    }
+
+    #[test]
+    fn resolve_tls_disabled_returns_none() {
+        assert!(resolve_tls(false, None, None, "localhost")
+            .expect("ok")
+            .is_none());
+    }
+
+    #[test]
+    fn resolve_tls_rejects_key_or_cert_without_ssl() {
+        assert!(resolve_tls(false, Some(Path::new("/k")), None, "localhost").is_err());
+        assert!(resolve_tls(false, None, Some(Path::new("/c")), "localhost").is_err());
+    }
+
+    #[test]
+    fn resolve_tls_auto_generates_when_ssl_without_paths() {
+        let tls = resolve_tls(true, None, None, "localhost")
+            .expect("ok")
+            .expect("some tls");
+        // Round-trips through the dev server's SslConfig as PEM bytes; just
+        // confirm something was minted.
+        let _ = tls; // opaque material; presence is the assertion
+    }
+
+    #[test]
+    fn resolve_tls_requires_both_key_and_cert() {
+        assert!(resolve_tls(true, Some(Path::new("/k")), None, "localhost").is_err());
+        assert!(resolve_tls(true, None, Some(Path::new("/c")), "localhost").is_err());
+    }
+
+    #[test]
+    fn resolve_tls_reads_explicit_pem_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = dir.path().join("dev.key");
+        let cert = dir.path().join("dev.crt");
+        std::fs::write(&key, b"KEYDATA").expect("write key");
+        std::fs::write(&cert, b"CERTDATA").expect("write cert");
+        let tls = resolve_tls(true, Some(&key), Some(&cert), "localhost")
+            .expect("ok")
+            .expect("some tls");
+        let _ = tls;
+    }
+
+    #[test]
+    fn resolve_tls_errors_when_explicit_pem_missing() {
+        let err = resolve_tls(
+            true,
+            Some(Path::new("/no/such/key.pem")),
+            Some(Path::new("/no/such/cert.pem")),
+            "localhost",
+        )
+        .expect_err("missing file should error");
+        assert!(matches!(err, NgcError::Io { .. }));
     }
 
     #[test]

@@ -27,16 +27,16 @@
     },
     "ssl": {
       "type": "boolean",
-      "description": "Serve over HTTPS. Currently unsupported by ngc-rs serve. Setting this to true fails the build with an explanatory error.",
+      "description": "Serve over HTTPS. When set without sslKey/sslCert, the dev server generates a throwaway self-signed certificate for the bind host plus the loopback names; browsers show the usual untrusted-certificate warning. Cannot be combined with proxyConfig — terminate TLS at the proxy or drop the proxy when enabling ssl.",
       "default": false
     },
     "sslKey": {
       "type": "string",
-      "description": "SSL key path. Currently unsupported."
+      "description": "Path to a PEM-encoded private key used when ssl is true. Resolved relative to the workspace root. Requires sslCert."
     },
     "sslCert": {
       "type": "string",
-      "description": "SSL certificate path. Currently unsupported."
+      "description": "Path to a PEM-encoded certificate used when ssl is true. Resolved relative to the workspace root. Requires sslKey."
     },
     "proxyConfig": {
       "type": "string",

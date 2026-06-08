@@ -262,6 +262,23 @@ enum Commands {
         /// overridden by these.
         #[arg(long = "headers")]
         headers: Option<String>,
+        /// Serve over HTTPS instead of HTTP. When set without `--ssl-key`
+        /// and `--ssl-cert`, a throwaway self-signed certificate is
+        /// generated for the bind host plus the loopback names; browsers
+        /// show the usual untrusted-certificate warning. Mirrors the `ssl`
+        /// option of `@angular/build:dev-server`.
+        #[arg(long)]
+        ssl: bool,
+        /// Path to a PEM-encoded private key for HTTPS. Requires `--ssl` and
+        /// `--ssl-cert`. Mirrors the `sslKey` option of
+        /// `@angular/build:dev-server`.
+        #[arg(long = "ssl-key")]
+        ssl_key: Option<PathBuf>,
+        /// Path to a PEM-encoded certificate for HTTPS. Requires `--ssl` and
+        /// `--ssl-key`. Mirrors the `sslCert` option of
+        /// `@angular/build:dev-server`.
+        #[arg(long = "ssl-cert")]
+        ssl_cert: Option<PathBuf>,
     },
     /// Extract translatable messages from every component template in the
     /// project and emit a translation file (XLIFF 2.0 by default; XLIFF 1.2
@@ -390,6 +407,9 @@ fn main() {
             serve_path,
             allowed_hosts,
             headers,
+            ssl,
+            ssl_key,
+            ssl_cert,
         } => {
             let parsed_headers = match parse_header_overrides(headers.as_deref()) {
                 Ok(h) => h,
@@ -407,6 +427,9 @@ fn main() {
                 serve_path.as_deref(),
                 &allowed_hosts,
                 &parsed_headers,
+                ssl,
+                ssl_key.as_deref(),
+                ssl_cert.as_deref(),
             ) {
                 eprintln!("{} {e}", "Error:".red().bold());
                 process::exit(1);
