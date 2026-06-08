@@ -46,10 +46,20 @@ use tiny_http::{Header, Method, Response, Server, SslConfig, StatusCode};
 ///
 /// * [`DevServerEvent::Reload`] → `event: reload`
 /// * [`DevServerEvent::BuildFailed`] → `event: build-failed`
+/// * [`DevServerEvent::CssUpdate`] → `event: css-update`
 #[derive(Debug, Clone)]
 pub enum DevServerEvent {
     /// A successful rebuild — connected browsers should refresh the page.
     Reload,
+    /// A successful rebuild that only changed global stylesheet(s). HMR
+    /// clients swap the `styles.css` `<link>` in place (cache-busting with
+    /// `timestamp`) without reloading the page, preserving component and
+    /// form state. Only emitted when HMR is enabled; otherwise a plain
+    /// [`DevServerEvent::Reload`] is sent.
+    CssUpdate {
+        /// Monotonic cache-buster appended to the swapped stylesheet href.
+        timestamp: u64,
+    },
     /// A rebuild failed — connected browsers should display an error
     /// overlay with the message and (when available) the offending file
     /// and source coordinates.
@@ -695,6 +705,9 @@ fn fanout_loop(rx: Receiver<DevServerEvent>, clients: SseClients) {
 pub fn sse_frame(event: &DevServerEvent) -> String {
     match event {
         DevServerEvent::Reload => "event: reload\ndata: rebuild\n\n".to_string(),
+        DevServerEvent::CssUpdate { timestamp } => {
+            format!("event: css-update\ndata: {{\"timestamp\":{timestamp}}}\n\n")
+        }
         DevServerEvent::BuildFailed {
             message,
             file,
@@ -1074,7 +1087,7 @@ pub fn mime_for(path: &Path) -> &'static str {
 /// Malformed `data:` payloads (non-JSON, missing keys) are tolerated and
 /// fall back to a generic "build failed" message rather than crashing the
 /// listener.
-pub const LIVE_RELOAD_SCRIPT: &str = r#"<script>(function(){try{var ID='__ngc_rs_overlay__';function dismiss(){var n=document.getElementById(ID);if(n){n.remove();}window.__ngcRsOverlay=null;}function show(payload){dismiss();var data={};try{data=JSON.parse(payload)||{};}catch(_){}var msg=typeof data.message==='string'&&data.message?data.message:'ngc-rs rebuild failed';var loc='';if(typeof data.file==='string'&&data.file){loc=data.file;if(typeof data.line==='number'){loc+=':'+data.line;if(typeof data.column==='number'){loc+=':'+data.column;}}}var overlay=document.createElement('div');overlay.id=ID;overlay.setAttribute('role','alert');overlay.style.cssText='position:fixed;inset:0;z-index:2147483647;background:rgba(20,20,20,0.92);color:#ff6b6b;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:14px;line-height:1.5;padding:32px;overflow:auto;white-space:pre-wrap;word-break:break-word;';var header=document.createElement('div');header.textContent='ngc-rs build failed';header.style.cssText='font-weight:bold;font-size:16px;margin-bottom:16px;color:#ff8a8a;';overlay.appendChild(header);if(loc){var locEl=document.createElement('div');locEl.textContent=loc;locEl.style.cssText='color:#ffd166;margin-bottom:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';overlay.appendChild(locEl);}var body=document.createElement('pre');body.textContent=msg;body.style.cssText='margin:0;color:#ff6b6b;white-space:pre-wrap;word-break:break-word;';overlay.appendChild(body);var hint=document.createElement('div');hint.textContent='Press Esc to dismiss · overlay reappears on next failed rebuild';hint.style.cssText='margin-top:24px;color:#888;font-size:12px;';overlay.appendChild(hint);(document.body||document.documentElement).appendChild(overlay);window.__ngcRsOverlay=overlay;}function onKey(e){if(e.key==='Escape'){dismiss();}}document.addEventListener('keydown',onKey);var s=new EventSource('/__ngc_reload');s.addEventListener('reload',function(){dismiss();location.reload();});s.addEventListener('build-failed',function(e){show(e.data);});}catch(e){console.warn('[ngc-rs] live reload unavailable',e);}})();</script>"#;
+pub const LIVE_RELOAD_SCRIPT: &str = r#"<script>(function(){try{var ID='__ngc_rs_overlay__';function dismiss(){var n=document.getElementById(ID);if(n){n.remove();}window.__ngcRsOverlay=null;}function show(payload){dismiss();var data={};try{data=JSON.parse(payload)||{};}catch(_){}var msg=typeof data.message==='string'&&data.message?data.message:'ngc-rs rebuild failed';var loc='';if(typeof data.file==='string'&&data.file){loc=data.file;if(typeof data.line==='number'){loc+=':'+data.line;if(typeof data.column==='number'){loc+=':'+data.column;}}}var overlay=document.createElement('div');overlay.id=ID;overlay.setAttribute('role','alert');overlay.style.cssText='position:fixed;inset:0;z-index:2147483647;background:rgba(20,20,20,0.92);color:#ff6b6b;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:14px;line-height:1.5;padding:32px;overflow:auto;white-space:pre-wrap;word-break:break-word;';var header=document.createElement('div');header.textContent='ngc-rs build failed';header.style.cssText='font-weight:bold;font-size:16px;margin-bottom:16px;color:#ff8a8a;';overlay.appendChild(header);if(loc){var locEl=document.createElement('div');locEl.textContent=loc;locEl.style.cssText='color:#ffd166;margin-bottom:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';overlay.appendChild(locEl);}var body=document.createElement('pre');body.textContent=msg;body.style.cssText='margin:0;color:#ff6b6b;white-space:pre-wrap;word-break:break-word;';overlay.appendChild(body);var hint=document.createElement('div');hint.textContent='Press Esc to dismiss · overlay reappears on next failed rebuild';hint.style.cssText='margin-top:24px;color:#888;font-size:12px;';overlay.appendChild(hint);(document.body||document.documentElement).appendChild(overlay);window.__ngcRsOverlay=overlay;}function onKey(e){if(e.key==='Escape'){dismiss();}}document.addEventListener('keydown',onKey);function swapCss(t){var links=document.querySelectorAll('link[rel="stylesheet"]');for(var i=0;i < links.length;i++){(function(link){var href=link.getAttribute('href');if(!href){return;}var base=href.split('?')[0];if(!/(^|\/)styles\.css$/.test(base)){return;}var next=link.cloneNode(false);next.setAttribute('href',base+'?ngcss='+t);next.addEventListener('load',function(){if(link.parentNode){link.parentNode.removeChild(link);}});next.addEventListener('error',function(){if(next.parentNode){next.parentNode.removeChild(next);}});link.parentNode.insertBefore(next,link.nextSibling);})(links[i]);}}var s=new EventSource('/__ngc_reload');s.addEventListener('reload',function(){dismiss();location.reload();});s.addEventListener('build-failed',function(e){show(e.data);});s.addEventListener('css-update',function(e){var t=0;try{t=(JSON.parse(e.data)||{}).timestamp||0;}catch(_){}if(!t){t=(new Date()).getTime();}dismiss();swapCss(t);});}catch(e){console.warn('[ngc-rs] live reload unavailable',e);}})();</script>"#;
 
 /// Insert the live-reload client script into an HTML byte buffer.
 ///
@@ -1243,6 +1256,38 @@ mod tests {
         assert_eq!(
             sse_frame(&DevServerEvent::Reload),
             "event: reload\ndata: rebuild\n\n"
+        );
+    }
+
+    #[test]
+    fn sse_frame_for_css_update_emits_named_event_with_timestamp() {
+        let frame = sse_frame(&DevServerEvent::CssUpdate { timestamp: 7 });
+        assert!(frame.starts_with("event: css-update\n"));
+        let data_line = frame.lines().nth(1).expect("data line");
+        let json: serde_json::Value = serde_json::from_str(
+            data_line.strip_prefix("data: ").expect("data: prefix"),
+        )
+        .expect("css-update payload is JSON");
+        assert_eq!(json["timestamp"], 7);
+        assert!(frame.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn live_reload_script_handles_css_update_in_place() {
+        // The injected client must subscribe to `css-update` and swap the
+        // global styles.css link instead of reloading the page.
+        assert!(LIVE_RELOAD_SCRIPT.contains("addEventListener('css-update'"));
+        assert!(LIVE_RELOAD_SCRIPT.contains("function swapCss"));
+        assert!(LIVE_RELOAD_SCRIPT.contains("styles\\.css"));
+        // CSS updates must not trigger a full reload.
+        let after_css = LIVE_RELOAD_SCRIPT
+            .split("addEventListener('css-update'")
+            .nth(1)
+            .expect("css-update handler present");
+        let handler_body = after_css.split("});").next().unwrap_or("");
+        assert!(
+            !handler_body.contains("location.reload"),
+            "css-update handler must not reload the page"
         );
     }
 
