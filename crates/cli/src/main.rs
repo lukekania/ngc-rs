@@ -279,6 +279,17 @@ enum Commands {
         /// `@angular/build:dev-server`.
         #[arg(long = "ssl-cert")]
         ssl_cert: Option<PathBuf>,
+        /// Enable Hot Module Replacement: edits to component templates and
+        /// styles (and global stylesheets) are applied in place without a
+        /// full page reload, preserving component and form state. Overrides
+        /// `architect.serve.options.hmr` in `angular.json`. Mirrors the `hmr`
+        /// option of `@angular/build:dev-server`.
+        #[arg(long, conflicts_with = "no_hmr")]
+        hmr: bool,
+        /// Disable Hot Module Replacement, forcing a full page reload on every
+        /// rebuild. Overrides `architect.serve.options.hmr` in `angular.json`.
+        #[arg(long = "no-hmr", conflicts_with = "hmr")]
+        no_hmr: bool,
     },
     /// Extract translatable messages from every component template in the
     /// project and emit a translation file (XLIFF 2.0 by default; XLIFF 1.2
@@ -410,6 +421,8 @@ fn main() {
             ssl,
             ssl_key,
             ssl_cert,
+            hmr,
+            no_hmr,
         } => {
             let parsed_headers = match parse_header_overrides(headers.as_deref()) {
                 Ok(h) => h,
@@ -417,6 +430,15 @@ fn main() {
                     eprintln!("{} {e}", "Error:".red().bold());
                     process::exit(1);
                 }
+            };
+            // CLI flags win over angular.json: `--hmr` → Some(true),
+            // `--no-hmr` → Some(false), neither → None (inherit config).
+            let hmr_override = if hmr {
+                Some(true)
+            } else if no_hmr {
+                Some(false)
+            } else {
+                None
             };
             if let Err(e) = serve_cmd::run(
                 &project,
@@ -430,6 +452,7 @@ fn main() {
                 ssl,
                 ssl_key.as_deref(),
                 ssl_cert.as_deref(),
+                hmr_override,
             ) {
                 eprintln!("{} {e}", "Error:".red().bold());
                 process::exit(1);
@@ -1883,7 +1906,7 @@ pub(crate) fn resolve_out_dir(
 }
 
 /// Try to find angular.json by searching upward from the project file's directory.
-fn find_and_resolve_angular_json(
+pub(crate) fn find_and_resolve_angular_json(
     project: &Path,
     configuration: Option<&str>,
 ) -> NgcResult<Option<ResolvedAngularProject>> {

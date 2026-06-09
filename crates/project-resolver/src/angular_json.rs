@@ -93,6 +93,32 @@ pub enum RawLocaleEntry {
 pub struct RawArchitect {
     /// Build target configuration.
     pub build: Option<RawBuildTarget>,
+    /// Serve (dev-server) target configuration. Only the options ngc-rs
+    /// honours are modelled — currently just `hmr`.
+    pub serve: Option<RawServeTarget>,
+}
+
+/// A serve target (`@angular/build:dev-server`) with default options and
+/// named configurations. Only the subset ngc-rs reads is modelled.
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RawServeTarget {
+    /// Default serve options.
+    pub options: Option<RawServeOptions>,
+    /// Named configurations (e.g. "production", "development").
+    pub configurations: Option<HashMap<String, RawServeOptions>>,
+    /// Default configuration name used when none is specified.
+    pub default_configuration: Option<String>,
+}
+
+/// Serve options from `architect.serve.options` (or a per-configuration
+/// block). Only `hmr` is honoured today.
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RawServeOptions {
+    /// Enable Hot Module Replacement. When absent, ngc-rs defaults to `false`
+    /// (full-reload live reload).
+    pub hmr: Option<bool>,
 }
 
 /// A build target with default options and named configurations.
@@ -532,6 +558,11 @@ pub struct ResolvedAngularProject {
     /// is by exact name or `<name>/...` prefix, mirroring how
     /// `@angular/build:application` (esbuild) treats package externals.
     pub external_dependencies: Vec<String>,
+    /// Resolved `architect.serve.options.hmr` (with the active
+    /// configuration's override layered on top). `false` when absent —
+    /// matching ngc-rs's default of full-reload live reload. The CLI
+    /// `--hmr`/`--no-hmr` flag takes precedence over this value.
+    pub hmr: bool,
 }
 
 /// Type of a resolved size budget.
@@ -840,6 +871,22 @@ pub fn resolve_angular_project(
         .or_else(|| options.and_then(|o| o.external_dependencies.clone()))
         .unwrap_or_default();
 
+    // Resolve serve `hmr`: base serve options, with the active
+    // configuration's serve override layered on top when present. Absent →
+    // `false` (full-reload live reload). The serve target reuses the same
+    // configuration name as the build (matching `ng serve -c <config>`).
+    let serve_target = project.architect.as_ref().and_then(|a| a.serve.as_ref());
+    let serve_options = serve_target.and_then(|st| st.options.as_ref());
+    let serve_config = config_name.as_deref().and_then(|cn| {
+        serve_target
+            .and_then(|st| st.configurations.as_ref())
+            .and_then(|configs| configs.get(cn))
+    });
+    let hmr = serve_config
+        .and_then(|sc| sc.hmr)
+        .or_else(|| serve_options.and_then(|o| o.hmr))
+        .unwrap_or(false);
+
     debug!(
         project = %name,
         output_path = %output_path.display(),
@@ -872,6 +919,7 @@ pub fn resolve_angular_project(
         define,
         scripts,
         external_dependencies,
+        hmr,
     })
 }
 
@@ -1104,6 +1152,61 @@ mod tests {
         assert_eq!(result.project_name, "my-app");
         assert!(result.output_path.ends_with("dist/my-app"));
         assert!(result.ts_config.ends_with("tsconfig.app.json"));
+    }
+
+    #[test]
+    fn test_hmr_defaults_to_false_when_no_serve_target() {
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "architect": {
+                        "build": { "options": { "tsConfig": "tsconfig.json" } }
+                    }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let result = resolve_angular_project(f.path(), None, None).unwrap();
+        assert!(!result.hmr);
+    }
+
+    #[test]
+    fn test_hmr_read_from_serve_options() {
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "architect": {
+                        "build": { "options": { "tsConfig": "tsconfig.json" } },
+                        "serve": { "options": { "hmr": true } }
+                    }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let result = resolve_angular_project(f.path(), None, None).unwrap();
+        assert!(result.hmr);
+    }
+
+    #[test]
+    fn test_hmr_serve_configuration_overrides_base() {
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "architect": {
+                        "build": { "options": { "tsConfig": "tsconfig.json" } },
+                        "serve": {
+                            "options": { "hmr": false },
+                            "configurations": { "development": { "hmr": true } }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let base = resolve_angular_project(f.path(), None, None).unwrap();
+        assert!(!base.hmr, "base serve options keep hmr false");
+        let dev = resolve_angular_project(f.path(), None, Some("development")).unwrap();
+        assert!(dev.hmr, "development configuration overrides hmr to true");
     }
 
     #[test]

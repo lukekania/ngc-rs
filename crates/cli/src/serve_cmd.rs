@@ -40,6 +40,7 @@ pub fn run(
     ssl: bool,
     ssl_key: Option<&Path>,
     ssl_cert: Option<&Path>,
+    hmr_override: Option<bool>,
 ) -> NgcResult<()> {
     run_with_stop(
         project,
@@ -53,6 +54,7 @@ pub fn run(
         ssl,
         ssl_key,
         ssl_cert,
+        hmr_override,
         install_ctrlc,
     )
 }
@@ -121,12 +123,32 @@ pub(crate) fn run_with_stop(
     ssl: bool,
     ssl_key: Option<&Path>,
     ssl_cert: Option<&Path>,
+    hmr_override: Option<bool>,
     install_stop: impl FnOnce(Arc<AtomicBool>),
 ) -> NgcResult<()> {
     let tls = resolve_tls(ssl, ssl_key, ssl_cert, host)?;
 
     let out_dir = crate::resolve_out_dir(project, None, configuration)?;
     let mut cache = BuildCache::new();
+
+    // Resolve HMR: CLI `--hmr`/`--no-hmr` wins; otherwise inherit
+    // `architect.serve.options.hmr` from angular.json (default `false`).
+    // Also collect the absolute paths of the global stylesheet entries so a
+    // rebuild that touches only those can be classified as a CSS-only update.
+    let resolved = crate::find_and_resolve_angular_json(project, configuration)?;
+    let hmr_enabled = hmr_override.unwrap_or_else(|| resolved.as_ref().map(|p| p.hmr).unwrap_or(false));
+    let global_style_paths: std::collections::HashSet<PathBuf> = resolved
+        .as_ref()
+        .map(|p| {
+            p.styles
+                .iter()
+                .map(|s| canonical_or_owned(&s.path))
+                .collect()
+        })
+        .unwrap_or_default();
+    if hmr_enabled {
+        eprintln!("{}", "ngc-rs HMR enabled".bold().green());
+    }
 
     // Normalize the user-supplied servePath up-front so the dev server
     // mount and the index.html `<base href>` fallback agree on the
@@ -185,6 +207,9 @@ pub(crate) fn run_with_stop(
     let project_path = project.to_path_buf();
     let configuration_owned = configuration.map(|s| s.to_string());
     let serve_path_owned = normalized_serve_path.clone();
+    // Monotonic cache-buster for the swapped `styles.css` href on CSS-only
+    // updates; must change every rebuild so the browser re-fetches.
+    let mut hmr_tick: u64 = 0;
 
     let build_fn = move |dirty: &[PathBuf]| -> NgcResult<()> {
         if dirty.iter().any(|p| !is_ts_path(p)) {
@@ -209,7 +234,19 @@ pub(crate) fn run_with_stop(
                     result.modules_bundled,
                     dirty.len()
                 );
-                if event_tx.send(DevServerEvent::Reload).is_err() {
+                // CSS-only fast path: when HMR is on and every changed file is
+                // a global stylesheet entry, swap `styles.css` in place
+                // instead of reloading (preserving component/form state).
+                let css_only = hmr_enabled && is_global_css_only_change(dirty, &global_style_paths);
+                let event = if css_only {
+                    hmr_tick += 1;
+                    DevServerEvent::CssUpdate {
+                        timestamp: hmr_tick,
+                    }
+                } else {
+                    DevServerEvent::Reload
+                };
+                if event_tx.send(event).is_err() {
                     tracing::debug!("dev server event channel closed");
                 }
                 Ok(())
@@ -247,6 +284,28 @@ pub(crate) fn build_failure_event(err: &NgcError) -> DevServerEvent {
         line,
         column,
     }
+}
+
+/// Canonicalize `path`, falling back to its owned form when canonicalization
+/// fails (e.g. the file was deleted between resolve and compare). Used so the
+/// watcher's emitted paths and the resolved style paths compare equal even
+/// across symlinks.
+fn canonical_or_owned(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// True when a rebuild's `dirty` set is non-empty and every changed file is a
+/// global stylesheet entry — the case where HMR can swap `styles.css` in place
+/// instead of reloading. An empty set (or any non-stylesheet change) returns
+/// `false`, falling back to a full reload.
+fn is_global_css_only_change(
+    dirty: &[PathBuf],
+    global_style_paths: &std::collections::HashSet<PathBuf>,
+) -> bool {
+    !dirty.is_empty()
+        && dirty
+            .iter()
+            .all(|p| global_style_paths.contains(&canonical_or_owned(p)))
 }
 
 fn error_location(err: &NgcError) -> (Option<PathBuf>, Option<u32>, Option<u32>) {
@@ -447,6 +506,48 @@ mod tests {
         )
         .expect_err("missing file should error");
         assert!(matches!(err, NgcError::Io { .. }));
+    }
+
+    #[test]
+    fn css_only_change_classification() {
+        use std::collections::HashSet;
+        let styles: HashSet<PathBuf> = [PathBuf::from("/proj/src/styles.css"), PathBuf::from("/proj/src/theme.scss")]
+            .into_iter()
+            .collect();
+
+        // All dirty files are global stylesheets → CSS-only.
+        assert!(is_global_css_only_change(
+            &[PathBuf::from("/proj/src/styles.css")],
+            &styles
+        ));
+        assert!(is_global_css_only_change(
+            &[
+                PathBuf::from("/proj/src/styles.css"),
+                PathBuf::from("/proj/src/theme.scss")
+            ],
+            &styles
+        ));
+
+        // A non-stylesheet change (or a stylesheet not in the global set)
+        // forces a full reload.
+        assert!(!is_global_css_only_change(
+            &[PathBuf::from("/proj/src/app.component.ts")],
+            &styles
+        ));
+        assert!(!is_global_css_only_change(
+            &[
+                PathBuf::from("/proj/src/styles.css"),
+                PathBuf::from("/proj/src/app.component.ts")
+            ],
+            &styles
+        ));
+        assert!(!is_global_css_only_change(
+            &[PathBuf::from("/proj/src/app.component.css")],
+            &styles
+        ));
+
+        // Empty dirty set never qualifies.
+        assert!(!is_global_css_only_change(&[], &styles));
     }
 
     #[test]
