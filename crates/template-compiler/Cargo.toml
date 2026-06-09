@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 ngc-diagnostics = { path = "../diagnostics" }
+ngc-ts-transform = { path = "../ts-transform" }
 serde_json = "1.0"
 oxc_allocator = "0.122"
 oxc_diagnostics = "0.122"
@@ -23,7 +24,6 @@ tracing = "0.1"
 
 [dev-dependencies]
 ngc-project-resolver = { path = "../project-resolver" }
-ngc-ts-transform = { path = "../ts-transform" }
 insta = { version = "1.46", features = ["glob"] }
 tempfile = "3"
 which = "8"

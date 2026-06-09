@@ -171,6 +171,7 @@ pub(crate) fn run_with_stop(
         false,
         Some(&mut cache),
         normalized_serve_path.as_deref(),
+        hmr_enabled,
     )?;
     eprintln!(
         "{} {} module(s), {} file(s)",
@@ -180,9 +181,14 @@ pub(crate) fn run_with_stop(
     );
 
     // Shared registry of per-component HMR update modules served at
-    // `/@ng/component`. Empty until the compiler emits update modules; we
-    // share one handle between the dev server and the rebuild callback.
+    // `/@ng/component`. Seed it from the initial build; the rebuild callback
+    // replaces its contents each cycle.
     let component_updates: ComponentUpdates = Arc::new(Mutex::new(HashMap::new()));
+    if hmr_enabled {
+        if let Ok(mut map) = component_updates.lock() {
+            map.clone_from(&initial.hmr_component_updates);
+        }
+    }
 
     // When HMR is on, bind `import.meta.hot` inside the entry module so the
     // per-component initializers can register update handlers.
@@ -225,8 +231,9 @@ pub(crate) fn run_with_stop(
     let configuration_owned = configuration.map(|s| s.to_string());
     let serve_path_owned = normalized_serve_path.clone();
     let out_dir_owned = out_dir.clone();
-    // Monotonic cache-buster for the swapped `styles.css` href on CSS-only
-    // updates; must change every rebuild so the browser re-fetches.
+    let registry = Arc::clone(&component_updates);
+    // Monotonic cache-buster for swapped stylesheets and component-update
+    // fetches; must change every rebuild so the browser re-fetches.
     let mut hmr_tick: u64 = 0;
 
     let build_fn = move |dirty: &[PathBuf]| -> NgcResult<()> {
@@ -243,6 +250,7 @@ pub(crate) fn run_with_stop(
             false,
             Some(&mut cache),
             serve_path_owned.as_deref(),
+            hmr_enabled,
         );
         match outcome {
             Ok(result) => {
@@ -252,24 +260,26 @@ pub(crate) fn run_with_stop(
                     result.modules_bundled,
                     dirty.len()
                 );
-                // Re-bind `import.meta.hot` in the freshly written entry chunk.
                 if hmr_enabled {
+                    // Re-bind `import.meta.hot` in the freshly written entry
+                    // chunk and refresh the served update-module registry.
                     inject_hmr_runtime(&out_dir_owned);
-                }
-                // CSS-only fast path: when HMR is on and every changed file is
-                // a global stylesheet entry, swap `styles.css` in place
-                // instead of reloading (preserving component/form state).
-                let css_only = hmr_enabled && is_global_css_only_change(dirty, &global_style_paths);
-                let event = if css_only {
-                    hmr_tick += 1;
-                    DevServerEvent::CssUpdate {
-                        timestamp: hmr_tick,
+                    if let Ok(mut map) = registry.lock() {
+                        map.clone_from(&result.hmr_component_updates);
                     }
-                } else {
-                    DevServerEvent::Reload
-                };
-                if event_tx.send(event).is_err() {
-                    tracing::debug!("dev server event channel closed");
+                }
+                hmr_tick += 1;
+                for event in classify_rebuild(
+                    hmr_enabled,
+                    dirty,
+                    &global_style_paths,
+                    &result.hmr_resource_to_component,
+                    hmr_tick,
+                ) {
+                    if event_tx.send(event).is_err() {
+                        tracing::debug!("dev server event channel closed");
+                        break;
+                    }
                 }
                 Ok(())
             }
@@ -316,30 +326,40 @@ fn canonical_or_owned(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Prepend the HMR runtime prelude to the entry chunk (`main.js`) so the
-/// per-component HMR initializers can resolve `import.meta.hot`. The build
-/// rewrites `main.js` from scratch each cycle, so this runs after every
-/// successful build. A guard skips the work if the prelude is already present
-/// (defensive — a fresh build never has it). Failures are logged and ignored:
-/// a missing entry chunk just means HMR initializers won't bind, which
-/// degrades to live reload rather than breaking the served app.
+/// Prepend the HMR runtime prelude to every emitted JS chunk so the
+/// per-component HMR initializers — which live in `main.js` for eager
+/// components and in lazy `chunk-*.js` for routed ones — can resolve
+/// `import.meta.hot` (each ES module has its own `import.meta`). The build
+/// rewrites the chunks from scratch each cycle, so this runs after every
+/// successful build. A per-file guard skips the work if the prelude is already
+/// present. Failures are logged and ignored: a chunk that can't be patched
+/// just degrades that component to live reload rather than breaking the app.
 fn inject_hmr_runtime(out_dir: &Path) {
-    let main_js = out_dir.join("main.js");
-    let existing = match std::fs::read_to_string(&main_js) {
-        Ok(s) => s,
+    let entries = match std::fs::read_dir(out_dir) {
+        Ok(e) => e,
         Err(e) => {
-            tracing::debug!(path = %main_js.display(), error = %e, "no entry chunk to inject HMR runtime into");
+            tracing::debug!(path = %out_dir.display(), error = %e, "could not read out_dir to inject HMR runtime");
             return;
         }
     };
-    if existing.starts_with(HMR_RUNTIME_PRELUDE) {
-        return;
-    }
-    let mut patched = String::with_capacity(HMR_RUNTIME_PRELUDE.len() + existing.len());
-    patched.push_str(HMR_RUNTIME_PRELUDE);
-    patched.push_str(&existing);
-    if let Err(e) = std::fs::write(&main_js, patched) {
-        tracing::debug!(path = %main_js.display(), error = %e, "could not inject HMR runtime");
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Top-level `.js` chunks only (skip source maps and nested locale dirs).
+        if path.extension().and_then(|e| e.to_str()) != Some("js") {
+            continue;
+        }
+        let Ok(existing) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if existing.starts_with(HMR_RUNTIME_PRELUDE) {
+            continue;
+        }
+        let mut patched = String::with_capacity(HMR_RUNTIME_PRELUDE.len() + existing.len());
+        patched.push_str(HMR_RUNTIME_PRELUDE);
+        patched.push_str(&existing);
+        if let Err(e) = std::fs::write(&path, patched) {
+            tracing::debug!(path = %path.display(), error = %e, "could not inject HMR runtime into chunk");
+        }
     }
 }
 
@@ -355,6 +375,49 @@ fn is_global_css_only_change(
         && dirty
             .iter()
             .all(|p| global_style_paths.contains(&canonical_or_owned(p)))
+}
+
+/// Decide which dev-server event(s) a successful rebuild should fan out.
+///
+/// * HMR off → always a full [`DevServerEvent::Reload`].
+/// * Every dirty file is a global stylesheet → one [`DevServerEvent::CssUpdate`].
+/// * Every dirty file is an external component resource (`templateUrl` /
+///   `styleUrls`) of a known component → one [`DevServerEvent::ComponentUpdate`]
+///   per affected component, swapping it in place.
+/// * Anything else (a `.ts` class change, an inline-template edit, or an
+///   unrecognised file) → a full reload. Inline-template/`.ts` HMR is
+///   intentionally deferred to a follow-up.
+fn classify_rebuild(
+    hmr_enabled: bool,
+    dirty: &[PathBuf],
+    global_style_paths: &std::collections::HashSet<PathBuf>,
+    resource_to_component: &HashMap<PathBuf, String>,
+    timestamp: u64,
+) -> Vec<DevServerEvent> {
+    if !hmr_enabled {
+        return vec![DevServerEvent::Reload];
+    }
+    if is_global_css_only_change(dirty, global_style_paths) {
+        return vec![DevServerEvent::CssUpdate { timestamp }];
+    }
+    if dirty.is_empty() {
+        return vec![DevServerEvent::Reload];
+    }
+    let mut ids: Vec<String> = Vec::new();
+    for path in dirty {
+        match resource_to_component.get(&canonical_or_owned(path)) {
+            Some(id) => {
+                if !ids.contains(id) {
+                    ids.push(id.clone());
+                }
+            }
+            // A `.ts` change, inline-template edit, or unknown file → reload.
+            None => return vec![DevServerEvent::Reload],
+        }
+    }
+    ids.into_iter()
+        .map(|id| DevServerEvent::ComponentUpdate { id, timestamp })
+        .collect()
 }
 
 fn error_location(err: &NgcError) -> (Option<PathBuf>, Option<u32>, Option<u32>) {
@@ -597,6 +660,87 @@ mod tests {
 
         // Empty dirty set never qualifies.
         assert!(!is_global_css_only_change(&[], &styles));
+    }
+
+    #[test]
+    fn classify_rebuild_routes_events() {
+        use std::collections::{HashMap, HashSet};
+        let styles: HashSet<PathBuf> = [PathBuf::from("/proj/src/styles.css")].into_iter().collect();
+        let mut resources: HashMap<PathBuf, String> = HashMap::new();
+        resources.insert(PathBuf::from("/proj/src/app/app.component.html"), "id-app".to_string());
+        resources.insert(PathBuf::from("/proj/src/app/app.component.css"), "id-app".to_string());
+        resources.insert(PathBuf::from("/proj/src/app/foo.component.html"), "id-foo".to_string());
+
+        // HMR off → always reload.
+        assert!(matches!(
+            classify_rebuild(false, &[PathBuf::from("/proj/src/app/app.component.html")], &styles, &resources, 1).as_slice(),
+            [DevServerEvent::Reload]
+        ));
+
+        // Global stylesheet only → CssUpdate.
+        assert!(matches!(
+            classify_rebuild(true, &[PathBuf::from("/proj/src/styles.css")], &styles, &resources, 5).as_slice(),
+            [DevServerEvent::CssUpdate { timestamp: 5 }]
+        ));
+
+        // A component template → one ComponentUpdate for its id.
+        let evs = classify_rebuild(true, &[PathBuf::from("/proj/src/app/app.component.html")], &styles, &resources, 7);
+        match evs.as_slice() {
+            [DevServerEvent::ComponentUpdate { id, timestamp: 7 }] => assert_eq!(id, "id-app"),
+            other => panic!("expected one ComponentUpdate, got {other:?}"),
+        }
+
+        // Two resources of the same component → deduped to a single update.
+        let evs = classify_rebuild(
+            true,
+            &[
+                PathBuf::from("/proj/src/app/app.component.html"),
+                PathBuf::from("/proj/src/app/app.component.css"),
+            ],
+            &styles,
+            &resources,
+            9,
+        );
+        assert_eq!(evs.len(), 1);
+
+        // Two distinct components → one update each.
+        let evs = classify_rebuild(
+            true,
+            &[
+                PathBuf::from("/proj/src/app/app.component.html"),
+                PathBuf::from("/proj/src/app/foo.component.html"),
+            ],
+            &styles,
+            &resources,
+            9,
+        );
+        assert_eq!(evs.len(), 2);
+
+        // A `.ts` (or any unknown) change → reload, even mixed with a resource.
+        assert!(matches!(
+            classify_rebuild(true, &[PathBuf::from("/proj/src/app/app.component.ts")], &styles, &resources, 1).as_slice(),
+            [DevServerEvent::Reload]
+        ));
+        assert!(matches!(
+            classify_rebuild(
+                true,
+                &[
+                    PathBuf::from("/proj/src/app/app.component.html"),
+                    PathBuf::from("/proj/src/app/app.component.ts"),
+                ],
+                &styles,
+                &resources,
+                1
+            )
+            .as_slice(),
+            [DevServerEvent::Reload]
+        ));
+
+        // Empty dirty set → reload.
+        assert!(matches!(
+            classify_rebuild(true, &[], &styles, &resources, 1).as_slice(),
+            [DevServerEvent::Reload]
+        ));
     }
 
     #[test]

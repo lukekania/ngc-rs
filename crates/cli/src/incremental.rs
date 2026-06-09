@@ -40,6 +40,11 @@ pub struct CachedModule {
     pub transformed_code: String,
     /// Optional source map for the transformed JS.
     pub transformed_map: Option<SourceMap>,
+    /// HMR artifacts captured during the original compile (when `--hmr` is
+    /// active). Reused on a cache hit so an unchanged component still
+    /// contributes its update module to the dev server's registry. `None`
+    /// for non-HMR builds.
+    pub hmr: Option<ngc_template_compiler::HmrArtifacts>,
 }
 
 /// Per-build-pipeline module cache.
@@ -135,6 +140,7 @@ mod tests {
             jit_fallback: false,
             transformed_code: "// transformed".to_string(),
             transformed_map: None,
+            hmr: None,
         }
     }
 

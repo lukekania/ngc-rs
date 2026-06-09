@@ -13,6 +13,7 @@ pub fn rewrite_source(
     source: &str,
     component: &ExtractedComponent,
     ivy_output: &IvyOutput,
+    hmr: bool,
 ) -> NgcResult<String> {
     let common = DecoratorCommon {
         decorator_span: component.decorator_span,
@@ -20,7 +21,16 @@ pub fn rewrite_source(
         angular_core_import_span: component.angular_core_import_span,
         other_angular_core_imports: component.other_angular_core_imports.clone(),
     };
-    rewrite_source_generic(source, &common, ivy_output)
+    let out = rewrite_source_generic(source, &common, ivy_output)?;
+    if hmr {
+        // The HMR initializer (appended later) and `ɵɵreplaceMetadata` need a
+        // namespace handle for `@angular/core`; the bundler resolves this to
+        // the synthesized core namespace object. The existing named import is
+        // left in place for the def's own runtime symbols.
+        Ok(format!("import * as i0 from '@angular/core';\n{out}"))
+    } else {
+        Ok(out)
+    }
 }
 
 /// Rewrite a TypeScript source string to replace any Angular decorator with
@@ -187,7 +197,7 @@ mod tests {
     fn test_rewrite_removes_decorator() {
         let component = make_component();
         let ivy = make_ivy_output();
-        let result = rewrite_source(TEST_SOURCE, &component, &ivy).expect("should rewrite");
+        let result = rewrite_source(TEST_SOURCE, &component, &ivy, false).expect("should rewrite");
         assert!(!result.contains("@Component"));
         assert!(result.contains("\u{0275}\u{0275}defineComponent"));
         assert!(result.contains("class AppComponent"));
@@ -198,7 +208,7 @@ mod tests {
     fn test_rewrite_updates_imports() {
         let component = make_component();
         let ivy = make_ivy_output();
-        let result = rewrite_source(TEST_SOURCE, &component, &ivy).expect("should rewrite");
+        let result = rewrite_source(TEST_SOURCE, &component, &ivy, false).expect("should rewrite");
         assert!(result.contains("\u{0275}\u{0275}defineComponent"));
         assert!(result.contains("\u{0275}\u{0275}element"));
         assert!(!result.contains("import { Component }"));
@@ -208,7 +218,7 @@ mod tests {
     fn test_rewrite_inserts_static_fields() {
         let component = make_component();
         let ivy = make_ivy_output();
-        let result = rewrite_source(TEST_SOURCE, &component, &ivy).expect("should rewrite");
+        let result = rewrite_source(TEST_SOURCE, &component, &ivy, false).expect("should rewrite");
         assert!(result.contains("static \u{0275}fac"));
         assert!(result.contains("static \u{0275}cmp"));
         // Static fields should be inside the class body

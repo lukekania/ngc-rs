@@ -141,6 +141,16 @@ struct BuildResult {
     total_size_bytes: u64,
     /// Wall-clock duration of the build pipeline.
     duration_ms: u64,
+    /// HMR component-update modules, keyed by component id. Populated only
+    /// when the build runs with HMR enabled (`serve --hmr`); internal to the
+    /// dev server, so excluded from the `--output-json` shape.
+    #[serde(skip)]
+    hmr_component_updates: HashMap<String, String>,
+    /// Map from an external resource (`templateUrl`/`styleUrls`) path to the
+    /// owning component's HMR id, so a changed `.html`/`.css` maps to the
+    /// component to hot-swap.
+    #[serde(skip)]
+    hmr_resource_to_component: HashMap<PathBuf, String>,
 }
 
 #[derive(Parser)]
@@ -554,6 +564,8 @@ fn main() {
                             modules_bundled: 0,
                             total_size_bytes: 0,
                             duration_ms: started.elapsed().as_millis() as u64,
+                            hmr_component_updates: HashMap::new(),
+                            hmr_resource_to_component: HashMap::new(),
                         };
                         let json = serde_json::to_string_pretty(&result)
                             .expect("BuildResult serialization should not fail");
@@ -605,6 +617,7 @@ fn run_build(
         strict_templates,
         None,
         None,
+        false,
     )
 }
 
@@ -631,6 +644,7 @@ pub(crate) fn run_build_with_cache(
         false,
         cache,
         None,
+        false,
     )
 }
 
@@ -644,6 +658,7 @@ pub(crate) fn run_build_with_cache(
 /// `strict_templates` mirrors the `--strict-templates` build flag: when
 /// true, any template that would otherwise fall back to JIT compilation
 /// produces an [`NgcError::TemplateCompileError`] instead.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_build_with_options(
     project: &Path,
     out_dir_override: Option<&Path>,
@@ -652,6 +667,7 @@ pub(crate) fn run_build_with_options(
     strict_templates: bool,
     mut cache: Option<&mut incremental::BuildCache>,
     base_href_override: Option<&str>,
+    hmr: bool,
 ) -> NgcResult<BuildResult> {
     let started_at = Instant::now();
 
@@ -720,7 +736,10 @@ pub(crate) fn run_build_with_options(
         .iter()
         .filter_map(|p| incremental::BuildCache::hash_file(p).map(|h| (p.clone(), h)))
         .collect();
-    let compile_opts = ngc_template_compiler::CompileOptions { strict_templates };
+    let compile_opts = ngc_template_compiler::CompileOptions {
+        strict_templates,
+        hmr,
+    };
     let (compiled, transform_cache_seed) = compile_decorators_cached(
         &files,
         &style_ctx,
@@ -729,6 +748,29 @@ pub(crate) fn run_build_with_options(
         &file_hashes,
     )?;
     drop(templates_span);
+
+    // Aggregate HMR artifacts (when enabled) into lookup maps the dev server
+    // consumes: id → update module, and source/resource path → component id.
+    let mut hmr_component_updates: HashMap<String, String> = HashMap::new();
+    let mut hmr_resource_to_component: HashMap<PathBuf, String> = HashMap::new();
+    if hmr {
+        for cf in &compiled {
+            if let Some(artifacts) = &cf.hmr {
+                for comp in &artifacts.components {
+                    hmr_component_updates
+                        .insert(comp.id.clone(), comp.update_module_source.clone());
+                    for resource in &comp.resource_files {
+                        // Canonicalize so the watcher's emitted paths (also
+                        // canonicalized at lookup) match across symlinks.
+                        let key = resource
+                            .canonicalize()
+                            .unwrap_or_else(|_| resource.clone());
+                        hmr_resource_to_component.insert(key, comp.id.clone());
+                    }
+                }
+            }
+        }
+    }
 
     // Report any JIT fallbacks. Each fallback also goes into
     // `BuildResult.warnings` so the architect builder shim can surface it
@@ -1485,6 +1527,8 @@ pub(crate) fn run_build_with_options(
         modules_bundled,
         total_size_bytes,
         duration_ms: started_at.elapsed().as_millis() as u64,
+        hmr_component_updates,
+        hmr_resource_to_component,
     })
 }
 
@@ -2841,6 +2885,7 @@ fn compile_decorators_cached(
                 source: hit.compiled_source,
                 compiled: true,
                 jit_fallback: hit.jit_fallback,
+                hmr: hit.hmr,
             });
             continue;
         }
@@ -2868,6 +2913,7 @@ fn compile_decorators_cached(
                         // Filled in by the transform step.
                         transformed_code: String::new(),
                         transformed_map: None,
+                        hmr: cf.hmr.clone(),
                     },
                 );
             }
