@@ -17,6 +17,7 @@ export interface DevServerOptions extends json.JsonObject {
   servePath: string | null;
   allowedHosts: string[] | null;
   headers: { [key: string]: string } | null;
+  hmr: boolean | null;
 }
 
 export interface TranslatedServeArgs {
@@ -94,6 +95,14 @@ export function translateOptions(
   const headers = normalizeHeaders(raw.headers);
   if (headers !== null) {
     args.push('--headers', headers);
+  }
+  // `hmr` is tri-state: an explicit true/false becomes `--hmr`/`--no-hmr`
+  // (the CLI override flags), while unset forwards nothing so the binary
+  // falls back to `architect.serve.options.hmr` in angular.json.
+  if (raw.hmr === true) {
+    args.push('--hmr');
+  } else if (raw.hmr === false) {
+    args.push('--no-hmr');
   }
   args.push(...sslArgs);
 

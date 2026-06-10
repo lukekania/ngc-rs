@@ -226,6 +226,24 @@ describe('translateOptions', () => {
     ).not.toContain('--headers');
     expect(translateOptions(base, '/ws').args).not.toContain('--headers');
   });
+
+  it('forwards hmr: true as --hmr', () => {
+    const t = translateOptions({ ...base, hmr: true }, '/ws');
+    expect(t.args).toContain('--hmr');
+    expect(t.args).not.toContain('--no-hmr');
+  });
+
+  it('forwards hmr: false as --no-hmr', () => {
+    const t = translateOptions({ ...base, hmr: false }, '/ws');
+    expect(t.args).toContain('--no-hmr');
+    expect(t.args).not.toContain('--hmr');
+  });
+
+  it('omits both hmr flags when hmr is unset so the binary inherits angular.json', () => {
+    const args = translateOptions(base, '/ws').args;
+    expect(args).not.toContain('--hmr');
+    expect(args).not.toContain('--no-hmr');
+  });
 });
 
 describe('formatUrl', () => {
