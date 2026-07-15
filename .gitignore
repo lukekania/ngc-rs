@@ -8,6 +8,5 @@
 MILESTONES.md
 .env
 .env.*
-/scripts/bench_local.sh
-/scripts/deploy_to_container.sh
+/scripts/
 /test/
