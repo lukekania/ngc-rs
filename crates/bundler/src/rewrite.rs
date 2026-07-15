@@ -167,7 +167,12 @@ fn collect_module_decl_edits(
     match module_decl {
         ModuleDeclaration::ImportDeclaration(import) => {
             let source = import.source.value.as_str();
-            if is_local(source, local_prefixes, bundled_specifiers, external_specifiers) {
+            if is_local(
+                source,
+                local_prefixes,
+                bundled_specifiers,
+                external_specifiers,
+            ) {
                 // Check if this import has a namespace mapping (npm module)
                 if let Some(ns) = namespace_map.get(source) {
                     // Replace import with namespace lookups

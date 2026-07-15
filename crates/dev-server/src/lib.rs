@@ -1370,10 +1370,9 @@ mod tests {
         let frame = sse_frame(&DevServerEvent::CssUpdate { timestamp: 7 });
         assert!(frame.starts_with("event: css-update\n"));
         let data_line = frame.lines().nth(1).expect("data line");
-        let json: serde_json::Value = serde_json::from_str(
-            data_line.strip_prefix("data: ").expect("data: prefix"),
-        )
-        .expect("css-update payload is JSON");
+        let json: serde_json::Value =
+            serde_json::from_str(data_line.strip_prefix("data: ").expect("data: prefix"))
+                .expect("css-update payload is JSON");
         assert_eq!(json["timestamp"], 7);
         assert!(frame.ends_with("\n\n"));
     }

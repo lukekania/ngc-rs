@@ -365,7 +365,11 @@ mod tests {
 
         // alpha + utils.mjs only — beta is external so its index.mjs must
         // not appear in modules and `beta` must not show up in resolved.
-        assert_eq!(result.modules.len(), 2, "beta's modules must not be pulled in");
+        assert_eq!(
+            result.modules.len(),
+            2,
+            "beta's modules must not be pulled in"
+        );
         assert!(
             !result.resolved_specifiers.contains("beta"),
             "external 'beta' must not appear in resolved_specifiers"
@@ -404,7 +408,9 @@ mod tests {
         // Only consumer is pulled in; the subpath import of jquery is
         // treated as external and never walked.
         assert_eq!(result.modules.len(), 1);
-        assert!(!result.resolved_specifiers.contains("jquery/dist/jquery.slim"));
+        assert!(!result
+            .resolved_specifiers
+            .contains("jquery/dist/jquery.slim"));
     }
 
     #[test]

@@ -1424,12 +1424,7 @@ impl IvyCodegen {
                     child.decls, child.vars
                 )),
             }
-            else_if_slots.push((
-                branch.condition.clone(),
-                fn_name.clone(),
-                ei_slot,
-                ei_alias,
-            ));
+            else_if_slots.push((branch.condition.clone(), fn_name.clone(), ei_slot, ei_alias));
             self.child_templates.push(child);
         }
 
@@ -3548,7 +3543,11 @@ fn build_test_chain(
 fn build_alias_value_chain(branches: &[(String, Option<String>, u32)]) -> String {
     let mut expr = String::new();
     for (compiled, alias, _slot) in branches {
-        let value = if alias.is_some() { compiled.as_str() } else { "null" };
+        let value = if alias.is_some() {
+            compiled.as_str()
+        } else {
+            "null"
+        };
         expr.push_str(&format!("{compiled} ? {value} : "));
     }
     expr.push_str("null");
@@ -4552,7 +4551,9 @@ mod tests {
         );
         for sym in ["getCurrentView", "restoreView", "reference"] {
             assert!(
-                output.ivy_imports.contains(&format!("\u{0275}\u{0275}{sym}")),
+                output
+                    .ivy_imports
+                    .contains(&format!("\u{0275}\u{0275}{sym}")),
                 "ivy_imports must include ɵɵ{sym}"
             );
         }
@@ -5865,7 +5866,9 @@ mod tests {
             "must not fall back to ctx.<alias>.<field> on the parent: {dc}"
         );
         assert!(
-            dc.contains("\u{0275}\u{0275}conditional(ctx.item() ? 0 : -1, ctx.item() ? ctx.item() : null);"),
+            dc.contains(
+                "\u{0275}\u{0275}conditional(ctx.item() ? 0 : -1, ctx.item() ? ctx.item() : null);"
+            ),
             "ɵɵconditional must receive the truthy value as its second arg: {dc}"
         );
     }
@@ -5918,9 +5921,8 @@ mod tests {
     /// don't have the alias as their own function parameter.
     #[test]
     fn if_block_alias_reaches_nested_scopes_via_next_context() {
-        let output = compile_template(
-            "@if (state(); as s) { @switch (s.k) { @case ('a') { {{ s.v }} } } }",
-        );
+        let output =
+            compile_template("@if (state(); as s) { @switch (s.k) { @case ('a') { {{ s.v }} } } }");
         let dc = full_emit(&output);
         // The @switch case's template binds `s` from the @if's embedded view.
         assert!(

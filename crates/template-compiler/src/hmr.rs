@@ -32,7 +32,11 @@ use crate::codegen::IvyOutput;
 /// initializer, the dev-server registry key, and the running app's fetch URL.
 pub fn encode_uri_component(input: &str) -> String {
     fn is_unreserved(b: u8) -> bool {
-        b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')')
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')'
+            )
     }
     let mut out = String::with_capacity(input.len());
     for &b in input.as_bytes() {
@@ -40,8 +44,16 @@ pub fn encode_uri_component(input: &str) -> String {
             out.push(b as char);
         } else {
             out.push('%');
-            out.push(char::from_digit((b >> 4) as u32, 16).unwrap().to_ascii_uppercase());
-            out.push(char::from_digit((b & 0xf) as u32, 16).unwrap().to_ascii_uppercase());
+            out.push(
+                char::from_digit((b >> 4) as u32, 16)
+                    .unwrap()
+                    .to_ascii_uppercase(),
+            );
+            out.push(
+                char::from_digit((b & 0xf) as u32, 16)
+                    .unwrap()
+                    .to_ascii_uppercase(),
+            );
         }
     }
     out
@@ -136,9 +148,7 @@ pub fn build_update_module_ts(class_name: &str, ivy: &IvyOutput, locals: &[Strin
     // `static ɵcmp = ɵɵdefineComponent({...})`; turn the class-field form into
     // an assignment statement on the class passed in as the first parameter.
     let def = ivy.static_fields.first().map(|s| s.as_str()).unwrap_or("");
-    let def_expr = def
-        .strip_prefix("static \u{0275}cmp = ")
-        .unwrap_or(def);
+    let def_expr = def.strip_prefix("static \u{0275}cmp = ").unwrap_or(def);
     out.push_str(&format!("  {class_name}.\u{0275}cmp = {def_expr};\n"));
 
     out.push_str("}\n");
@@ -188,10 +198,16 @@ mod tests {
 
     #[test]
     fn initializer_embeds_id_locals_and_replace_metadata() {
-        let init = build_initializer("AppComponent", "the%2Fid%40AppComponent", &["RouterOutlet".into(), "MyPipe".into()]);
+        let init = build_initializer(
+            "AppComponent",
+            "the%2Fid%40AppComponent",
+            &["RouterOutlet".into(), "MyPipe".into()],
+        );
         assert!(init.contains("var __ngId = 'the%2Fid%40AppComponent';"));
         assert!(init.contains("i0.\u{0275}\u{0275}replaceMetadata(AppComponent, m.default, [i0], [RouterOutlet, MyPipe], import.meta, __ngId)"));
-        assert!(init.contains("import('./@ng/component?c=' + __ngId + '&t=' + encodeURIComponent(t))"));
+        assert!(
+            init.contains("import('./@ng/component?c=' + __ngId + '&t=' + encodeURIComponent(t))")
+        );
         assert!(init.contains("import.meta.hot.on('angular:component-update'"));
     }
 
@@ -214,7 +230,8 @@ mod tests {
         let module = build_update_module_ts("App", &ivy, &["RouterOutlet".into()]);
         assert!(module.contains("export default function App_UpdateMetadata(App, \u{0275}\u{0275}namespaces, RouterOutlet)"));
         assert!(module.contains("const i0 = \u{0275}\u{0275}namespaces[0];"));
-        assert!(module.contains("var \u{0275}\u{0275}defineComponent = i0.\u{0275}\u{0275}defineComponent;"));
+        assert!(module
+            .contains("var \u{0275}\u{0275}defineComponent = i0.\u{0275}\u{0275}defineComponent;"));
         assert!(module.contains("function App_div_0_Template"));
         assert!(module.contains("App.\u{0275}cmp = \u{0275}\u{0275}defineComponent({"));
         // The update module must not reassign the factory (template/style-only).

@@ -141,7 +141,8 @@ pub(crate) fn run_with_stop(
     // Also collect the absolute paths of the global stylesheet entries so a
     // rebuild that touches only those can be classified as a CSS-only update.
     let resolved = crate::find_and_resolve_angular_json(project, configuration)?;
-    let hmr_enabled = hmr_override.unwrap_or_else(|| resolved.as_ref().map(|p| p.hmr).unwrap_or(false));
+    let hmr_enabled =
+        hmr_override.unwrap_or_else(|| resolved.as_ref().map(|p| p.hmr).unwrap_or(false));
     let global_style_paths: std::collections::HashSet<PathBuf> = resolved
         .as_ref()
         .map(|p| {
@@ -623,9 +624,12 @@ mod tests {
     #[test]
     fn css_only_change_classification() {
         use std::collections::HashSet;
-        let styles: HashSet<PathBuf> = [PathBuf::from("/proj/src/styles.css"), PathBuf::from("/proj/src/theme.scss")]
-            .into_iter()
-            .collect();
+        let styles: HashSet<PathBuf> = [
+            PathBuf::from("/proj/src/styles.css"),
+            PathBuf::from("/proj/src/theme.scss"),
+        ]
+        .into_iter()
+        .collect();
 
         // All dirty files are global stylesheets → CSS-only.
         assert!(is_global_css_only_change(
@@ -665,26 +669,57 @@ mod tests {
     #[test]
     fn classify_rebuild_routes_events() {
         use std::collections::{HashMap, HashSet};
-        let styles: HashSet<PathBuf> = [PathBuf::from("/proj/src/styles.css")].into_iter().collect();
+        let styles: HashSet<PathBuf> = [PathBuf::from("/proj/src/styles.css")]
+            .into_iter()
+            .collect();
         let mut resources: HashMap<PathBuf, String> = HashMap::new();
-        resources.insert(PathBuf::from("/proj/src/app/app.component.html"), "id-app".to_string());
-        resources.insert(PathBuf::from("/proj/src/app/app.component.css"), "id-app".to_string());
-        resources.insert(PathBuf::from("/proj/src/app/foo.component.html"), "id-foo".to_string());
+        resources.insert(
+            PathBuf::from("/proj/src/app/app.component.html"),
+            "id-app".to_string(),
+        );
+        resources.insert(
+            PathBuf::from("/proj/src/app/app.component.css"),
+            "id-app".to_string(),
+        );
+        resources.insert(
+            PathBuf::from("/proj/src/app/foo.component.html"),
+            "id-foo".to_string(),
+        );
 
         // HMR off → always reload.
         assert!(matches!(
-            classify_rebuild(false, &[PathBuf::from("/proj/src/app/app.component.html")], &styles, &resources, 1).as_slice(),
+            classify_rebuild(
+                false,
+                &[PathBuf::from("/proj/src/app/app.component.html")],
+                &styles,
+                &resources,
+                1
+            )
+            .as_slice(),
             [DevServerEvent::Reload]
         ));
 
         // Global stylesheet only → CssUpdate.
         assert!(matches!(
-            classify_rebuild(true, &[PathBuf::from("/proj/src/styles.css")], &styles, &resources, 5).as_slice(),
+            classify_rebuild(
+                true,
+                &[PathBuf::from("/proj/src/styles.css")],
+                &styles,
+                &resources,
+                5
+            )
+            .as_slice(),
             [DevServerEvent::CssUpdate { timestamp: 5 }]
         ));
 
         // A component template → one ComponentUpdate for its id.
-        let evs = classify_rebuild(true, &[PathBuf::from("/proj/src/app/app.component.html")], &styles, &resources, 7);
+        let evs = classify_rebuild(
+            true,
+            &[PathBuf::from("/proj/src/app/app.component.html")],
+            &styles,
+            &resources,
+            7,
+        );
         match evs.as_slice() {
             [DevServerEvent::ComponentUpdate { id, timestamp: 7 }] => assert_eq!(id, "id-app"),
             other => panic!("expected one ComponentUpdate, got {other:?}"),
@@ -718,7 +753,14 @@ mod tests {
 
         // A `.ts` (or any unknown) change → reload, even mixed with a resource.
         assert!(matches!(
-            classify_rebuild(true, &[PathBuf::from("/proj/src/app/app.component.ts")], &styles, &resources, 1).as_slice(),
+            classify_rebuild(
+                true,
+                &[PathBuf::from("/proj/src/app/app.component.ts")],
+                &styles,
+                &resources,
+                1
+            )
+            .as_slice(),
             [DevServerEvent::Reload]
         ));
         assert!(matches!(

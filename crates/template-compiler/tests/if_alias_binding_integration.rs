@@ -86,9 +86,8 @@ export class YComponent {
 
 #[test]
 fn if_alias_emits_runtime_correct_codegen() {
-    let compiled =
-        compile_component(DETAIL_FIXTURE, &PathBuf::from("detail.component.ts"))
-            .expect("component should compile");
+    let compiled = compile_component(DETAIL_FIXTURE, &PathBuf::from("detail.component.ts"))
+        .expect("component should compile");
 
     assert!(
         compiled.compiled,
@@ -125,9 +124,8 @@ fn if_alias_emits_runtime_correct_codegen() {
     //    expression is re-evaluated (same shape Angular's own compiler
     //    emits) — `item()` appears on both sides of the ternary chain.
     assert!(
-        out.contains(
-            "\u{0275}\u{0275}conditional(ctx.item() ? "
-        ) && out.contains(", ctx.item() ? ctx.item() : null);"),
+        out.contains("\u{0275}\u{0275}conditional(ctx.item() ? ")
+            && out.contains(", ctx.item() ? ctx.item() : null);"),
         "ɵɵconditional must receive the alias value as its second arg:\n{out}"
     );
 
@@ -141,9 +139,8 @@ fn if_alias_emits_runtime_correct_codegen() {
 
 #[test]
 fn else_if_alias_binds_per_branch_independently() {
-    let compiled =
-        compile_component(ELSE_IF_FIXTURE, &PathBuf::from("x.component.ts"))
-            .expect("component should compile");
+    let compiled = compile_component(ELSE_IF_FIXTURE, &PathBuf::from("x.component.ts"))
+        .expect("component should compile");
     let out = &compiled.source;
 
     assert!(
@@ -168,9 +165,8 @@ fn else_if_alias_binds_per_branch_independently() {
 
 #[test]
 fn nested_scope_reads_outer_if_alias_via_next_context() {
-    let compiled =
-        compile_component(NESTED_FIXTURE, &PathBuf::from("y.component.ts"))
-            .expect("component should compile");
+    let compiled = compile_component(NESTED_FIXTURE, &PathBuf::from("y.component.ts"))
+        .expect("component should compile");
     let out = &compiled.source;
 
     // The @switch case body is nested two levels deep (root → @if → @switch

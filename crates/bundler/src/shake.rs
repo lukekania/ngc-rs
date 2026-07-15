@@ -218,11 +218,7 @@ pub fn analyze_unused_exports(
                 };
                 mark_reachable(&target, &mut reachable, &mut import_queue);
                 for name in imported_names {
-                    if used
-                        .entry(target.clone())
-                        .or_default()
-                        .insert(name.clone())
-                    {
+                    if used.entry(target.clone()).or_default().insert(name.clone()) {
                         use_queue.push((target.clone(), name.clone()));
                     }
                 }
@@ -483,9 +479,8 @@ fn resolve_local_specifier(
     // never reaches `lodash-es/lodash.js` and the whole package is pinned.
     // Cross-chunk bare imports resolve to a path outside `module_paths` and fall
     // through to `None` (handled by the `externally_used` mechanism instead).
-    let is_bare = !specifier.starts_with('.')
-        && !specifier.starts_with('/')
-        && !specifier.starts_with('#');
+    let is_bare =
+        !specifier.starts_with('.') && !specifier.starts_with('/') && !specifier.starts_with('#');
     if is_bare {
         let ctx = subpath_ctx?;
         let resolved = ngc_npm_resolver::resolve::resolve_bare_specifier(
@@ -809,7 +804,9 @@ mod tests {
         .expect("should analyze");
 
         assert!(
-            !result.unused_exports.contains_key(&PathBuf::from("/root/main.ts")),
+            !result
+                .unused_exports
+                .contains_key(&PathBuf::from("/root/main.ts")),
             "entry module exports should never be marked unused"
         );
     }
@@ -843,7 +840,9 @@ mod tests {
         .expect("should analyze");
 
         assert!(
-            !result.unused_exports.contains_key(&PathBuf::from("/root/side.ts")),
+            !result
+                .unused_exports
+                .contains_key(&PathBuf::from("/root/side.ts")),
             "side-effect module should not have unused exports listed"
         );
     }

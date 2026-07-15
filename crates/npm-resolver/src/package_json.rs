@@ -105,7 +105,11 @@ fn glob_matches(glob: &str, path: &str) -> bool {
     let g = glob.strip_prefix("./").unwrap_or(glob);
     // A bare `**/x` or `*.ext` pattern should match at any directory depth.
     if let Some(suffix) = g.strip_prefix("**/") {
-        if path.rsplit('/').next().is_some_and(|base| simple_glob(suffix, base)) {
+        if path
+            .rsplit('/')
+            .next()
+            .is_some_and(|base| simple_glob(suffix, base))
+        {
             return true;
         }
         return simple_glob(suffix, path);

@@ -216,8 +216,7 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
                 // `import().then(m => m.X)` — invisible to static analysis — so
                 // keep all their exports. A shared vendor chunk's entry is just
                 // the first package module; let `externally_used` drive shaking.
-                let seed_entry_exports =
-                    matches!(chunk.kind, ChunkKind::Main | ChunkKind::Lazy);
+                let seed_entry_exports = matches!(chunk.kind, ChunkKind::Main | ChunkKind::Lazy);
                 let shake = shake::analyze_unused_exports(
                     &chunk.modules,
                     &input.modules,

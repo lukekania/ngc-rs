@@ -762,9 +762,7 @@ pub(crate) fn run_build_with_options(
                     for resource in &comp.resource_files {
                         // Canonicalize so the watcher's emitted paths (also
                         // canonicalized at lookup) match across symlinks.
-                        let key = resource
-                            .canonicalize()
-                            .unwrap_or_else(|_| resource.clone());
+                        let key = resource.canonicalize().unwrap_or_else(|_| resource.clone());
                         hmr_resource_to_component.insert(key, comp.id.clone());
                     }
                 }
@@ -855,9 +853,9 @@ pub(crate) fn run_build_with_options(
         .unwrap_or_default();
     let is_external = |spec: &str| -> bool {
         external_specifiers.contains(spec)
-            || external_specifiers.iter().any(|ext| {
-                spec.starts_with(ext.as_str()) && spec[ext.len()..].starts_with('/')
-            })
+            || external_specifiers
+                .iter()
+                .any(|ext| spec.starts_with(ext.as_str()) && spec[ext.len()..].starts_with('/'))
     };
     let mut bare_specifiers: Vec<String> = file_graph
         .npm_import_sites

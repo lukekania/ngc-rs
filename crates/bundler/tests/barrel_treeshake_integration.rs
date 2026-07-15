@@ -181,7 +181,12 @@ fn barrel_pkg_shakes_to_used_export_only() {
     let output = bundle(&input).expect("bundle succeeds");
 
     // The lazy route chunk carries the used method and its helper...
-    let all_code: String = output.chunks.values().cloned().collect::<Vec<_>>().join("\n");
+    let all_code: String = output
+        .chunks
+        .values()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         all_code.contains("function debounce"),
         "used export `debounce` must survive"

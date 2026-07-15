@@ -804,7 +804,8 @@ pub fn compile_component_with_options(
         let id = hmr::component_hmr_id(&style_ctx.project_root, file_path, &extracted.class_name);
         let locals = &extracted.imports_identifiers;
         let update_ts = hmr::build_update_module_ts(&extracted.class_name, &ivy_output, locals);
-        let update_module_source = ngc_ts_transform::transform_source(&update_ts, "ngc-hmr-update.ts")?;
+        let update_module_source =
+            ngc_ts_transform::transform_source(&update_ts, "ngc-hmr-update.ts")?;
         rewritten.push('\n');
         rewritten.push_str(&hmr::build_initializer(&extracted.class_name, &id, locals));
 
@@ -931,7 +932,9 @@ export class XComponent {}
 
         // The rewritten module must add the `i0` namespace import and the
         // appended HMR initializer wired to `import.meta.hot`.
-        assert!(result.source.contains("import * as i0 from '@angular/core';"));
+        assert!(result
+            .source
+            .contains("import * as i0 from '@angular/core';"));
         assert!(result
             .source
             .contains("import.meta.hot.on('angular:component-update'"));
