@@ -36,6 +36,119 @@ pub fn conditions_for_configuration(configuration: Option<&str>) -> &'static [&'
     }
 }
 
+/// Whether a package (given its directory) declares itself free of module-level
+/// side effects, per the `sideEffects` field.
+///
+/// Returns, for the package rooted at `pkg_dir`, a classifier for its files:
+/// - `sideEffects: false` → every file is side-effect-free (`true` for all).
+/// - `sideEffects: [globs]` → a file is side-effect-free *unless* its path
+///   matches one of the globs (matched files are the ones that DO have effects).
+/// - absent / `true` → nothing is guaranteed side-effect-free.
+///
+/// This mirrors how esbuild / webpack treat the field for tree shaking: a
+/// side-effect-free module whose exports are all unused can be dropped whole,
+/// even if it has top-level statements (e.g. lodash-es's `lodash.default.js`
+/// builds its `_` object with hundreds of top-level assignments yet the whole
+/// package is marked `sideEffects: false`).
+pub fn read_side_effects(pkg_dir: &Path) -> SideEffects {
+    let pkg_json_path = pkg_dir.join("package.json");
+    let Ok(content) = std::fs::read_to_string(&pkg_json_path) else {
+        return SideEffects::Unknown;
+    };
+    let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return SideEffects::Unknown;
+    };
+    match pkg.get("sideEffects") {
+        Some(serde_json::Value::Bool(false)) => SideEffects::None,
+        Some(serde_json::Value::Array(globs)) => SideEffects::Only(
+            globs
+                .iter()
+                .filter_map(|g| g.as_str().map(|s| s.to_string()))
+                .collect(),
+        ),
+        _ => SideEffects::Unknown,
+    }
+}
+
+/// Classification of a package's `sideEffects` declaration.
+#[derive(Debug, Clone)]
+pub enum SideEffects {
+    /// No `sideEffects` field, or `sideEffects: true` — assume effects present.
+    Unknown,
+    /// `sideEffects: false` — every file in the package is side-effect-free.
+    None,
+    /// `sideEffects: [globs]` — only files matching a glob have side effects.
+    Only(Vec<String>),
+}
+
+impl SideEffects {
+    /// Whether the file at `path` (inside the package rooted at `pkg_dir`) is
+    /// guaranteed free of module-level side effects.
+    pub fn is_free(&self, pkg_dir: &Path, path: &Path) -> bool {
+        match self {
+            SideEffects::Unknown => false,
+            SideEffects::None => true,
+            SideEffects::Only(globs) => {
+                let rel = path.strip_prefix(pkg_dir).unwrap_or(path);
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                // A file is side-effect-free unless it matches a listed glob.
+                !globs.iter().any(|g| glob_matches(g, &rel_str))
+            }
+        }
+    }
+}
+
+/// Minimal glob matcher for `sideEffects` array entries. Supports a leading
+/// `./`, a `**/` prefix (any directory depth), and `*` (any run of non-slash
+/// characters) — enough for the `"*.css"`, `"./src/**/*.js"` forms packages use.
+fn glob_matches(glob: &str, path: &str) -> bool {
+    let g = glob.strip_prefix("./").unwrap_or(glob);
+    // A bare `**/x` or `*.ext` pattern should match at any directory depth.
+    if let Some(suffix) = g.strip_prefix("**/") {
+        if path.rsplit('/').next().is_some_and(|base| simple_glob(suffix, base)) {
+            return true;
+        }
+        return simple_glob(suffix, path);
+    }
+    if !g.contains('/') {
+        // No directory component: match against the basename at any depth.
+        if let Some(base) = path.rsplit('/').next() {
+            return simple_glob(g, base);
+        }
+    }
+    simple_glob(g, path)
+}
+
+/// Match a single path segment pattern where `*` is any run of non-`/` chars.
+fn simple_glob(pattern: &str, text: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == text;
+    }
+    let mut pos = 0usize;
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if i == 0 {
+            if !text[pos..].starts_with(part) {
+                return false;
+            }
+            pos += part.len();
+        } else if i == parts.len() - 1 {
+            // Final literal must match the end.
+            if !text[pos..].ends_with(part) {
+                return false;
+            }
+        } else if let Some(found) = text[pos..].find(part) {
+            pos += found + part.len();
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
 /// Resolve the ESM entry point for a package given its directory and a subpath.
 ///
 /// Follows the Node.js module resolution algorithm:
@@ -329,6 +442,51 @@ mod tests {
 
     const DEV: &[&str] = DEVELOPMENT_BROWSER_CONDITIONS;
     const PROD: &[&str] = PRODUCTION_BROWSER_CONDITIONS;
+
+    #[test]
+    fn side_effects_false_marks_every_file_free() {
+        let tmp = std::env::temp_dir().join(format!("ngc-se-false-{}", std::process::id()));
+        let pkg_dir = tmp.join("node_modules/lodash-es");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(pkg_dir.join("package.json"), r#"{"sideEffects": false}"#).unwrap();
+        let se = read_side_effects(&pkg_dir);
+        assert!(matches!(se, SideEffects::None));
+        assert!(se.is_free(&pkg_dir, &pkg_dir.join("lodash.default.js")));
+        assert!(se.is_free(&pkg_dir, &pkg_dir.join("debounce.js")));
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn side_effects_absent_or_true_is_unknown() {
+        let tmp = std::env::temp_dir().join(format!("ngc-se-unknown-{}", std::process::id()));
+        let pkg_dir = tmp.join("node_modules/pkg");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(pkg_dir.join("package.json"), r#"{"name": "pkg"}"#).unwrap();
+        let se = read_side_effects(&pkg_dir);
+        assert!(matches!(se, SideEffects::Unknown));
+        assert!(!se.is_free(&pkg_dir, &pkg_dir.join("index.js")));
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn side_effects_glob_array_matches_only_listed_files() {
+        let tmp = std::env::temp_dir().join(format!("ngc-se-glob-{}", std::process::id()));
+        let pkg_dir = tmp.join("node_modules/pkg");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(
+            pkg_dir.join("package.json"),
+            r#"{"sideEffects": ["*.css", "./src/polyfill.js"]}"#,
+        )
+        .unwrap();
+        let se = read_side_effects(&pkg_dir);
+        // Listed files have side effects → NOT free.
+        assert!(!se.is_free(&pkg_dir, &pkg_dir.join("dist/styles.css")));
+        assert!(!se.is_free(&pkg_dir, &pkg_dir.join("src/polyfill.js")));
+        // Everything else is free.
+        assert!(se.is_free(&pkg_dir, &pkg_dir.join("src/index.js")));
+        assert!(se.is_free(&pkg_dir, &pkg_dir.join("debounce.js")));
+        fs::remove_dir_all(&tmp).ok();
+    }
 
     fn create_mock_package(dir: &Path, name: &str, pkg_json: &str, files: &[(&str, &str)]) {
         let pkg_dir = dir.join("node_modules").join(name);

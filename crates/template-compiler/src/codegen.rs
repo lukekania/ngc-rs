@@ -107,6 +107,17 @@ struct IvyCodegen {
     ///      multi-slot projection (`<ng-content select="...">`) is
     ///      not yet implemented.
     has_projection: bool,
+    /// Set once a root-level (depth-0) listener reads a template reference and
+    /// therefore needs `ɵɵrestoreView(_r)` to call `ɵɵreference(slot)`. When
+    /// set, `generate_ivy` prepends `const _r = ɵɵgetCurrentView();` to the
+    /// root template's creation block (matching `ng build`, which captures the
+    /// view at the head of `rf & 1`).
+    root_saved_view_needed: bool,
+    /// `true` while walking an old-style structural-directive (`*ngIf` /
+    /// `*ngFor`) child template. Its listeners run inside a separate template
+    /// function, so they must not be treated as root-level even though they
+    /// carry an empty `scope_stack`.
+    in_child_template: bool,
 }
 
 struct ChildTemplate {
@@ -148,6 +159,8 @@ pub fn generate_ivy(
         namespace_state: Namespace::Html,
         namespace_stack: vec![Namespace::Html],
         has_projection: false,
+        root_saved_view_needed: false,
+        in_child_template: false,
     };
 
     gen.ivy_imports
@@ -165,6 +178,12 @@ pub fn generate_ivy(
     let mut template_body = String::new();
     if !gen.creation.is_empty() {
         template_body.push_str("    if (rf & 1) {\n");
+        // A root-level listener that reads a template reference needs the saved
+        // view restored before `ɵɵreference(slot)`. Capture it once at the head
+        // of the creation block (mirrors `ng build`).
+        if gen.root_saved_view_needed {
+            template_body.push_str("      const _r = \u{0275}\u{0275}getCurrentView();\n");
+        }
         // When the template uses `<ng-content>`, the runtime needs
         // `ɵɵprojectionDef()` to run once at the head of the create
         // block so it can stash the projected children's TNodes onto
@@ -763,6 +782,19 @@ impl IvyCodegen {
                                 "\u{0275}\u{0275}listener('{}', function($event) {{ {listener_preamble}{compiled_handler} }});",
                                 name,
                             ));
+                        } else if let Some(prelude) =
+                            self.root_listener_ref_prelude(&compiled_handler)
+                        {
+                            // Root-level listener (depth 0) reading a template
+                            // reference: it must restore the view and resolve
+                            // the ref via ɵɵreference(slot), just like an
+                            // embedded-view listener. Without this the handler
+                            // sees a bare, undeclared identifier and throws
+                            // `ReferenceError` at runtime.
+                            self.creation.push(format!(
+                                "\u{0275}\u{0275}listener('{}', function($event) {{ {prelude}{compiled_handler} }});",
+                                name,
+                            ));
                         } else {
                             self.creation.push(format!(
                                 "\u{0275}\u{0275}listener('{}', function($event) {{ {compiled_handler} }});",
@@ -1033,6 +1065,49 @@ impl IvyCodegen {
         code
     }
 
+    /// Build the listener-body prelude for a *root-level* listener whose
+    /// handler reads template reference variables: `ɵɵrestoreView(_r); const
+    /// <ref> = ɵɵreference(<slot>); …`. Returns `None` when this is not a
+    /// genuine root listener (we're inside a structural-directive child
+    /// template) or when the handler references no in-scope ref — in which
+    /// case the caller emits a plain listener.
+    ///
+    /// Embedded-view listeners (`@if` / `@for`, `scope_depth() > 0`) are
+    /// handled separately by [`generate_listener_preamble`]; this covers the
+    /// depth-0 case that path skips.
+    fn root_listener_ref_prelude(&mut self, compiled_handler: &str) -> Option<String> {
+        if self.in_child_template || self.template_refs.is_empty() {
+            return None;
+        }
+        let used: Vec<(String, u32)> = self
+            .template_refs
+            .iter()
+            .filter(|(name, _)| identifier_used_in(compiled_handler, name))
+            .map(|(name, slot)| (name.clone(), *slot))
+            .collect();
+        if used.is_empty() {
+            return None;
+        }
+
+        // Capturing the view (`const _r = ɵɵgetCurrentView();`) is deferred to
+        // the root creation block in `generate_ivy`; flag that it's needed.
+        self.root_saved_view_needed = true;
+        self.ivy_imports
+            .insert("\u{0275}\u{0275}getCurrentView".to_string());
+        self.ivy_imports
+            .insert("\u{0275}\u{0275}restoreView".to_string());
+        self.ivy_imports
+            .insert("\u{0275}\u{0275}reference".to_string());
+
+        let mut prelude = String::from("\u{0275}\u{0275}restoreView(_r); ");
+        for (name, slot) in &used {
+            prelude.push_str(&format!(
+                "const {name} = \u{0275}\u{0275}reference({slot}); "
+            ));
+        }
+        Some(prelude)
+    }
+
     /// Desugar a structural directive (*ngIf, *ngFor) to an ng-template wrapper.
     fn generate_structural_directive(&mut self, el: &ElementNode, dir_name: &str, dir_expr: &str) {
         let slot = self.slot_index;
@@ -1131,7 +1206,10 @@ impl IvyCodegen {
         self.pipe_var_offset = 0;
         self.last_update_slot = None;
 
+        let parent_in_child = self.in_child_template;
+        self.in_child_template = true;
         self.generate_element(el);
+        self.in_child_template = parent_in_child;
 
         let decls = self.slot_index;
 
@@ -3266,6 +3344,29 @@ fn collect_ctx_rewrites(
             ctx_inserts.push(id.span.start);
         }
         Expression::CallExpression(call) => {
+            // `$any(expr)` is Angular's compile-time cast: strip the call and
+            // keep only the inner expression (matching `ng build`, which emits
+            // no runtime `ctx.$any(...)` — there is no such member). Only treat
+            // it as a cast when `$any` is not shadowed by a template local.
+            if let Expression::Identifier(id) = &call.callee {
+                if id.name == "$any" && call.arguments.len() == 1 && !is_local("$any") {
+                    if let Some(arg) = call.arguments.first() {
+                        if !matches!(arg, Argument::SpreadElement(_)) {
+                            let inner = arg.to_expression();
+                            remove_ranges.push((call.span.start, inner.span().start));
+                            remove_ranges.push((inner.span().end, call.span.end));
+                            collect_ctx_rewrites(
+                                inner,
+                                ctx_inserts,
+                                remove_ranges,
+                                is_member_property,
+                                locals,
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
             collect_ctx_rewrites(&call.callee, ctx_inserts, remove_ranges, false, locals);
             for arg in &call.arguments {
                 if let Argument::SpreadElement(spread) = arg {
@@ -4385,6 +4486,105 @@ mod tests {
         let output = generate_ivy(&comp, &nodes).expect("should generate");
         assert!(output.ivy_imports.contains("\u{0275}\u{0275}listener"));
         assert!(output.static_fields[0].contains("listener"));
+    }
+
+    #[test]
+    fn test_any_cast_is_stripped() {
+        // `$any(...)` is Angular's compile-time cast — it must be removed, not
+        // emitted as a runtime `ctx.$any(...)` member call.
+        assert_eq!(ctx_expr("$any(x).y"), "ctx.x.y");
+        assert_eq!(
+            ctx_expr("onAny($any($event.target).value)"),
+            "ctx.onAny($event.target.value)"
+        );
+        // Nested / standalone forms.
+        assert_eq!(ctx_expr("$any(value)"), "ctx.value");
+        assert!(!ctx_expr("$any(a) + $any(b)").contains("$any"));
+    }
+
+    #[test]
+    fn test_any_cast_not_stripped_when_shadowed_by_local() {
+        // If a template local named `$any` is in scope it is a real call, not
+        // the cast keyword — leave it intact (and unprefixed).
+        let mut locals = BTreeSet::new();
+        locals.insert("$any".to_string());
+        assert_eq!(ctx_expr_with_locals("$any(x)", &locals), "$any(ctx.x)");
+    }
+
+    #[test]
+    fn test_root_listener_reads_template_ref_via_reference() {
+        // `<input #box (input)="onRef(box.value)">` at the root level: the
+        // generated listener must restore the view and declare
+        // `const box = ɵɵreference(slot)` so `box` resolves at runtime.
+        let comp = test_component();
+        let nodes = vec![TemplateNode::Element(ElementNode {
+            tag: "input".to_string(),
+            attributes: vec![
+                TemplateAttribute::Reference {
+                    name: "box".to_string(),
+                    export_as: None,
+                },
+                TemplateAttribute::Event {
+                    name: "input".to_string(),
+                    handler: "onRef(box.value)".to_string(),
+                },
+            ],
+            children: vec![],
+            is_void: true,
+        })];
+        let output = generate_ivy(&comp, &nodes).expect("should generate");
+        let dc = &output.static_fields[0];
+        assert!(
+            dc.contains("const _r = \u{0275}\u{0275}getCurrentView();"),
+            "root creation block must capture the view: {dc}"
+        );
+        assert!(
+            dc.contains("\u{0275}\u{0275}restoreView(_r);"),
+            "listener must restore the view before ɵɵreference: {dc}"
+        );
+        assert!(
+            dc.contains("const box = \u{0275}\u{0275}reference("),
+            "listener must declare the ref via ɵɵreference(slot): {dc}"
+        );
+        assert!(
+            !dc.contains("ctx.box"),
+            "the ref name must not be prefixed with ctx.: {dc}"
+        );
+        for sym in ["getCurrentView", "restoreView", "reference"] {
+            assert!(
+                output.ivy_imports.contains(&format!("\u{0275}\u{0275}{sym}")),
+                "ivy_imports must include ɵɵ{sym}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_root_listener_without_ref_stays_plain() {
+        // A root listener that reads no ref must NOT gain a restoreView prelude.
+        let comp = test_component();
+        let nodes = vec![TemplateNode::Element(ElementNode {
+            tag: "input".to_string(),
+            attributes: vec![TemplateAttribute::Event {
+                name: "input".to_string(),
+                handler: "onAny($any($event.target).value)".to_string(),
+            }],
+            children: vec![],
+            is_void: true,
+        })];
+        let output = generate_ivy(&comp, &nodes).expect("should generate");
+        let dc = &output.static_fields[0];
+        assert!(
+            !dc.contains("restoreView"),
+            "ref-free listener must not restore the view: {dc}"
+        );
+        assert!(
+            !dc.contains("getCurrentView"),
+            "ref-free template must not capture the view: {dc}"
+        );
+        assert!(
+            dc.contains("ctx.onAny($event.target.value)"),
+            "$any must be stripped in the listener body: {dc}"
+        );
     }
 
     #[test]

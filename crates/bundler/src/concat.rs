@@ -210,18 +210,26 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
         .par_iter()
         .enumerate()
         .map(|(idx, chunk)| -> NgcResult<(String, ChunkBundleResult)> {
-            let unused_exports = if input.options.tree_shake {
+            let (unused_exports, dead_modules) = if input.options.tree_shake {
                 let externally_used_ref = externally_used_per_chunk.get(idx);
-                shake::analyze_unused_exports(
+                // Main/lazy chunk entries are consumed via bootstrap or dynamic
+                // `import().then(m => m.X)` — invisible to static analysis — so
+                // keep all their exports. A shared vendor chunk's entry is just
+                // the first package module; let `externally_used` drive shaking.
+                let seed_entry_exports =
+                    matches!(chunk.kind, ChunkKind::Main | ChunkKind::Lazy);
+                let shake = shake::analyze_unused_exports(
                     &chunk.modules,
                     &input.modules,
                     &chunk.entry,
                     &prefix_refs,
                     externally_used_ref,
+                    seed_entry_exports,
                     subpath_ctx,
-                )?
+                )?;
+                (shake.unused_exports, shake.dead_modules)
             } else {
-                HashMap::new()
+                (HashMap::new(), HashSet::new())
             };
 
             let chunk_module_set: HashSet<PathBuf> = chunk.modules.iter().cloned().collect();
@@ -234,6 +242,7 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
                 per_module_maps: &input.per_module_maps,
                 generate_source_maps: input.options.source_maps,
                 unused_exports: &unused_exports,
+                dead_modules: &dead_modules,
                 bundled_specifiers: &input.bundled_specifiers,
                 external_specifiers: &input.external_specifiers,
                 chunk_entry: &chunk.entry,
@@ -557,6 +566,11 @@ struct ChunkBundleParams<'a> {
     per_module_maps: &'a HashMap<PathBuf, SourceMap>,
     generate_source_maps: bool,
     unused_exports: &'a HashMap<PathBuf, HashSet<String>>,
+    /// Modules the shaker proved unreachable. ngc-rs drops these from the chunk
+    /// entirely, but only when they are npm modules — project modules keep the
+    /// conservative behaviour to stay clear of framework-magic reachability the
+    /// static analysis can't see.
+    dead_modules: &'a HashSet<PathBuf>,
     bundled_specifiers: &'a HashSet<String>,
     /// Specifiers declared external via `externalDependencies` in
     /// `angular.json`. Imports matching these stay as bare specifiers.
@@ -651,6 +665,14 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<ChunkBundleResult> {
 
                 let is_npm = file_to_namespace.contains_key(module_path);
                 let file_name = module_path.to_string_lossy();
+
+                // Whole-module dead-code elimination: an unreachable npm module
+                // (e.g. a barrel package's unused sibling re-exports) contributes
+                // nothing live to the chunk, so drop it. Restricted to npm
+                // modules; project modules keep the conservative path.
+                if is_npm && p.dead_modules.contains(module_path) {
+                    return Ok((None, Vec::new()));
+                }
 
                 if is_npm {
                     // NPM module: wrap in IIFE with namespace isolation.

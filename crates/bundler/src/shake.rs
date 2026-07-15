@@ -27,41 +27,84 @@ pub struct SubpathImportContext<'a> {
     pub export_conditions: &'a [&'a str],
 }
 
+/// A re-export edge: `export { <local> as <exported> } from '<source>'`.
+///
+/// Unlike a plain import, a re-export only *consumes* `source`'s `local`
+/// binding when some other module actually imports this module's `exported`
+/// name. Tracking the edge (rather than eagerly marking `source` used) is what
+/// lets a barrel package like `lodash-es` tree-shake: importing `{ debounce }`
+/// keeps `debounce.js` while every sibling re-export stays dead.
+#[derive(Clone)]
+struct ReExport {
+    source: String,
+    local: String,
+    exported: String,
+}
+
 /// Information about a module's exports and imports for tree shaking analysis.
 struct ModuleInfo {
     /// Names exported by this module.
     exported_names: HashSet<String>,
     /// Names imported from local modules: maps source specifier -> set of imported names.
     local_imports: HashMap<String, HashSet<String>>,
+    /// Re-export edges (`export { x as y } from './z'`), tracked separately so
+    /// usage propagates only for the re-exported names a consumer reaches.
+    reexports: Vec<ReExport>,
     /// Whether this module has top-level side effects (expression statements, etc.).
     has_side_effects: bool,
 }
 
-/// Analyze export usage across modules in a chunk and return unused exports per module.
+/// Result of per-chunk tree-shake analysis.
+pub struct ChunkShake {
+    /// Map from module path to the set of export names that nothing reachable
+    /// in the chunk consumes. The caller trims these export bridges/declarations.
+    pub unused_exports: HashMap<PathBuf, HashSet<String>>,
+    /// Modules that are unreachable from the chunk's live roots and carry no
+    /// side effects — their whole body can be dropped from the chunk. The
+    /// caller decides which of these are safe to elide (ngc-rs limits this to
+    /// npm modules). Never includes the entry or any side-effectful module.
+    pub dead_modules: HashSet<PathBuf>,
+}
+
+/// Analyze export usage across modules in a chunk via reachability.
 ///
-/// Returns a map from module path to the set of export names that are never imported
-/// by any other module in the chunk. The entry module's exports are always considered used.
+/// Starting from the chunk's live roots — the entry module's exports, any
+/// `externally_used` names (consumed cross-chunk), and every side-effectful
+/// module — this walks import and re-export edges to the fixpoint of reachable
+/// `(module, export)` pairs. Anything not reached is unused; a module reached
+/// by nothing is dead and can be dropped whole.
 ///
-/// Modules with no used exports, no side effects, and that are not the entry point
-/// are indicated by having ALL their exports listed as unused — the caller can
-/// choose to drop them entirely.
+/// Reachability (rather than the older "imported by any module in the chunk")
+/// is what lets a barrel package tree-shake: `lodash-es`' `lodash.default.js`
+/// imports every method, but it is only reached through the barrel's `default`
+/// re-export — which no consumer imports — so it and its transitive imports
+/// stay dead while `import { debounce }` keeps just `debounce.js` and its deps.
 ///
-/// `externally_used` optionally carries a flat set of names that must be preserved
-/// across every module in the chunk regardless of intra-chunk usage. Callers pass
-/// this for the main chunk to reflect symbols consumed cross-chunk by lazy chunks
-/// — such consumption is invisible to the per-chunk analysis below and would
-/// otherwise leave dangling names in the bundler's final `export { ... }` block.
+/// `externally_used` optionally carries a flat set of names that must be
+/// preserved across every module in the chunk regardless of intra-chunk usage.
+/// Callers pass this for the main chunk to reflect symbols consumed cross-chunk
+/// by lazy chunks — such consumption is invisible to the per-chunk analysis and
+/// would otherwise leave dangling names in the final `export { ... }` block.
+///
+/// `seed_entry_exports` controls whether *all* of the entry module's exports
+/// are treated as roots. Main/lazy chunks set this: their entry is consumed via
+/// bootstrap or `import('./route').then(m => m.X)` — a dynamic property access
+/// the static graph can't see, so every entry export must survive. Shared
+/// vendor chunks set it `false`: their "entry" is merely the lexicographically
+/// first package module, so seeding its exports would pin the whole package;
+/// `externally_used` is the real consumption signal there.
 pub fn analyze_unused_exports(
     module_paths: &[PathBuf],
     all_code: &HashMap<PathBuf, String>,
     entry: &PathBuf,
     local_prefixes: &[&str],
     externally_used: Option<&HashSet<String>>,
+    seed_entry_exports: bool,
     subpath_ctx: Option<SubpathImportContext<'_>>,
-) -> NgcResult<HashMap<PathBuf, HashSet<String>>> {
+) -> NgcResult<ChunkShake> {
     // Step 1: Parse each module in parallel and collect export/import info.
     // `analyze_module` only reads its inputs, so per-module work is independent.
-    let module_infos: HashMap<PathBuf, ModuleInfo> = module_paths
+    let mut module_infos: HashMap<PathBuf, ModuleInfo> = module_paths
         .par_iter()
         .filter_map(|path| all_code.get(path).map(|code| (path, code)))
         .map(|(path, code)| -> NgcResult<(PathBuf, ModuleInfo)> {
@@ -70,67 +113,174 @@ pub fn analyze_unused_exports(
         })
         .collect::<NgcResult<HashMap<_, _>>>()?;
 
-    // Step 2: Build usage map — which exports are actually referenced
-    let mut used_exports: HashMap<PathBuf, HashSet<String>> = HashMap::new();
-
-    // Entry module exports are always considered used
-    if let Some(info) = module_infos.get(entry) {
-        used_exports
-            .entry(entry.clone())
-            .or_default()
-            .extend(info.exported_names.iter().cloned());
+    // Honour each npm package's `sideEffects` field. A file inside a package
+    // marked `sideEffects: false` (or not matched by a `sideEffects` glob) is
+    // guaranteed free of module-level effects, so it may be dropped whole when
+    // none of its exports are reached — even if it has top-level statements.
+    // Without this, barrels like lodash-es's `lodash.default.js` (hundreds of
+    // top-level `_.x = ...` assignments) are pinned as side-effectful and drag
+    // the entire package into the chunk.
+    let mut side_effects_cache: HashMap<PathBuf, ngc_npm_resolver::package_json::SideEffects> =
+        HashMap::new();
+    for (path, info) in module_infos.iter_mut() {
+        if !info.has_side_effects {
+            continue;
+        }
+        let Some(pkg_root) = npm_package_root(path) else {
+            continue;
+        };
+        let classifier = side_effects_cache
+            .entry(pkg_root.clone())
+            .or_insert_with(|| ngc_npm_resolver::package_json::read_side_effects(&pkg_root));
+        if classifier.is_free(&pkg_root, path) {
+            info.has_side_effects = false;
+        }
     }
 
-    // For each module, check what it imports from other local modules
-    for (importer_path, info) in &module_infos {
-        for (specifier, imported_names) in &info.local_imports {
-            // Resolve specifier to a module path
-            if let Some(target_path) = resolve_local_specifier(
-                specifier,
-                importer_path,
-                module_paths,
-                local_prefixes,
-                subpath_ctx,
-            ) {
-                debug!(
-                    importer = %importer_path.display(),
-                    specifier = specifier,
-                    target = %target_path.display(),
-                    names = ?imported_names,
-                    "tree shake: resolved import"
-                );
-                used_exports
-                    .entry(target_path)
-                    .or_default()
-                    .extend(imported_names.iter().cloned());
+    // Resolve a specifier appearing in `from_module` to a chunk module path.
+    let resolve = |specifier: &str, from_module: &Path| -> Option<PathBuf> {
+        resolve_local_specifier(
+            specifier,
+            from_module,
+            module_paths,
+            local_prefixes,
+            subpath_ctx,
+        )
+    };
+
+    // Step 2: Reachability fixpoint over (module, export-name) pairs.
+    //
+    // `used[m]` accumulates the export names of `m` that are reached.
+    // `reachable` holds modules whose body must be kept (any used export, a
+    // side effect, or the entry). A worklist drives propagation: when a module
+    // first becomes reachable we mark all its direct imports used (and their
+    // targets reachable); when an export name becomes used we pass it through
+    // any matching re-export edge to the upstream module.
+    let mut used: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+    let mut reachable: HashSet<PathBuf> = HashSet::new();
+    // Modules whose direct imports still need to be propagated.
+    let mut import_queue: Vec<PathBuf> = Vec::new();
+    // (module, name) uses whose re-export pass-through still needs propagating.
+    let mut use_queue: Vec<(PathBuf, String)> = Vec::new();
+
+    let mark_reachable =
+        |module: &PathBuf, reachable: &mut HashSet<PathBuf>, import_queue: &mut Vec<PathBuf>| {
+            if reachable.insert(module.clone()) {
+                import_queue.push(module.clone());
+            }
+        };
+
+    // Seed: the entry is always reachable (its body and imports are kept).
+    // Whether its *exports* are all roots depends on the chunk kind.
+    if module_infos.contains_key(entry) {
+        mark_reachable(entry, &mut reachable, &mut import_queue);
+        if seed_entry_exports {
+            if let Some(info) = module_infos.get(entry) {
+                for name in &info.exported_names {
+                    if used.entry(entry.clone()).or_default().insert(name.clone()) {
+                        use_queue.push((entry.clone(), name.clone()));
+                    }
+                }
+            }
+        }
+    }
+    // Seed: side-effectful modules are kept (their top-level effects must run);
+    // and externally-used exports are roots.
+    for (module_path, info) in &module_infos {
+        if info.has_side_effects {
+            mark_reachable(module_path, &mut reachable, &mut import_queue);
+        }
+        if let Some(ext) = externally_used {
+            for name in &info.exported_names {
+                if ext.contains(name)
+                    && used
+                        .entry(module_path.clone())
+                        .or_default()
+                        .insert(name.clone())
+                {
+                    mark_reachable(module_path, &mut reachable, &mut import_queue);
+                    use_queue.push((module_path.clone(), name.clone()));
+                }
             }
         }
     }
 
-    // Step 3: Compute unused exports
+    // Drain both worklists to a fixpoint.
+    while !import_queue.is_empty() || !use_queue.is_empty() {
+        while let Some(module_path) = import_queue.pop() {
+            let Some(info) = module_infos.get(&module_path) else {
+                continue;
+            };
+            // A reachable module pulls in every name it directly imports.
+            for (specifier, imported_names) in &info.local_imports {
+                let Some(target) = resolve(specifier, &module_path) else {
+                    continue;
+                };
+                mark_reachable(&target, &mut reachable, &mut import_queue);
+                for name in imported_names {
+                    if used
+                        .entry(target.clone())
+                        .or_default()
+                        .insert(name.clone())
+                    {
+                        use_queue.push((target.clone(), name.clone()));
+                    }
+                }
+            }
+        }
+        while let Some((module_path, name)) = use_queue.pop() {
+            let Some(info) = module_infos.get(&module_path) else {
+                continue;
+            };
+            // Pass the use through any re-export edge for this name.
+            for re in &info.reexports {
+                if re.exported != name {
+                    continue;
+                }
+                let Some(target) = resolve(&re.source, &module_path) else {
+                    continue;
+                };
+                mark_reachable(&target, &mut reachable, &mut import_queue);
+                if used
+                    .entry(target.clone())
+                    .or_default()
+                    .insert(re.local.clone())
+                {
+                    use_queue.push((target.clone(), re.local.clone()));
+                }
+            }
+        }
+    }
+
+    // Step 3: Derive unused exports and dead modules from the reachable set.
     let mut unused: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+    let mut dead_modules: HashSet<PathBuf> = HashSet::new();
 
     for (module_path, info) in &module_infos {
-        // Skip entry module — its exports are always kept
-        if module_path == entry {
+        if module_path == entry || info.has_side_effects {
+            // Entry and side-effectful modules are kept verbatim.
             continue;
         }
 
-        // Skip modules with side effects — they must be kept
-        if info.has_side_effects {
-            continue;
-        }
-
-        let used = used_exports.get(module_path);
-        let mut unused_names = HashSet::new();
-
-        for name in &info.exported_names {
-            let is_used = used.is_some_and(|u| u.contains(name));
-            let is_externally_used = externally_used.is_some_and(|set| set.contains(name));
-            if !is_used && !is_externally_used {
-                unused_names.insert(name.clone());
+        if !reachable.contains(module_path) {
+            // Nothing reaches this module: drop its whole body.
+            debug!(module = %module_path.display(), "tree shake: dead module");
+            dead_modules.insert(module_path.clone());
+            // Also report every export as unused so any consumer-side bridge
+            // referencing it is trimmed (defence in depth; there should be none).
+            if !info.exported_names.is_empty() {
+                unused.insert(module_path.clone(), info.exported_names.clone());
             }
+            continue;
         }
+
+        let used_here = used.get(module_path);
+        let unused_names: HashSet<String> = info
+            .exported_names
+            .iter()
+            .filter(|name| !used_here.is_some_and(|u| u.contains(*name)))
+            .cloned()
+            .collect();
 
         if !unused_names.is_empty() {
             debug!(
@@ -142,7 +292,10 @@ pub fn analyze_unused_exports(
         }
     }
 
-    Ok(unused)
+    Ok(ChunkShake {
+        unused_exports: unused,
+        dead_modules,
+    })
 }
 
 /// Parse a module and extract export/import information for tree shaking.
@@ -158,6 +311,7 @@ fn analyze_module(code: &str, path: &Path) -> NgcResult<ModuleInfo> {
 
     let mut exported_names = HashSet::new();
     let mut local_imports: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut reexports: Vec<ReExport> = Vec::new();
     let mut has_side_effects = false;
 
     for stmt in &parsed.program.body {
@@ -194,8 +348,20 @@ fn analyze_module(code: &str, path: &Path) -> NgcResult<ModuleInfo> {
                     if let Some(decl) = &export.declaration {
                         collect_declaration_names(decl, &mut exported_names);
                     }
+                    let source = export.source.as_ref().map(|s| s.value.to_string());
                     for spec in &export.specifiers {
-                        exported_names.insert(spec.exported.name().to_string());
+                        let exported = spec.exported.name().to_string();
+                        exported_names.insert(exported.clone());
+                        // `export { x as y } from './z'` is a re-export edge, not
+                        // a local binding. Record it so reachability can pass the
+                        // use of `y` through to `./z`'s `x` only when reached.
+                        if let Some(src) = &source {
+                            reexports.push(ReExport {
+                                source: src.clone(),
+                                local: spec.local.name().to_string(),
+                                exported,
+                            });
+                        }
                     }
                 }
                 ModuleDeclaration::ExportDefaultDeclaration(export) => {
@@ -226,6 +392,7 @@ fn analyze_module(code: &str, path: &Path) -> NgcResult<ModuleInfo> {
     Ok(ModuleInfo {
         exported_names,
         local_imports,
+        reexports,
         has_side_effects,
     })
 }
@@ -254,6 +421,33 @@ fn collect_declaration_names(decl: &oxc_ast::ast::Declaration, names: &mut HashS
     }
 }
 
+/// Given a path inside `node_modules`, return the package's root directory
+/// (`.../node_modules/<pkg>` or `.../node_modules/@scope/<pkg>`). Returns
+/// `None` for paths that aren't inside a `node_modules` tree.
+fn npm_package_root(path: &Path) -> Option<PathBuf> {
+    let components: Vec<_> = path.components().collect();
+    // Find the last `node_modules` segment (handles nested node_modules).
+    let nm_idx = components
+        .iter()
+        .rposition(|c| c.as_os_str() == "node_modules")?;
+    let first = components.get(nm_idx + 1)?;
+    // Scoped packages span two segments: `@scope/name`.
+    let take = if first.as_os_str().to_string_lossy().starts_with('@') {
+        2
+    } else {
+        1
+    };
+    let end = nm_idx + 1 + take;
+    if components.len() < end {
+        return None;
+    }
+    let mut root = PathBuf::new();
+    for c in &components[..end] {
+        root.push(c.as_os_str());
+    }
+    Some(root)
+}
+
 /// Try to resolve a local import specifier to a module path.
 ///
 /// This is a best-effort resolution — it checks if the specifier starts with
@@ -275,6 +469,27 @@ fn resolve_local_specifier(
         let resolved = ngc_npm_resolver::resolve::resolve_subpath_import(
             specifier,
             Some(importer),
+            ctx.root_dir,
+            ctx.export_conditions,
+        )
+        .ok()?;
+        let canonical = resolved.canonicalize().unwrap_or(resolved);
+        return module_paths.iter().find(|p| **p == canonical).cloned();
+    }
+
+    // Bare npm specifier (e.g. `lodash-es`, `@angular/core`, `lodash-es/debounce`).
+    // Resolve it through node_modules so reachability can follow a chunk-local
+    // barrel re-export edge — without this, `import { debounce } from 'lodash-es'`
+    // never reaches `lodash-es/lodash.js` and the whole package is pinned.
+    // Cross-chunk bare imports resolve to a path outside `module_paths` and fall
+    // through to `None` (handled by the `externally_used` mechanism instead).
+    let is_bare = !specifier.starts_with('.')
+        && !specifier.starts_with('/')
+        && !specifier.starts_with('#');
+    if is_bare {
+        let ctx = subpath_ctx?;
+        let resolved = ngc_npm_resolver::resolve::resolve_bare_specifier(
+            specifier,
             ctx.root_dir,
             ctx.export_conditions,
         )
@@ -555,11 +770,12 @@ mod tests {
             &PathBuf::from("/root/main.js"),
             &["."],
             None,
+            true,
             None,
         )
         .expect("should analyze");
 
-        let utils_unused = result.get(&PathBuf::from("/root/utils.js"));
+        let utils_unused = result.unused_exports.get(&PathBuf::from("/root/utils.js"));
         assert!(utils_unused.is_some(), "utils should have unused exports");
         assert!(
             utils_unused.expect("checked").contains("unused"),
@@ -587,12 +803,13 @@ mod tests {
             &PathBuf::from("/root/main.ts"),
             &["."],
             None,
+            true,
             None,
         )
         .expect("should analyze");
 
         assert!(
-            !result.contains_key(&PathBuf::from("/root/main.ts")),
+            !result.unused_exports.contains_key(&PathBuf::from("/root/main.ts")),
             "entry module exports should never be marked unused"
         );
     }
@@ -620,12 +837,13 @@ mod tests {
             &PathBuf::from("/root/main.ts"),
             &["."],
             None,
+            true,
             None,
         )
         .expect("should analyze");
 
         assert!(
-            !result.contains_key(&PathBuf::from("/root/side.ts")),
+            !result.unused_exports.contains_key(&PathBuf::from("/root/side.ts")),
             "side-effect module should not have unused exports listed"
         );
     }
@@ -659,15 +877,96 @@ mod tests {
             &PathBuf::from("/root/main.js"),
             &["."],
             Some(&externally_used),
+            false,
             None,
         )
         .expect("should analyze");
 
-        let svc_unused = result.get(&PathBuf::from("/root/svc.js"));
+        let svc_unused = result.unused_exports.get(&PathBuf::from("/root/svc.js"));
         assert!(
             svc_unused.is_none() || !svc_unused.expect("checked").contains("AnalyticsService"),
             "externally-used export must not be flagged unused"
         );
+    }
+
+    #[test]
+    fn test_barrel_reexport_shakes_to_used_method() {
+        // Miniature of the lodash-es shape: a barrel re-exports two leaf
+        // methods plus a `default` aggregator that imports every method. The
+        // consumer imports only `debounce`. Reachability must keep the barrel,
+        // `debounce`, and `debounce`'s transitive dep, while dropping the unused
+        // `throttle` leaf and the aggregator (reached only via the unused
+        // `default` re-export) — even though the aggregator imports `throttle`.
+        let mut modules: HashMap<PathBuf, String> = HashMap::new();
+        modules.insert(
+            PathBuf::from("/lib/main.js"),
+            "import { debounce } from './barrel.js';\ndebounce();\n".into(),
+        );
+        modules.insert(
+            PathBuf::from("/lib/barrel.js"),
+            "export { default as debounce } from './debounce.js';\n\
+             export { default as throttle } from './throttle.js';\n\
+             export { default } from './agg.js';\n"
+                .into(),
+        );
+        modules.insert(
+            PathBuf::from("/lib/debounce.js"),
+            "import helper from './helper.js';\nfunction debounce(){return helper();}\nexport default debounce;\n".into(),
+        );
+        modules.insert(
+            PathBuf::from("/lib/throttle.js"),
+            "function throttle(){}\nexport default throttle;\n".into(),
+        );
+        modules.insert(
+            PathBuf::from("/lib/agg.js"),
+            "import debounce from './debounce.js';\nimport throttle from './throttle.js';\nexport default { debounce, throttle };\n".into(),
+        );
+        modules.insert(
+            PathBuf::from("/lib/helper.js"),
+            "function helper(){}\nexport default helper;\n".into(),
+        );
+
+        let paths: Vec<PathBuf> = modules.keys().cloned().collect();
+        let result = analyze_unused_exports(
+            &paths,
+            &modules,
+            &PathBuf::from("/lib/main.js"),
+            &["."],
+            None,
+            true,
+            None,
+        )
+        .expect("should analyze");
+
+        let dead = &result.dead_modules;
+        assert!(
+            dead.contains(&PathBuf::from("/lib/throttle.js")),
+            "unused leaf throttle.js must be dead: {dead:?}"
+        );
+        assert!(
+            dead.contains(&PathBuf::from("/lib/agg.js")),
+            "aggregator reached only via unused `default` re-export must be dead: {dead:?}"
+        );
+        assert!(
+            !dead.contains(&PathBuf::from("/lib/debounce.js")),
+            "used method debounce.js must be kept"
+        );
+        assert!(
+            !dead.contains(&PathBuf::from("/lib/helper.js")),
+            "debounce's transitive dep helper.js must be kept"
+        );
+        assert!(
+            !dead.contains(&PathBuf::from("/lib/barrel.js")),
+            "barrel.js is the resolution entry for the import and must be kept"
+        );
+        // The barrel keeps only the `debounce` bridge; throttle/default are unused.
+        let barrel_unused = result
+            .unused_exports
+            .get(&PathBuf::from("/lib/barrel.js"))
+            .expect("barrel should have unused re-exports");
+        assert!(barrel_unused.contains("throttle"));
+        assert!(barrel_unused.contains("default"));
+        assert!(!barrel_unused.contains("debounce"));
     }
 
     #[test]
