@@ -66,6 +66,15 @@ pub struct BundleInput {
     /// Bare specifiers that have been resolved and included in the graph.
     /// The rewriter treats imports of these specifiers as local (strips them).
     pub bundled_specifiers: HashSet<String>,
+    /// Bare specifiers declared as external (`externalDependencies` in
+    /// `angular.json`). Imports of these specifiers — or of subpaths of
+    /// them, e.g. `jquery/dist/jquery.slim` — stay as bare ESM specifiers
+    /// in the emitted bundle, with no namespace rewrite and no inlining.
+    /// This list is enforced *in addition to* the absence of an entry in
+    /// `bundled_specifiers`: if a specifier appears in `external_specifiers`,
+    /// it is always treated as external, even if some upstream pass leaked
+    /// it into `bundled_specifiers`.
+    pub external_specifiers: HashSet<String>,
     /// Active `exports` conditions (e.g. `browser`, `import`, `production`).
     /// Forwarded to the npm resolver when re-resolving specifiers during
     /// bundling so the same branch of conditional exports selected during
@@ -154,24 +163,40 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
         .map(|c| c.filename.clone())
         .collect();
 
-    // Lazy chunks consume symbols from main cross-chunk; those consumptions
-    // are invisible to the per-chunk shake analysis. Precompute the union
-    // before fan-out so the main chunk's analyze_unused_exports preserves
-    // them.
-    let externally_used: Option<HashSet<String>> = if input.options.tree_shake {
-        let mut lazy_consumers: Vec<PathBuf> = Vec::new();
-        for chunk in &chunk_graph.chunks[1..] {
-            lazy_consumers.extend(chunk.modules.iter().cloned());
+    // Every chunk consumes symbols from other chunks (main from lazy, lazy
+    // from main, lazy from vendor, ...) — those consumptions are invisible
+    // to per-chunk shake analysis. Precompute the per-provider used-name
+    // set before fan-out so each chunk's analyze_unused_exports preserves
+    // exactly what its consumers reach into.
+    //
+    // For bare npm specifiers (e.g. `'@angular/core'`), build a
+    // specifier → canonical-entry-path map by composing the bare-spec →
+    // namespace and namespace → owning-path lookups we already computed.
+    // Without this, the shake walker can't attribute an `import { X } from
+    // '@angular/core'` to its vendor chunk and the chunk falls back to
+    // pinning every export the package declares.
+    let externally_used_per_chunk: Vec<HashSet<String>> = if input.options.tree_shake {
+        let mut ns_to_path: HashMap<&str, &PathBuf> = HashMap::new();
+        for (path, ns) in &all_file_to_ns {
+            ns_to_path.insert(ns.as_str(), path);
         }
-        Some(shake::collect_cross_chunk_used_names(
-            &lazy_consumers,
-            &main_chunk.modules,
+        let specifier_to_path: HashMap<String, PathBuf> = specifier_to_namespace
+            .iter()
+            .filter_map(|(spec, ns)| {
+                ns_to_path
+                    .get(ns.as_str())
+                    .map(|path| (spec.clone(), (*path).clone()))
+            })
+            .collect();
+        shake::collect_cross_chunk_used_names_per_provider(
+            &chunk_graph,
             &input.modules,
             &prefix_refs,
+            &specifier_to_path,
             subpath_ctx,
-        )?)
+        )?
     } else {
-        None
+        vec![HashSet::new(); chunk_graph.chunks.len()]
     };
 
     // Process every chunk (main + lazy/shared) in a single rayon fan-out.
@@ -185,23 +210,25 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
         .par_iter()
         .enumerate()
         .map(|(idx, chunk)| -> NgcResult<(String, ChunkBundleResult)> {
-            let is_main = idx == 0;
-            let unused_exports = if input.options.tree_shake {
-                let externally_used_ref = if is_main {
-                    externally_used.as_ref()
-                } else {
-                    None
-                };
-                shake::analyze_unused_exports(
+            let (unused_exports, dead_modules) = if input.options.tree_shake {
+                let externally_used_ref = externally_used_per_chunk.get(idx);
+                // Main/lazy chunk entries are consumed via bootstrap or dynamic
+                // `import().then(m => m.X)` — invisible to static analysis — so
+                // keep all their exports. A shared vendor chunk's entry is just
+                // the first package module; let `externally_used` drive shaking.
+                let seed_entry_exports = matches!(chunk.kind, ChunkKind::Main | ChunkKind::Lazy);
+                let shake = shake::analyze_unused_exports(
                     &chunk.modules,
                     &input.modules,
                     &chunk.entry,
                     &prefix_refs,
                     externally_used_ref,
+                    seed_entry_exports,
                     subpath_ctx,
-                )?
+                )?;
+                (shake.unused_exports, shake.dead_modules)
             } else {
-                HashMap::new()
+                (HashMap::new(), HashSet::new())
             };
 
             let chunk_module_set: HashSet<PathBuf> = chunk.modules.iter().cloned().collect();
@@ -214,7 +241,9 @@ pub fn bundle(input: &BundleInput) -> NgcResult<BundleOutput> {
                 per_module_maps: &input.per_module_maps,
                 generate_source_maps: input.options.source_maps,
                 unused_exports: &unused_exports,
+                dead_modules: &dead_modules,
                 bundled_specifiers: &input.bundled_specifiers,
+                external_specifiers: &input.external_specifiers,
                 chunk_entry: &chunk.entry,
                 chunk_kind: &chunk.kind,
                 chunk_module_set: &chunk_module_set,
@@ -536,7 +565,15 @@ struct ChunkBundleParams<'a> {
     per_module_maps: &'a HashMap<PathBuf, SourceMap>,
     generate_source_maps: bool,
     unused_exports: &'a HashMap<PathBuf, HashSet<String>>,
+    /// Modules the shaker proved unreachable. ngc-rs drops these from the chunk
+    /// entirely, but only when they are npm modules — project modules keep the
+    /// conservative behaviour to stay clear of framework-magic reachability the
+    /// static analysis can't see.
+    dead_modules: &'a HashSet<PathBuf>,
     bundled_specifiers: &'a HashSet<String>,
+    /// Specifiers declared external via `externalDependencies` in
+    /// `angular.json`. Imports matching these stay as bare specifiers.
+    external_specifiers: &'a HashSet<String>,
     /// The chunk's entry module — exports from this module are preserved.
     chunk_entry: &'a Path,
     /// The kind of chunk being bundled (Main, Lazy, or Shared).
@@ -628,6 +665,14 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<ChunkBundleResult> {
                 let is_npm = file_to_namespace.contains_key(module_path);
                 let file_name = module_path.to_string_lossy();
 
+                // Whole-module dead-code elimination: an unreachable npm module
+                // (e.g. a barrel package's unused sibling re-exports) contributes
+                // nothing live to the chunk, so drop it. Restricted to npm
+                // modules; project modules keep the conservative path.
+                if is_npm && p.dead_modules.contains(module_path) {
+                    return Ok((None, Vec::new()));
+                }
+
                 if is_npm {
                     // NPM module: wrap in IIFE with namespace isolation.
                     // The wrap closure resolves to canonical `__ns_*` names
@@ -635,10 +680,12 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<ChunkBundleResult> {
                     // or another — cross-chunk refs become imports at the
                     // chunk's top, emitted in the post-process pass.
                     let namespace = &file_to_namespace[module_path];
+                    let module_unused = p.unused_exports.get(module_path);
                     let wrapped = crate::npm_wrap::wrap_npm_module(
                         js_code,
                         &file_name,
                         namespace,
+                        module_unused,
                         |specifier| {
                             if specifier.starts_with('.') {
                                 let from_dir = module_path.parent()?;
@@ -707,6 +754,7 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<ChunkBundleResult> {
                         module_unused,
                         effective_bundled,
                         effective_ns_map,
+                        p.external_specifiers,
                         is_chunk_entry,
                     )?;
 
@@ -743,8 +791,16 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<ChunkBundleResult> {
     if is_lazy {
         let mut main_js_named = BTreeSet::new();
         let mut main_js_default = None;
+        // Externalised imports survive intact — they are bare specifiers the
+        // runtime resolves (import map, CDN). They are NOT re-exported from
+        // main, NOT routed cross-chunk, and NOT folded into `npm_externals`.
+        let mut keep_as_bare: Vec<ExternalImport> = Vec::new();
 
         for ext in all_externals {
+            if rewrite::matches_external_specifier(&ext.source, p.external_specifiers) {
+                keep_as_bare.push(ext);
+                continue;
+            }
             let is_from_npm = ext.source.starts_with("__resolved_ns__")
                 || ext.source.starts_with("__npm_")
                 || p.bundled_specifiers.contains(&ext.source)
@@ -775,7 +831,7 @@ fn bundle_chunk(p: &ChunkBundleParams<'_>) -> NgcResult<ChunkBundleResult> {
             }
         }
 
-        all_externals = Vec::new();
+        all_externals = keep_as_bare;
 
         if let Some(default_name) = main_js_default {
             main_js_named.insert(default_name);
@@ -891,6 +947,14 @@ fn classify_lazy_externals(
 
     let mut out: Vec<ExternalImport> = Vec::with_capacity(externals.len());
     for ext in externals {
+        // Externalised dependencies (`externalDependencies` in angular.json)
+        // stay as bare specifiers — they neither resolve to a chunk module
+        // nor get routed through `./main.js`, so pass them through verbatim
+        // and let the lazy-chunk routing block keep them in `keep_as_bare`.
+        if rewrite::matches_external_specifier(&ext.source, p.external_specifiers) {
+            out.push(ext);
+            continue;
+        }
         // Subpath imports (`#foo`) point at a file under the importing
         // package's `imports` map — typically a project file, occasionally
         // a bare specifier. Resolve to the actual target so chunk-membership
@@ -1426,6 +1490,7 @@ mod tests {
             options: BundleOptions::default(),
             per_module_maps: HashMap::new(),
             bundled_specifiers: HashSet::new(),
+            external_specifiers: HashSet::new(),
             export_conditions: Vec::new(),
         };
 
@@ -1473,6 +1538,7 @@ mod tests {
             options: BundleOptions::default(),
             per_module_maps: HashMap::new(),
             bundled_specifiers: HashSet::new(),
+            external_specifiers: HashSet::new(),
             export_conditions: Vec::new(),
         };
 
@@ -1483,6 +1549,95 @@ mod tests {
         assert_eq!(import_count, 1, "imports should be merged");
         assert!(result.contains("Component"));
         assert!(result.contains("Injectable"));
+    }
+
+    #[test]
+    fn test_external_specifier_kept_as_bare_import_even_if_bundled() {
+        // Regression for issue #146: when a specifier appears in
+        // `external_specifiers`, the rewriter must leave the import as a
+        // bare ESM import, even if `bundled_specifiers` happens to contain
+        // the same string (the negative set vetoes the positive one).
+        let mut graph = DiGraph::new();
+        let entry = graph.add_node(make_path("/root/main.ts"));
+        let _ = entry;
+
+        let mut modules = HashMap::new();
+        modules.insert(
+            make_path("/root/main.ts"),
+            "import $ from 'jquery';\nimport { trim } from 'jquery';\nconsole.log($, trim);\n"
+                .to_string(),
+        );
+
+        let mut bundled = HashSet::new();
+        bundled.insert("jquery".to_string()); // simulate it leaking in
+        let mut externals = HashSet::new();
+        externals.insert("jquery".to_string());
+
+        let input = BundleInput {
+            modules,
+            graph,
+            entry: make_path("/root/main.ts"),
+            local_prefixes: vec![".".to_string()],
+            root_dir: make_path("/root"),
+            options: BundleOptions::default(),
+            per_module_maps: HashMap::new(),
+            bundled_specifiers: bundled,
+            external_specifiers: externals,
+            export_conditions: Vec::new(),
+        };
+
+        let output = bundle(&input).expect("should bundle");
+        let result = main_chunk(&output);
+        assert!(
+            result.contains("from 'jquery'"),
+            "external jquery import should survive verbatim, got:\n{result}"
+        );
+        // Verify it's a hoisted ESM import — not rewritten into a
+        // `var $ = __ns_jquery.default` namespace assignment.
+        assert!(
+            !result.contains("__ns_jquery"),
+            "external import must not be rewritten to namespace; got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_external_specifier_subpath_kept_as_bare_import() {
+        // `externalDependencies: ["jquery"]` should also externalise
+        // subpath imports like `jquery/dist/jquery.slim`, matching how
+        // esbuild's `--external: jquery` behaves under
+        // `@angular/build:application`.
+        let mut graph = DiGraph::new();
+        let entry = graph.add_node(make_path("/root/main.ts"));
+        let _ = entry;
+
+        let mut modules = HashMap::new();
+        modules.insert(
+            make_path("/root/main.ts"),
+            "import $ from 'jquery/dist/jquery.slim';\nconsole.log($);\n".to_string(),
+        );
+
+        let mut externals = HashSet::new();
+        externals.insert("jquery".to_string());
+
+        let input = BundleInput {
+            modules,
+            graph,
+            entry: make_path("/root/main.ts"),
+            local_prefixes: vec![".".to_string()],
+            root_dir: make_path("/root"),
+            options: BundleOptions::default(),
+            per_module_maps: HashMap::new(),
+            bundled_specifiers: HashSet::new(),
+            external_specifiers: externals,
+            export_conditions: Vec::new(),
+        };
+
+        let output = bundle(&input).expect("should bundle");
+        let result = main_chunk(&output);
+        assert!(
+            result.contains("from 'jquery/dist/jquery.slim'"),
+            "subpath of external package should survive verbatim, got:\n{result}"
+        );
     }
 
     #[test]
@@ -1516,6 +1671,7 @@ mod tests {
             options: BundleOptions::default(),
             per_module_maps: HashMap::new(),
             bundled_specifiers: HashSet::new(),
+            external_specifiers: HashSet::new(),
             export_conditions: Vec::new(),
         };
 
@@ -1560,6 +1716,7 @@ mod tests {
             options: BundleOptions::default(),
             per_module_maps: HashMap::new(),
             bundled_specifiers: HashSet::new(),
+            external_specifiers: HashSet::new(),
             export_conditions: Vec::new(),
         };
 
@@ -1632,6 +1789,7 @@ mod tests {
             options: BundleOptions::default(),
             per_module_maps: HashMap::new(),
             bundled_specifiers: HashSet::new(),
+            external_specifiers: HashSet::new(),
             export_conditions: Vec::new(),
         };
 
@@ -1766,6 +1924,7 @@ mod tests {
             },
             per_module_maps,
             bundled_specifiers: HashSet::new(),
+            external_specifiers: HashSet::new(),
             export_conditions: Vec::new(),
         };
 
@@ -1816,6 +1975,7 @@ mod tests {
             options: BundleOptions::default(),
             per_module_maps: HashMap::new(),
             bundled_specifiers: HashSet::new(),
+            external_specifiers: HashSet::new(),
             export_conditions: Vec::new(),
         };
 
@@ -1874,6 +2034,7 @@ mod tests {
             },
             per_module_maps: HashMap::new(),
             bundled_specifiers: HashSet::new(),
+            external_specifiers: HashSet::new(),
             export_conditions: Vec::new(),
         };
 

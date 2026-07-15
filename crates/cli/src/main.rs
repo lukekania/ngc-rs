@@ -141,6 +141,16 @@ struct BuildResult {
     total_size_bytes: u64,
     /// Wall-clock duration of the build pipeline.
     duration_ms: u64,
+    /// HMR component-update modules, keyed by component id. Populated only
+    /// when the build runs with HMR enabled (`serve --hmr`); internal to the
+    /// dev server, so excluded from the `--output-json` shape.
+    #[serde(skip)]
+    hmr_component_updates: HashMap<String, String>,
+    /// Map from an external resource (`templateUrl`/`styleUrls`) path to the
+    /// owning component's HMR id, so a changed `.html`/`.css` maps to the
+    /// component to hot-swap.
+    #[serde(skip)]
+    hmr_resource_to_component: HashMap<PathBuf, String>,
 }
 
 #[derive(Parser)]
@@ -177,8 +187,12 @@ enum Commands {
         /// every `$localize\`...\`` literal in the bundled output. The
         /// source-locale build is moved under
         /// `<out_dir>/<sourceLocale>/`.
-        #[arg(long)]
-        localize: bool,
+        ///
+        /// Pass `--localize` alone to emit every locale declared in
+        /// `i18n.locales`; pass `--localize=en,de` to restrict the output
+        /// to a subset (useful for trimming CI builds).
+        #[arg(long, num_args = 0..=1, value_delimiter = ',')]
+        localize: Option<Vec<String>>,
         /// Treat any template that would fall back to JIT compilation as a
         /// hard error. Mirrors `@angular/build:application`, which has no
         /// JIT fallback. Defaults to on for `--configuration production` and
@@ -203,8 +217,11 @@ enum Commands {
         configuration: Option<String>,
         /// Emit one `<out_dir>/<locale>/` tree per locale defined in
         /// `angular.json`'s `i18n.locales` block.
-        #[arg(long)]
-        localize: bool,
+        ///
+        /// Pass `--localize` alone for all locales, or `--localize=en,de`
+        /// to restrict the output to a subset.
+        #[arg(long, num_args = 0..=1, value_delimiter = ',')]
+        localize: Option<Vec<String>>,
     },
     /// Serve the project: build once, watch for changes, and host the
     /// resulting `dist/` directory over HTTP with live reload. Mirrors
@@ -235,6 +252,54 @@ enum Commands {
         /// to use the same value as its `<base href>`.
         #[arg(long = "serve-path")]
         serve_path: Option<String>,
+        /// Comma-separated list of host names the dev server's
+        /// `Host:`-header check accepts. Loopback hosts (`localhost`,
+        /// `127.0.0.1`, `[::1]`) are always allowed. Pass `all` to
+        /// disable the check entirely, or `auto` to additionally accept
+        /// the configured bind host. Use this when fronting the dev
+        /// server with a tunneling proxy (ngrok, Cloudflare Tunnel,
+        /// GitHub Codespaces) or a non-default local hostname
+        /// (`*.localhost`, `app.local`).
+        #[arg(long = "allowed-hosts", value_delimiter = ',', num_args = 0..)]
+        allowed_hosts: Vec<String>,
+        /// Custom HTTP response headers to emit on every served response,
+        /// as a JSON object of header name → string value (e.g.
+        /// `--headers '{"Cross-Origin-Opener-Policy":"same-origin"}'`).
+        /// Mirrors the `headers` option of `@angular/build:dev-server`,
+        /// for serving production-like security headers (CSP, COOP),
+        /// CORS headers, or cache-control overrides in dev. Headers the
+        /// server sets itself (`Content-Type`, `Cache-Control`) are not
+        /// overridden by these.
+        #[arg(long = "headers")]
+        headers: Option<String>,
+        /// Serve over HTTPS instead of HTTP. When set without `--ssl-key`
+        /// and `--ssl-cert`, a throwaway self-signed certificate is
+        /// generated for the bind host plus the loopback names; browsers
+        /// show the usual untrusted-certificate warning. Mirrors the `ssl`
+        /// option of `@angular/build:dev-server`.
+        #[arg(long)]
+        ssl: bool,
+        /// Path to a PEM-encoded private key for HTTPS. Requires `--ssl` and
+        /// `--ssl-cert`. Mirrors the `sslKey` option of
+        /// `@angular/build:dev-server`.
+        #[arg(long = "ssl-key")]
+        ssl_key: Option<PathBuf>,
+        /// Path to a PEM-encoded certificate for HTTPS. Requires `--ssl` and
+        /// `--ssl-key`. Mirrors the `sslCert` option of
+        /// `@angular/build:dev-server`.
+        #[arg(long = "ssl-cert")]
+        ssl_cert: Option<PathBuf>,
+        /// Enable Hot Module Replacement: edits to component templates and
+        /// styles (and global stylesheets) are applied in place without a
+        /// full page reload, preserving component and form state. Overrides
+        /// `architect.serve.options.hmr` in `angular.json`. Mirrors the `hmr`
+        /// option of `@angular/build:dev-server`.
+        #[arg(long, conflicts_with = "no_hmr")]
+        hmr: bool,
+        /// Disable Hot Module Replacement, forcing a full page reload on every
+        /// rebuild. Overrides `architect.serve.options.hmr` in `angular.json`.
+        #[arg(long = "no-hmr", conflicts_with = "hmr")]
+        no_hmr: bool,
     },
     /// Extract translatable messages from every component template in the
     /// project and emit a translation file (XLIFF 2.0 by default; XLIFF 1.2
@@ -283,6 +348,32 @@ enum ExtractFormat {
     Arb,
 }
 
+/// Parse the `serve --headers` JSON object into ordered name/value pairs.
+///
+/// Accepts a JSON object whose values are all strings, e.g.
+/// `{"Cross-Origin-Opener-Policy":"same-origin"}`. `None` (flag omitted)
+/// yields an empty list. A non-object, malformed JSON, or a non-string
+/// value is a hard error so a typo in `angular.json`'s `headers` surfaces
+/// immediately rather than being silently dropped.
+fn parse_header_overrides(raw: Option<&str>) -> Result<Vec<(String, String)>, String> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| format!("--headers is not valid JSON: {e}"))?;
+    let serde_json::Value::Object(map) = value else {
+        return Err("--headers must be a JSON object of header name to string value".to_string());
+    };
+    let mut out = Vec::with_capacity(map.len());
+    for (name, val) in map {
+        match val {
+            serde_json::Value::String(s) => out.push((name, s)),
+            _ => return Err(format!("--headers value for \"{name}\" must be a string")),
+        }
+    }
+    Ok(out)
+}
+
 fn main() {
     init_tracing();
     let cli = Cli::parse();
@@ -320,7 +411,7 @@ fn main() {
                 &project,
                 out_dir.as_deref(),
                 configuration.as_deref(),
-                localize,
+                localize.as_deref(),
                 Vec::new(),
                 |_| false,
             ) {
@@ -335,7 +426,30 @@ fn main() {
             host,
             open,
             serve_path,
+            allowed_hosts,
+            headers,
+            ssl,
+            ssl_key,
+            ssl_cert,
+            hmr,
+            no_hmr,
         } => {
+            let parsed_headers = match parse_header_overrides(headers.as_deref()) {
+                Ok(h) => h,
+                Err(e) => {
+                    eprintln!("{} {e}", "Error:".red().bold());
+                    process::exit(1);
+                }
+            };
+            // CLI flags win over angular.json: `--hmr` → Some(true),
+            // `--no-hmr` → Some(false), neither → None (inherit config).
+            let hmr_override = if hmr {
+                Some(true)
+            } else if no_hmr {
+                Some(false)
+            } else {
+                None
+            };
             if let Err(e) = serve_cmd::run(
                 &project,
                 Some(&configuration),
@@ -343,6 +457,12 @@ fn main() {
                 port,
                 open,
                 serve_path.as_deref(),
+                &allowed_hosts,
+                &parsed_headers,
+                ssl,
+                ssl_key.as_deref(),
+                ssl_cert.as_deref(),
+                hmr_override,
             ) {
                 eprintln!("{} {e}", "Error:".red().bold());
                 process::exit(1);
@@ -387,7 +507,7 @@ fn main() {
                 &project,
                 out_dir.as_deref(),
                 configuration.as_deref(),
-                localize,
+                localize.as_deref(),
                 strict_templates,
             ) {
                 Ok(result) => {
@@ -444,6 +564,8 @@ fn main() {
                             modules_bundled: 0,
                             total_size_bytes: 0,
                             duration_ms: started.elapsed().as_millis() as u64,
+                            hmr_component_updates: HashMap::new(),
+                            hmr_resource_to_component: HashMap::new(),
                         };
                         let json = serde_json::to_string_pretty(&result)
                             .expect("BuildResult serialization should not fail");
@@ -475,11 +597,16 @@ fn init_tracing() {
 }
 
 /// Orchestrate the full build pipeline: resolve → transform → bundle → output.
+///
+/// `localize` mirrors the `--localize` CLI flag: `None` skips locale
+/// fan-out entirely; `Some(&[])` emits every locale declared in
+/// `i18n.locales`; `Some(&["en", "de"])` restricts the output to that
+/// subset.
 fn run_build(
     project: &Path,
     out_dir_override: Option<&Path>,
     configuration: Option<&str>,
-    localize: bool,
+    localize: Option<&[String]>,
     strict_templates: bool,
 ) -> NgcResult<BuildResult> {
     run_build_with_options(
@@ -490,6 +617,7 @@ fn run_build(
         strict_templates,
         None,
         None,
+        false,
     )
 }
 
@@ -505,7 +633,7 @@ pub(crate) fn run_build_with_cache(
     project: &Path,
     out_dir_override: Option<&Path>,
     configuration: Option<&str>,
-    localize: bool,
+    localize: Option<&[String]>,
     cache: Option<&mut incremental::BuildCache>,
 ) -> NgcResult<BuildResult> {
     run_build_with_options(
@@ -516,6 +644,7 @@ pub(crate) fn run_build_with_cache(
         false,
         cache,
         None,
+        false,
     )
 }
 
@@ -529,14 +658,16 @@ pub(crate) fn run_build_with_cache(
 /// `strict_templates` mirrors the `--strict-templates` build flag: when
 /// true, any template that would otherwise fall back to JIT compilation
 /// produces an [`NgcError::TemplateCompileError`] instead.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_build_with_options(
     project: &Path,
     out_dir_override: Option<&Path>,
     configuration: Option<&str>,
-    localize: bool,
+    localize: Option<&[String]>,
     strict_templates: bool,
     mut cache: Option<&mut incremental::BuildCache>,
     base_href_override: Option<&str>,
+    hmr: bool,
 ) -> NgcResult<BuildResult> {
     let started_at = Instant::now();
 
@@ -605,7 +736,10 @@ pub(crate) fn run_build_with_options(
         .iter()
         .filter_map(|p| incremental::BuildCache::hash_file(p).map(|h| (p.clone(), h)))
         .collect();
-    let compile_opts = ngc_template_compiler::CompileOptions { strict_templates };
+    let compile_opts = ngc_template_compiler::CompileOptions {
+        strict_templates,
+        hmr,
+    };
     let (compiled, transform_cache_seed) = compile_decorators_cached(
         &files,
         &style_ctx,
@@ -614,6 +748,27 @@ pub(crate) fn run_build_with_options(
         &file_hashes,
     )?;
     drop(templates_span);
+
+    // Aggregate HMR artifacts (when enabled) into lookup maps the dev server
+    // consumes: id → update module, and source/resource path → component id.
+    let mut hmr_component_updates: HashMap<String, String> = HashMap::new();
+    let mut hmr_resource_to_component: HashMap<PathBuf, String> = HashMap::new();
+    if hmr {
+        for cf in &compiled {
+            if let Some(artifacts) = &cf.hmr {
+                for comp in &artifacts.components {
+                    hmr_component_updates
+                        .insert(comp.id.clone(), comp.update_module_source.clone());
+                    for resource in &comp.resource_files {
+                        // Canonicalize so the watcher's emitted paths (also
+                        // canonicalized at lookup) match across symlinks.
+                        let key = resource.canonicalize().unwrap_or_else(|_| resource.clone());
+                        hmr_resource_to_component.insert(key, comp.id.clone());
+                    }
+                }
+            }
+        }
+    }
 
     // Report any JIT fallbacks. Each fallback also goes into
     // `BuildResult.warnings` so the architect builder shim can surface it
@@ -687,19 +842,40 @@ pub(crate) fn run_build_with_options(
     // Collect bare specifiers from project scanning AND from transformed output
     // (oxc may inject new imports like @oxc-project/runtime/helpers/decorate)
     let npm_span = tracing::info_span!("npm_resolve").entered();
-    let mut bare_specifiers: Vec<String> = file_graph.npm_import_sites.keys().cloned().collect();
+    // `externalDependencies` from angular.json — these are NOT bundled
+    // (their imports stay as bare ESM specifiers for the runtime to
+    // resolve via an import map / CDN). Build the set once and use it
+    // to filter every list we hand to `resolve_npm_dependencies` so the
+    // BFS never walks into an externalised package's modules.
+    let external_specifiers: std::collections::HashSet<String> = angular_project
+        .as_ref()
+        .map(|ap| ap.external_dependencies.iter().cloned().collect())
+        .unwrap_or_default();
+    let is_external = |spec: &str| -> bool {
+        external_specifiers.contains(spec)
+            || external_specifiers
+                .iter()
+                .any(|ext| spec.starts_with(ext.as_str()) && spec[ext.len()..].starts_with('/'))
+    };
+    let mut bare_specifiers: Vec<String> = file_graph
+        .npm_import_sites
+        .keys()
+        .filter(|s| !is_external(s))
+        .cloned()
+        .collect();
     let post_transform_specifiers = scan_transformed_bare_specifiers(&modules, &local_prefixes);
     for spec in post_transform_specifiers {
-        if !bare_specifiers.contains(&spec) {
+        if !bare_specifiers.contains(&spec) && !is_external(&spec) {
             bare_specifiers.push(spec);
         }
     }
     let export_conditions =
         ngc_npm_resolver::package_json::conditions_for_configuration(configuration);
-    let mut npm_resolution = ngc_npm_resolver::resolve_npm_dependencies(
+    let mut npm_resolution = ngc_npm_resolver::resolve_npm_dependencies_with_externals(
         &bare_specifiers,
         &config_dir,
         export_conditions,
+        &external_specifiers,
     )?;
 
     // Merge npm modules into the modules map (they're already JS — no transform needed)
@@ -759,7 +935,7 @@ pub(crate) fn run_build_with_options(
     let prescan_new: Vec<String> = if public_exports.has_specifier_outside(&bare_set) {
         ngc_linker::flatten::scan_introduced_specifiers(&modules, &registry, &public_exports)
             .into_iter()
-            .filter(|s| !bare_set.contains(s))
+            .filter(|s| !bare_set.contains(s) && !is_external(s))
             .collect()
     } else {
         Vec::new()
@@ -771,10 +947,11 @@ pub(crate) fn run_build_with_options(
             prescan_new
         );
         bare_specifiers.extend(prescan_new.iter().cloned());
-        let extra = ngc_npm_resolver::resolve_npm_dependencies(
+        let extra = ngc_npm_resolver::resolve_npm_dependencies_with_externals(
             &prescan_new,
             &config_dir,
             export_conditions,
+            &external_specifiers,
         )?;
         tracing::info!(
             "pre-scan: pulled in {} additional file(s) before flatten",
@@ -854,7 +1031,7 @@ pub(crate) fn run_build_with_options(
     let post_link_specifiers = scan_transformed_bare_specifiers(&project_modules, &local_prefixes);
     let mut new_specifiers: Vec<String> = Vec::new();
     for spec in post_link_specifiers {
-        if !bare_specifiers.contains(&spec) {
+        if !bare_specifiers.contains(&spec) && !is_external(&spec) {
             new_specifiers.push(spec);
         }
     }
@@ -865,10 +1042,11 @@ pub(crate) fn run_build_with_options(
             new_specifiers
         );
         bare_specifiers.extend(new_specifiers.iter().cloned());
-        let extra = ngc_npm_resolver::resolve_npm_dependencies(
+        let extra = ngc_npm_resolver::resolve_npm_dependencies_with_externals(
             &new_specifiers,
             &config_dir,
             export_conditions,
+            &external_specifiers,
         )?;
         tracing::info!(
             "post-flatten npm resolution pulled in {} file(s)",
@@ -1011,6 +1189,14 @@ pub(crate) fn run_build_with_options(
         drop(define_span);
     }
 
+    // Belt-and-braces: even though the resolver was told to skip externals,
+    // strip them from `bundled_specifiers` so the rewriter never sees an
+    // externalised name in its "local" set. This also handles the edge
+    // case where `inject_oxc_runtime_helpers` adds a specifier later — if
+    // somehow an external name showed up, this last filter keeps the
+    // bundle output correct.
+    bundled_specifiers.retain(|s| !external_specifiers.contains(s));
+
     let bundle_input = BundleInput {
         modules,
         graph,
@@ -1020,6 +1206,7 @@ pub(crate) fn run_build_with_options(
         options: bundle_options,
         per_module_maps,
         bundled_specifiers,
+        external_specifiers,
         export_conditions: export_conditions.iter().map(|s| (*s).to_string()).collect(),
     };
     drop(graph_span);
@@ -1187,26 +1374,13 @@ pub(crate) fn run_build_with_options(
         output_files.push(lp);
     }
 
-    // Step 12.5: Service worker manifest (`ngsw.json`) when the project opts
-    // in via `architect.build.options.serviceWorker`. Hashing runs *after*
-    // every other writer so it sees the final filenames + contents.
-    if let Some(ref ap) = angular_project {
-        if ap.service_worker {
-            if localize {
-                tracing::warn!(
-                    "serviceWorker is enabled but --localize was passed; skipping ngsw.json (per-locale manifests are not yet supported)"
-                );
-            } else {
-                let ngsw_paths = generate_service_worker(ap, &out_dir, &config_dir)?;
-                output_files.extend(ngsw_paths);
-            }
-        }
-    }
-
-    // Step 13: --localize → fan the source-locale build out to
+    // Step 12.5: --localize → fan the source-locale build out to
     // `<out_dir>/<sourceLocale>/` and produce a translated copy under
-    // `<out_dir>/<locale>/` for each entry in `i18n.locales`.
-    if localize {
+    // `<out_dir>/<locale>/` for each entry in `i18n.locales`. A non-empty
+    // `subset` filters the emitted locales — useful for trimming CI builds
+    // that only need one or two locales per deploy.
+    let localized = localize.is_some();
+    if let Some(subset) = localize {
         let i18n = angular_project
             .as_ref()
             .and_then(|ap| ap.i18n.as_ref())
@@ -1215,8 +1389,46 @@ pub(crate) fn run_build_with_options(
                     "--localize was passed but angular.json does not declare a `projects.<name>.i18n` block"
                         .to_string(),
             })?;
-        let localized_files = fan_out_locales(&out_dir, i18n, &output_files)?;
+        let localized_files = fan_out_locales(&out_dir, i18n, subset, &output_files)?;
         output_files = localized_files;
+    }
+
+    // Step 13: Service worker manifest (`ngsw.json`) when the project opts in
+    // via `architect.build.options.serviceWorker`. Hashing runs *after* every
+    // other writer (including locale fan-out) so it sees the final filenames +
+    // contents. With `--localize` each locale subdirectory is its own PWA
+    // deploy root, so we emit one manifest per `<out_dir>/<locale>/` — asset
+    // hashes are naturally per-locale (translated bundles differ byte-for-byte).
+    if let Some(ref ap) = angular_project {
+        if ap.service_worker {
+            if localized {
+                for entry in std::fs::read_dir(&out_dir).map_err(|e| NgcError::Io {
+                    path: out_dir.clone(),
+                    source: e,
+                })? {
+                    let entry = entry.map_err(|e| NgcError::Io {
+                        path: out_dir.clone(),
+                        source: e,
+                    })?;
+                    let locale_dir = entry.path();
+                    let is_dir = entry
+                        .file_type()
+                        .map_err(|e| NgcError::Io {
+                            path: locale_dir.clone(),
+                            source: e,
+                        })?
+                        .is_dir();
+                    if !is_dir {
+                        continue;
+                    }
+                    let ngsw_paths = generate_service_worker(ap, &locale_dir, &config_dir)?;
+                    output_files.extend(ngsw_paths);
+                }
+            } else {
+                let ngsw_paths = generate_service_worker(ap, &out_dir, &config_dir)?;
+                output_files.extend(ngsw_paths);
+            }
+        }
     }
 
     // Stat each written path and tag it with its OutputKind. Failed stats
@@ -1313,17 +1525,50 @@ pub(crate) fn run_build_with_options(
         modules_bundled,
         total_size_bytes,
         duration_ms: started_at.elapsed().as_millis() as u64,
+        hmr_component_updates,
+        hmr_resource_to_component,
     })
 }
 
 /// Move the source-locale build under `<out_dir>/<sourceLocale>/` and
 /// emit a translated copy under `<out_dir>/<locale>/` for every entry in
 /// `i18n.locales`. Returns the new full set of output files.
+///
+/// `subset` filters which locales are emitted. An empty slice emits every
+/// locale (source plus all `i18n.locales` entries); a non-empty slice
+/// restricts the output to the codes listed (validated against
+/// `i18n.source_locale` and the keys of `i18n.locales`).
 fn fan_out_locales(
     out_dir: &Path,
     i18n: &I18nConfig,
+    subset: &[String],
     original_files: &[PathBuf],
 ) -> NgcResult<Vec<PathBuf>> {
+    let include_source: bool;
+    let include_locale: Box<dyn Fn(&str) -> bool>;
+    if subset.is_empty() {
+        include_source = true;
+        include_locale = Box::new(|_: &str| true);
+    } else {
+        // Reject `--localize=foo` when `foo` is neither the source locale
+        // nor one of the declared `i18n.locales` keys — silently skipping
+        // would let typos produce empty `dist/` runs in CI.
+        for code in subset {
+            let known = code == &i18n.source_locale || i18n.locales.contains_key(code.as_str());
+            if !known {
+                return Err(NgcError::ConfigError {
+                    message: format!(
+                        "--localize subset entry `{code}` is not declared in angular.json `i18n.locales` (and is not the source locale `{}`)",
+                        i18n.source_locale
+                    ),
+                });
+            }
+        }
+        include_source = subset.iter().any(|c| c == &i18n.source_locale);
+        let allow: std::collections::BTreeSet<String> = subset.iter().cloned().collect();
+        include_locale = Box::new(move |code: &str| allow.contains(code));
+    }
+
     // Materialize file contents from the original (source-locale) build so
     // we can write them back into per-locale directories without worrying
     // about the source-locale move clobbering them.
@@ -1345,10 +1590,15 @@ fn fan_out_locales(
 
     let mut new_outputs: Vec<PathBuf> = Vec::new();
 
-    let source_dir = out_dir.join(&i18n.source_locale);
-    write_locale_tree(&source_dir, &sources, None, &mut new_outputs)?;
+    if include_source {
+        let source_dir = out_dir.join(&i18n.source_locale);
+        write_locale_tree(&source_dir, &sources, None, &mut new_outputs)?;
+    }
 
     for entry in i18n.locales.values() {
+        if !include_locale(entry.locale.as_str()) {
+            continue;
+        }
         let translations = match &entry.translation_path {
             Some(path) => Some(localize::parse_xliff(path)?),
             None => None,
@@ -1698,7 +1948,7 @@ pub(crate) fn resolve_out_dir(
 }
 
 /// Try to find angular.json by searching upward from the project file's directory.
-fn find_and_resolve_angular_json(
+pub(crate) fn find_and_resolve_angular_json(
     project: &Path,
     configuration: Option<&str>,
 ) -> NgcResult<Option<ResolvedAngularProject>> {
@@ -2633,6 +2883,7 @@ fn compile_decorators_cached(
                 source: hit.compiled_source,
                 compiled: true,
                 jit_fallback: hit.jit_fallback,
+                hmr: hit.hmr,
             });
             continue;
         }
@@ -2660,6 +2911,7 @@ fn compile_decorators_cached(
                         // Filled in by the transform step.
                         transformed_code: String::new(),
                         transformed_map: None,
+                        hmr: cf.hmr.clone(),
                     },
                 );
             }
@@ -3487,5 +3739,235 @@ mod tests {
         for url in app_urls.iter().chain(media_urls.iter()) {
             assert!(table.contains_key(*url), "missing hash for {url}");
         }
+    }
+
+    /// End-to-end fixture: a localized build (`--localize`) with
+    /// `serviceWorker: true` must emit one `ngsw.json` per locale
+    /// subdirectory, each carrying deploy-root-relative URLs and asset
+    /// hashes computed from that locale's own (translated) tree.
+    #[test]
+    fn test_service_worker_pipeline_localized_fixture() {
+        use ngc_project_resolver::angular_json::resolve_angular_project;
+        use sha1::{Digest, Sha1};
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path();
+
+        // angular.json: serviceWorker on + an i18n block declaring one
+        // translation locale (`fr`) alongside the `en` source locale.
+        std::fs::write(
+            root.join("angular.json"),
+            r#"{
+                "projects": {
+                    "pwa": {
+                        "root": "",
+                        "sourceRoot": "src",
+                        "i18n": {
+                            "sourceLocale": "en",
+                            "locales": { "fr": "src/locale/messages.fr.xlf" }
+                        },
+                        "architect": {
+                            "build": {
+                                "options": {
+                                    "outputPath": "dist/pwa",
+                                    "tsConfig": "tsconfig.json",
+                                    "serviceWorker": true,
+                                    "ngswConfigPath": "ngsw-config.json"
+                                }
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            root.join("ngsw-config.json"),
+            r#"{
+                "index": "/index.html",
+                "assetGroups": [
+                    {
+                        "name": "app",
+                        "installMode": "prefetch",
+                        "resources": { "files": ["/index.html", "/*.js", "/*.css"] }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        // Translation file mapping the `greeting` message to French so the
+        // `fr` bundle diverges byte-for-byte from `en` — the precise reason
+        // each locale needs its own manifest with its own hashes.
+        std::fs::create_dir_all(root.join("src").join("locale")).unwrap();
+        std::fs::write(
+            root.join("src").join("locale").join("messages.fr.xlf"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<xliff version="2.0" xmlns="urn:oasis:names:tc:xliff:document:2.0" srcLang="en" trgLang="fr">
+  <file id="ngc.template" original="ng.template">
+    <unit id="greeting">
+      <segment>
+        <source>Hello</source>
+        <target>Bonjour</target>
+      </segment>
+    </unit>
+  </file>
+</xliff>"#,
+        )
+        .unwrap();
+
+        // Pre-populate the flat source-locale dist tree, as the bundler would.
+        let dist = root.join("dist").join("pwa");
+        std::fs::create_dir_all(&dist).unwrap();
+        let index_bytes = b"<!doctype html><title>pwa</title>".to_vec();
+        let style_bytes = b"body { color: red; }".to_vec();
+        std::fs::write(dist.join("index.html"), &index_bytes).unwrap();
+        std::fs::write(
+            dist.join("main-ABCDE.js"),
+            "var x = $localize`:@@greeting:Hello`;",
+        )
+        .unwrap();
+        std::fs::write(dist.join("styles-FGHIJ.css"), &style_bytes).unwrap();
+        let original_files = vec![
+            dist.join("index.html"),
+            dist.join("main-ABCDE.js"),
+            dist.join("styles-FGHIJ.css"),
+        ];
+
+        let project = resolve_angular_project(&root.join("angular.json"), Some("pwa"), None)
+            .expect("resolve angular project");
+        assert!(project.service_worker);
+        let i18n = project.i18n.as_ref().expect("i18n block parsed");
+
+        // Fan the flat build out into `dist/pwa/en/` and `dist/pwa/fr/`.
+        fan_out_locales(&dist, i18n, &[], &original_files).expect("fan_out_locales");
+
+        // Generate one manifest per locale subdir — mirrors the build pipeline.
+        for locale in ["en", "fr"] {
+            let paths = generate_service_worker(&project, &dist.join(locale), root)
+                .expect("generate_service_worker");
+            assert!(
+                !paths.is_empty(),
+                "{locale}: should write at least ngsw.json"
+            );
+        }
+
+        let expect_sha1 = |bytes: &[u8]| -> String {
+            let mut h = Sha1::new();
+            h.update(bytes);
+            h.finalize().iter().fold(String::new(), |mut acc, b| {
+                acc.push_str(&format!("{b:02x}"));
+                acc
+            })
+        };
+
+        for locale in ["en", "fr"] {
+            let manifest_path = dist.join(locale).join("ngsw.json");
+            assert!(manifest_path.is_file(), "{locale}/ngsw.json must exist");
+            let manifest: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap())
+                    .expect("ngsw.json parses as JSON");
+
+            let groups = manifest["assetGroups"].as_array().expect("assetGroups");
+            let urls: Vec<&str> = groups[0]["urls"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            // URLs are relative to the locale deploy root — no `/en/` prefix.
+            assert!(
+                urls.contains(&"/index.html"),
+                "{locale}: missing /index.html"
+            );
+            assert!(
+                urls.contains(&"/main-ABCDE.js"),
+                "{locale}: missing /main-ABCDE.js"
+            );
+            assert!(
+                urls.contains(&"/styles-FGHIJ.css"),
+                "{locale}: missing /styles-FGHIJ.css"
+            );
+            assert!(
+                !urls.iter().any(|u| u.starts_with(&format!("/{locale}/"))),
+                "{locale}: URLs must be deploy-root-relative, got {urls:?}"
+            );
+
+            // hashTable entries must equal the SHA-1 of this locale's bytes.
+            let table = manifest["hashTable"].as_object().expect("hashTable");
+            let main_bytes = std::fs::read(dist.join(locale).join("main-ABCDE.js")).unwrap();
+            assert_eq!(
+                table["/main-ABCDE.js"].as_str().unwrap(),
+                expect_sha1(&main_bytes),
+                "{locale}: main.js hash must match its own tree"
+            );
+            assert_eq!(
+                table["/index.html"].as_str().unwrap(),
+                expect_sha1(&index_bytes)
+            );
+        }
+
+        // The translated `fr` bundle differs from `en`, so the two manifests
+        // must record different hashes for the same URL — correct cache busting.
+        let main_hash = |locale: &str| -> String {
+            let m: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(dist.join(locale).join("ngsw.json")).unwrap(),
+            )
+            .unwrap();
+            m["hashTable"]["/main-ABCDE.js"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_ne!(
+            main_hash("en"),
+            main_hash("fr"),
+            "translated bundle must hash differently per locale"
+        );
+    }
+
+    #[test]
+    fn parse_header_overrides_none_yields_empty() {
+        assert_eq!(parse_header_overrides(None).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn parse_header_overrides_parses_a_json_object() {
+        let parsed = parse_header_overrides(Some(
+            r#"{"Cross-Origin-Opener-Policy":"same-origin","X-Frame-Options":"DENY"}"#,
+        ))
+        .unwrap();
+        // serde_json's Map iterates keys in sorted order.
+        assert_eq!(
+            parsed,
+            vec![
+                (
+                    "Cross-Origin-Opener-Policy".to_string(),
+                    "same-origin".to_string()
+                ),
+                ("X-Frame-Options".to_string(), "DENY".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_header_overrides_rejects_malformed_json() {
+        assert!(parse_header_overrides(Some("{not json")).is_err());
+    }
+
+    #[test]
+    fn parse_header_overrides_rejects_non_object_json() {
+        let err = parse_header_overrides(Some(r#"["X-Foo"]"#)).unwrap_err();
+        assert!(err.contains("JSON object"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_header_overrides_rejects_non_string_values() {
+        let err = parse_header_overrides(Some(r#"{"X-Foo":123}"#)).unwrap_err();
+        assert!(
+            err.contains("X-Foo") && err.contains("string"),
+            "got: {err}"
+        );
     }
 }

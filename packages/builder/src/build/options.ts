@@ -175,16 +175,6 @@ export function translateOptions(
       'The `outputHashing` option is hardcoded by ngc-rs per `--configuration` (production hashes bundles, development does not); the option value is ignored.',
     );
   }
-  if (raw.externalDependencies && raw.externalDependencies.length > 0) {
-    warnings.push(
-      '`externalDependencies` is currently ignored by ngc-rs; all imports are bundled.',
-    );
-  }
-  if (Array.isArray(raw.localize)) {
-    warnings.push(
-      'Selecting a locale subset via `localize` array is not yet honoured by ngc-rs; all locales declared in `angular.json` `i18n.locales` are emitted.',
-    );
-  }
   if (raw.stylePreprocessorOptions) {
     const opts = raw.stylePreprocessorOptions as json.JsonObject;
     const includePaths = opts['includePaths'];
@@ -228,7 +218,6 @@ export function translateOptions(
 
   const tsConfig = raw.tsConfig ?? 'tsconfig.json';
   const outDir = resolveOutDir(raw.outputPath, workspaceRoot);
-  const localize = raw.localize === true || Array.isArray(raw.localize);
 
   const args: string[] = ['build', '--project', tsConfig, '--output-json'];
   if (configuration) {
@@ -237,8 +226,14 @@ export function translateOptions(
   if (outDir) {
     args.push('--out-dir', outDir);
   }
-  if (localize) {
+  // `localize: true` → emit all locales (`--localize` with no value).
+  // `localize: ['en', 'de']` → emit just that subset (`--localize=en,de`).
+  // `localize: []` is treated as `true` to match `@angular/build`, which
+  // ignores an empty array and falls back to "all locales".
+  if (raw.localize === true || (Array.isArray(raw.localize) && raw.localize.length === 0)) {
     args.push('--localize');
+  } else if (Array.isArray(raw.localize)) {
+    args.push(`--localize=${raw.localize.join(',')}`);
   }
   if (raw.strictTemplates === true) {
     args.push('--strict-templates');

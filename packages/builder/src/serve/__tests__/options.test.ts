@@ -51,16 +51,53 @@ describe('translateOptions', () => {
     expect(t.args[portIdx + 1]).toBe('0');
   });
 
-  it('rejects ssl=true with a clear error', () => {
+  it('forwards --ssl and uses an https url when ssl is true without key/cert', () => {
+    const t = translateOptions({ ...base, ssl: true }, '/ws');
+    expect(t.args).toContain('--ssl');
+    expect(t.args).not.toContain('--ssl-key');
+    expect(t.args).not.toContain('--ssl-cert');
+    expect(t.url).toBe('https://localhost:4200/');
+  });
+
+  it('forwards resolved --ssl-key/--ssl-cert when both are provided', () => {
+    const t = translateOptions(
+      { ...base, ssl: true, sslKey: 'certs/dev.key', sslCert: 'certs/dev.crt' },
+      '/ws',
+    );
+    expect(t.args).toContain('--ssl');
+    const keyIdx = t.args.indexOf('--ssl-key');
+    const certIdx = t.args.indexOf('--ssl-cert');
+    expect(t.args[keyIdx + 1]).toBe('/ws/certs/dev.key');
+    expect(t.args[certIdx + 1]).toBe('/ws/certs/dev.crt');
+    expect(t.url).toBe('https://localhost:4200/');
+  });
+
+  it('throws when only one of sslKey/sslCert is provided', () => {
     expect(() =>
-      translateOptions({ ...base, ssl: true }, '/ws'),
+      translateOptions({ ...base, ssl: true, sslKey: '/k' }, '/ws'),
+    ).toThrow(OptionTranslationError);
+    expect(() =>
+      translateOptions({ ...base, ssl: true, sslCert: '/c' }, '/ws'),
     ).toThrow(OptionTranslationError);
   });
 
-  it('rejects sslKey/sslCert', () => {
+  it('rejects ssl combined with proxyConfig', () => {
     expect(() =>
-      translateOptions({ ...base, sslKey: '/k' }, '/ws'),
+      translateOptions(
+        { ...base, ssl: true, proxyConfig: 'proxy.conf.json' },
+        '/ws',
+      ),
     ).toThrow(OptionTranslationError);
+  });
+
+  it('ignores sslKey/sslCert and stays on http when ssl is not enabled', () => {
+    const t = translateOptions(
+      { ...base, sslKey: 'certs/dev.key', sslCert: 'certs/dev.crt' },
+      '/ws',
+    );
+    expect(t.args).not.toContain('--ssl');
+    expect(t.args).not.toContain('--ssl-key');
+    expect(t.url).toBe('http://localhost:4200/');
   });
 
   it('honors a custom project tsconfig', () => {
@@ -100,6 +137,113 @@ describe('translateOptions', () => {
       translateOptions({ ...base, servePath: '' }, '/ws').args,
     ).not.toContain('--serve-path');
   });
+
+  it('forwards a non-empty allowedHosts list as a comma-joined --allowed-hosts arg', () => {
+    const t = translateOptions(
+      { ...base, allowedHosts: ['my-app.ngrok.io', 'app.local'] },
+      '/ws',
+    );
+    const idx = t.args.indexOf('--allowed-hosts');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(t.args[idx + 1]).toBe('my-app.ngrok.io,app.local');
+  });
+
+  it('passes through the "all" sentinel verbatim', () => {
+    const t = translateOptions({ ...base, allowedHosts: ['all'] }, '/ws');
+    const idx = t.args.indexOf('--allowed-hosts');
+    expect(t.args[idx + 1]).toBe('all');
+  });
+
+  it('drops empty / whitespace-only allowedHosts entries and dedupes case-insensitively', () => {
+    const t = translateOptions(
+      {
+        ...base,
+        allowedHosts: ['', '   ', 'foo.example', 'Foo.Example', 'bar.example'],
+      },
+      '/ws',
+    );
+    const idx = t.args.indexOf('--allowed-hosts');
+    expect(t.args[idx + 1]).toBe('foo.example,bar.example');
+  });
+
+  it('omits --allowed-hosts when the list is empty or unset', () => {
+    expect(
+      translateOptions({ ...base, allowedHosts: [] }, '/ws').args,
+    ).not.toContain('--allowed-hosts');
+    expect(translateOptions(base, '/ws').args).not.toContain('--allowed-hosts');
+  });
+
+  it('forwards a headers map as a JSON --headers arg', () => {
+    const t = translateOptions(
+      {
+        ...base,
+        headers: { 'Cross-Origin-Opener-Policy': 'same-origin' },
+      },
+      '/ws',
+    );
+    const idx = t.args.indexOf('--headers');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(JSON.parse(t.args[idx + 1])).toEqual({
+      'Cross-Origin-Opener-Policy': 'same-origin',
+    });
+  });
+
+  it('forwards multiple headers in a single --headers arg', () => {
+    const t = translateOptions(
+      {
+        ...base,
+        headers: { 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' },
+      },
+      '/ws',
+    );
+    const idx = t.args.indexOf('--headers');
+    expect(JSON.parse(t.args[idx + 1])).toEqual({
+      'X-Frame-Options': 'DENY',
+      'X-Content-Type-Options': 'nosniff',
+    });
+  });
+
+  it('trims header names and drops empty-name / non-string entries', () => {
+    const t = translateOptions(
+      {
+        ...base,
+        headers: {
+          '  X-Trim  ': 'ok',
+          '': 'dropped',
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          'X-Bad': 123 as any,
+        },
+      },
+      '/ws',
+    );
+    const idx = t.args.indexOf('--headers');
+    expect(JSON.parse(t.args[idx + 1])).toEqual({ 'X-Trim': 'ok' });
+  });
+
+  it('omits --headers when the map is empty or unset', () => {
+    expect(
+      translateOptions({ ...base, headers: {} }, '/ws').args,
+    ).not.toContain('--headers');
+    expect(translateOptions(base, '/ws').args).not.toContain('--headers');
+  });
+
+  it('forwards hmr: true as --hmr', () => {
+    const t = translateOptions({ ...base, hmr: true }, '/ws');
+    expect(t.args).toContain('--hmr');
+    expect(t.args).not.toContain('--no-hmr');
+  });
+
+  it('forwards hmr: false as --no-hmr', () => {
+    const t = translateOptions({ ...base, hmr: false }, '/ws');
+    expect(t.args).toContain('--no-hmr');
+    expect(t.args).not.toContain('--hmr');
+  });
+
+  it('omits both hmr flags when hmr is unset so the binary inherits angular.json', () => {
+    const args = translateOptions(base, '/ws').args;
+    expect(args).not.toContain('--hmr');
+    expect(args).not.toContain('--no-hmr');
+  });
 });
 
 describe('formatUrl', () => {
@@ -112,6 +256,14 @@ describe('formatUrl', () => {
   it('appends a servePath when provided', () => {
     expect(formatUrl('localhost', 4200, '/admin/')).toBe(
       'http://localhost:4200/admin/',
+    );
+  });
+  it('uses the https scheme when requested', () => {
+    expect(formatUrl('localhost', 4200, null, 'https')).toBe(
+      'https://localhost:4200/',
+    );
+    expect(formatUrl('app.local', 8080, '/admin/', 'https')).toBe(
+      'https://app.local:8080/admin/',
     );
   });
 });

@@ -27,16 +27,16 @@
     },
     "ssl": {
       "type": "boolean",
-      "description": "Serve over HTTPS. Currently unsupported by ngc-rs serve. Setting this to true fails the build with an explanatory error.",
+      "description": "Serve over HTTPS. When set without sslKey/sslCert, the dev server generates a throwaway self-signed certificate for the bind host plus the loopback names; browsers show the usual untrusted-certificate warning. Cannot be combined with proxyConfig — terminate TLS at the proxy or drop the proxy when enabling ssl.",
       "default": false
     },
     "sslKey": {
       "type": "string",
-      "description": "SSL key path. Currently unsupported."
+      "description": "Path to a PEM-encoded private key used when ssl is true. Resolved relative to the workspace root. Requires sslCert."
     },
     "sslCert": {
       "type": "string",
-      "description": "SSL certificate path. Currently unsupported."
+      "description": "Path to a PEM-encoded certificate used when ssl is true. Resolved relative to the workspace root. Requires sslKey."
     },
     "proxyConfig": {
       "type": "string",
@@ -63,6 +63,20 @@
     "servePath": {
       "type": "string",
       "description": "URL path prefix to mount the dev server under (e.g. \"/admin/\"). Mirrors @angular/build:dev-server's servePath option for projects deployed behind a subpath. When set, the served index.html is rewritten to use the same value as <base href> unless angular.json already configures one explicitly."
+    },
+    "allowedHosts": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "List of host names the dev server's Host-header check accepts. Loopback hosts (localhost, 127.0.0.1, [::1]) are always allowed. The special value \"all\" disables the check entirely. The special value \"auto\" additionally accepts the configured bind host. Use this to expose the dev server through tunneling proxies (ngrok, Cloudflare Tunnel, GitHub Codespaces) or non-default local hostnames (*.localhost, app.local)."
+    },
+    "headers": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Custom HTTP response headers emitted on every served response (static assets, the SPA-fallback index.html, and the SSE live-reload stream). Use this to serve production-like security headers (CSP, Cross-Origin-Opener-Policy), CORS headers, or cache-control overrides in dev. Headers the dev server sets itself (Content-Type, Cache-Control) are not overridden. Headers are not added to proxy-forwarded responses, which keep their upstream headers."
+    },
+    "hmr": {
+      "type": "boolean",
+      "description": "Enable Hot Module Replacement: edits to component templates and styles (and global stylesheets) are applied in place without a full page reload, preserving component and form state. TypeScript edits still trigger a full reload. When unset, the spawned binary falls back to `architect.serve.options.hmr` in angular.json (default false, matching today's full-reload behavior)."
     }
   },
   "additionalProperties": false

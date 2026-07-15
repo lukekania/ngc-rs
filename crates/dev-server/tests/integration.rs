@@ -119,6 +119,45 @@ fn get_root_returns_index_html_with_injected_client() {
 }
 
 #[test]
+fn component_endpoint_serves_registered_update_module() {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    let root = TempDir::new().expect("tempdir");
+    write_file(root.path(), "index.html", b"<html><body></body></html>");
+    let registry: ngc_dev_server::ComponentUpdates = Arc::new(Mutex::new(HashMap::new()));
+    let id = "src%2Fapp%2Fapp.component.ts%40AppComponent";
+    registry
+        .lock()
+        .unwrap()
+        .insert(id.to_string(), "export default function(){}".to_string());
+
+    let cfg = DevServerConfig::new(root.path())
+        .with_port(0)
+        .with_component_updates(Arc::clone(&registry));
+    let (_tx, rx) = channel::<DevServerEvent>();
+    let server = DevServer::start(cfg, rx).expect("start dev server");
+
+    // Registered id → the update module, as text/javascript.
+    let resp = http_get(server.addr(), &format!("/@ng/component?c={id}&t=99"));
+    assert_eq!(resp.status, 200);
+    assert!(resp
+        .header("Content-Type")
+        .expect("content-type")
+        .starts_with("text/javascript"));
+    assert_eq!(resp.body, b"export default function(){}");
+
+    // Unknown id → empty 200 (the running app guards on m.default).
+    let resp = http_get(server.addr(), "/@ng/component?c=nope&t=1");
+    assert_eq!(resp.status, 200);
+    assert!(resp.body.is_empty());
+
+    // Missing `c` → 400.
+    let resp = http_get(server.addr(), "/@ng/component");
+    assert_eq!(resp.status, 400);
+}
+
+#[test]
 fn get_index_html_directly_also_injects_client() {
     let fx = Fixture::new();
     let resp = http_get(fx.server.addr(), "/index.html");
@@ -443,6 +482,123 @@ fn unprefixed_request_returns_404_when_serve_path_set() {
     assert_eq!(http_get(fx.server.addr(), "/__ngc_reload").status, 404);
 }
 
+fn http_get_with_host(addr: std::net::SocketAddr, path: &str, host_header: &str) -> HttpResponse {
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).expect("write");
+    stream.flush().expect("flush");
+
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line).expect("status line");
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .expect("status code");
+
+    let mut headers = Vec::new();
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("header line");
+        if line == "\r\n" || line.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = line.trim_end_matches("\r\n").split_once(':') {
+            headers.push((k.trim().to_string(), v.trim().to_string()));
+        }
+    }
+    let mut body = Vec::new();
+    reader.read_to_end(&mut body).expect("body");
+    HttpResponse {
+        status,
+        headers,
+        body,
+    }
+}
+
+fn allowed_hosts_fixture(patterns: &[&str]) -> Fixture {
+    let root = TempDir::new().expect("tempdir");
+    write_file(
+        root.path(),
+        "index.html",
+        b"<html><body><h1>hi</h1></body></html>",
+    );
+    let cfg = DevServerConfig::new(root.path())
+        .with_port(0)
+        .with_allowed_hosts(patterns.iter().copied());
+    let (_tx, rx) = channel::<DevServerEvent>();
+    let server = DevServer::start(cfg, rx).expect("start dev server");
+    Fixture {
+        server,
+        _root: root,
+    }
+}
+
+#[test]
+fn default_allowed_hosts_accept_loopback_and_403_others() {
+    let fx = allowed_hosts_fixture(&[]);
+    assert_eq!(
+        http_get_with_host(fx.server.addr(), "/", "localhost").status,
+        200
+    );
+    assert_eq!(
+        http_get_with_host(fx.server.addr(), "/", "127.0.0.1").status,
+        200
+    );
+    assert_eq!(
+        http_get_with_host(fx.server.addr(), "/", "[::1]").status,
+        200
+    );
+    let blocked = http_get_with_host(fx.server.addr(), "/", "my-app.ngrok.io");
+    assert_eq!(blocked.status, 403);
+    let body = std::str::from_utf8(&blocked.body).unwrap_or("");
+    assert!(
+        body.contains("my-app.ngrok.io") && body.contains("allowedHosts"),
+        "403 body should name the host and point at allowedHosts: {body}"
+    );
+}
+
+#[test]
+fn explicit_allowed_host_lets_ngrok_traffic_through() {
+    let fx = allowed_hosts_fixture(&["my-app.ngrok.io"]);
+    assert_eq!(
+        http_get_with_host(fx.server.addr(), "/", "my-app.ngrok.io").status,
+        200
+    );
+    // Port stripping: a tunneling proxy may forward Host with a port.
+    assert_eq!(
+        http_get_with_host(fx.server.addr(), "/", "my-app.ngrok.io:8443").status,
+        200
+    );
+    // Loopback still works.
+    assert_eq!(
+        http_get_with_host(fx.server.addr(), "/", "localhost").status,
+        200
+    );
+    // Anything else is still blocked.
+    assert_eq!(
+        http_get_with_host(fx.server.addr(), "/", "other.ngrok.io").status,
+        403
+    );
+}
+
+#[test]
+fn allowed_hosts_all_disables_check() {
+    let fx = allowed_hosts_fixture(&["all"]);
+    assert_eq!(
+        http_get_with_host(fx.server.addr(), "/", "anything.example.com").status,
+        200
+    );
+    assert_eq!(
+        http_get_with_host(fx.server.addr(), "/", "my-app.ngrok.io").status,
+        200
+    );
+}
+
 #[test]
 fn prefixed_sse_channel_is_reachable_under_prefix() {
     let fx = prefixed_fixture("/admin/");
@@ -472,4 +628,336 @@ fn prefixed_sse_channel_is_reachable_under_prefix() {
         }
     }
     assert!(saw_event_stream);
+}
+
+/// Build a fixture whose dev server is configured with the given custom
+/// response `headers`.
+fn headers_fixture(headers: &[(&str, &str)]) -> Fixture {
+    let root = TempDir::new().expect("tempdir");
+    write_file(
+        root.path(),
+        "index.html",
+        b"<html><body><h1>hi</h1></body></html>",
+    );
+    write_file(root.path(), "main.js", b"console.log('hello');");
+
+    let cfg = DevServerConfig::new(root.path())
+        .with_port(0)
+        .with_headers(headers.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+    let (_tx, rx) = channel::<DevServerEvent>();
+    let server = DevServer::start(cfg, rx).expect("start dev server");
+    Fixture {
+        server,
+        _root: root,
+    }
+}
+
+#[test]
+fn custom_headers_are_emitted_on_static_assets() {
+    let fx = headers_fixture(&[("Cross-Origin-Opener-Policy", "same-origin")]);
+    let resp = http_get(fx.server.addr(), "/main.js");
+    assert_eq!(resp.status, 200);
+    assert_eq!(
+        resp.header("Cross-Origin-Opener-Policy"),
+        Some("same-origin")
+    );
+}
+
+#[test]
+fn custom_headers_are_emitted_on_index_html() {
+    let fx = headers_fixture(&[("Cross-Origin-Opener-Policy", "same-origin")]);
+    let resp = http_get(fx.server.addr(), "/");
+    assert_eq!(resp.status, 200);
+    assert_eq!(
+        resp.header("Cross-Origin-Opener-Policy"),
+        Some("same-origin")
+    );
+}
+
+#[test]
+fn custom_headers_are_emitted_on_spa_fallback() {
+    let fx = headers_fixture(&[("X-Frame-Options", "DENY")]);
+    // A deep client-side route resolves to no file and falls back to
+    // index.html — the custom headers must ride along.
+    let resp = http_get(fx.server.addr(), "/users/42/profile");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.header("X-Frame-Options"), Some("DENY"));
+}
+
+#[test]
+fn multiple_custom_headers_are_all_emitted() {
+    let fx = headers_fixture(&[
+        ("X-Frame-Options", "DENY"),
+        ("X-Content-Type-Options", "nosniff"),
+    ]);
+    let resp = http_get(fx.server.addr(), "/main.js");
+    assert_eq!(resp.header("X-Frame-Options"), Some("DENY"));
+    assert_eq!(resp.header("X-Content-Type-Options"), Some("nosniff"));
+}
+
+#[test]
+fn custom_content_type_header_does_not_clobber_the_real_one() {
+    // A user `Content-Type` entry must never override the MIME type the
+    // server picked for the served file.
+    let fx = headers_fixture(&[("Content-Type", "text/plain")]);
+    let resp = http_get(fx.server.addr(), "/main.js");
+    assert_eq!(resp.status, 200);
+    let ct = resp.header("Content-Type").expect("content-type");
+    assert!(
+        ct.starts_with("application/javascript"),
+        "user Content-Type clobbered the server's: {ct}"
+    );
+}
+
+#[test]
+fn custom_cache_control_header_does_not_clobber_the_dev_server_one() {
+    // Live reload depends on responses not being cached; a user
+    // `Cache-Control` entry must not override the dev server's `no-cache`.
+    let fx = headers_fixture(&[("Cache-Control", "max-age=31536000")]);
+    let resp = http_get(fx.server.addr(), "/main.js");
+    assert_eq!(resp.header("Cache-Control"), Some("no-cache"));
+}
+
+#[test]
+fn no_custom_headers_keeps_responses_unchanged() {
+    let fx = headers_fixture(&[]);
+    let resp = http_get(fx.server.addr(), "/main.js");
+    assert_eq!(resp.status, 200);
+    assert!(resp.header("Cross-Origin-Opener-Policy").is_none());
+}
+
+#[test]
+fn custom_headers_are_emitted_on_the_sse_stream() {
+    let fx = headers_fixture(&[("Cross-Origin-Opener-Policy", "same-origin")]);
+    let mut stream = TcpStream::connect(fx.server.addr()).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    let req = "GET /__ngc_reload HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/event-stream\r\n\r\n";
+    stream.write_all(req.as_bytes()).expect("write");
+    stream.flush().expect("flush");
+
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line).expect("status line");
+    assert!(status_line.contains("200"), "got {status_line}");
+
+    let mut saw_header = false;
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).expect("header");
+        if n == 0 || line == "\r\n" {
+            break;
+        }
+        if line
+            .to_ascii_lowercase()
+            .starts_with("cross-origin-opener-policy:")
+        {
+            assert!(line.to_ascii_lowercase().contains("same-origin"));
+            saw_header = true;
+        }
+    }
+    assert!(saw_header, "custom header missing from SSE response head");
+}
+
+// ----------------------------------------------------------------------------
+// HTTPS / TLS (#142)
+//
+// These tests stand up a dev server with a throwaway self-signed certificate
+// and drive it through a rustls client that skips certificate verification —
+// the equivalent of clicking through the browser's untrusted-certificate
+// warning. They confirm both ordinary static serving and the long-lived SSE
+// live-reload stream work once the connection is wrapped in TLS.
+// ----------------------------------------------------------------------------
+
+mod tls {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpStream;
+    use std::sync::mpsc::channel;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use ngc_dev_server::{
+        DevServer, DevServerConfig, DevServerEvent, TlsConfig, LIVE_RELOAD_SCRIPT,
+    };
+    use rustls::{ClientConfig, ClientConnection, StreamOwned};
+    use tempfile::TempDir;
+
+    struct TlsFixture {
+        server: DevServer,
+        _root: TempDir,
+    }
+
+    impl TlsFixture {
+        fn new() -> Self {
+            let root = TempDir::new().expect("tempdir");
+            std::fs::write(
+                root.path().join("index.html"),
+                b"<html><body><h1>secure</h1></body></html>",
+            )
+            .expect("write index");
+            let tls = TlsConfig::self_signed(&["127.0.0.1".to_string()]).expect("self-signed");
+            let cfg = DevServerConfig::new(root.path())
+                .with_port(0)
+                .with_tls(Some(tls));
+            let (_tx, rx) = channel::<DevServerEvent>();
+            let server = DevServer::start(cfg, rx).expect("start tls dev server");
+            Self {
+                server,
+                _root: root,
+            }
+        }
+    }
+
+    // A certificate verifier that accepts everything — the test cert is
+    // self-signed and not in any trust store, which is exactly the dev
+    // workflow this feature targets.
+    struct NoVerify;
+
+    impl rustls::client::ServerCertVerifier for NoVerify {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::Certificate,
+            _intermediates: &[rustls::Certificate],
+            _server_name: &rustls::ServerName,
+            _scts: &mut dyn Iterator<Item = &[u8]>,
+            _ocsp_response: &[u8],
+            _now: std::time::SystemTime,
+        ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::ServerCertVerified::assertion())
+        }
+    }
+
+    fn tls_stream(addr: std::net::SocketAddr) -> StreamOwned<ClientConnection, TcpStream> {
+        let config = ClientConfig::builder()
+            .with_safe_defaults()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth();
+        let server_name = rustls::ServerName::try_from("localhost").expect("server name");
+        let conn = ClientConnection::new(Arc::new(config), server_name).expect("client conn");
+        let sock = TcpStream::connect(addr).expect("connect");
+        sock.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        StreamOwned::new(conn, sock)
+    }
+
+    #[test]
+    fn serves_index_over_https_with_injected_live_reload_script() {
+        let fx = TlsFixture::new();
+        let mut stream = tls_stream(fx.server.addr());
+        let req = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        stream.write_all(req.as_bytes()).expect("write");
+        stream.flush().expect("flush");
+
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).expect("read response");
+        let text = String::from_utf8_lossy(&raw);
+
+        let status_line = text.lines().next().expect("status line");
+        assert!(status_line.contains("200"), "status was {status_line}");
+        // The SPA index is served and the live-reload client is injected,
+        // proving TLS framing of an ordinary file response works.
+        assert!(text.contains("<h1>secure</h1>"), "body missing app markup");
+        assert!(
+            text.contains(LIVE_RELOAD_SCRIPT),
+            "live-reload script not injected over https"
+        );
+    }
+
+    #[test]
+    fn scheme_reports_https_when_tls_enabled() {
+        let fx = TlsFixture::new();
+        assert_eq!(fx.server.scheme(), "https");
+    }
+
+    #[test]
+    fn sse_live_reload_stream_works_over_https() {
+        let fx = TlsFixture::new();
+        let stream = tls_stream(fx.server.addr());
+        let mut writer = stream;
+        let req =
+            "GET /__ngc_reload HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n";
+        writer.write_all(req.as_bytes()).expect("write");
+        writer.flush().expect("flush");
+
+        let mut reader = BufReader::new(writer);
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line).expect("status line");
+        assert!(status_line.contains("200"), "status was {status_line}");
+
+        let mut saw_event_stream = false;
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).expect("header");
+            if n == 0 || line == "\r\n" {
+                break;
+            }
+            if line.to_ascii_lowercase().contains("text/event-stream") {
+                saw_event_stream = true;
+            }
+        }
+        assert!(
+            saw_event_stream,
+            "missing event-stream content type over tls"
+        );
+
+        let mut connected = String::new();
+        reader.read_line(&mut connected).expect("connected");
+        assert!(connected.starts_with(": connected"), "got {connected:?}");
+        let mut blank = String::new();
+        reader.read_line(&mut blank).expect("blank");
+
+        std::thread::sleep(Duration::from_millis(100));
+        fx.server.trigger_reload().expect("trigger reload");
+
+        let mut event = String::new();
+        reader.read_line(&mut event).expect("event line");
+        assert_eq!(event, "event: reload\n");
+        let mut data = String::new();
+        reader.read_line(&mut data).expect("data line");
+        assert_eq!(data, "data: rebuild\n");
+    }
+
+    #[test]
+    fn serves_over_https_with_explicit_cert_and_key() {
+        // Mint a cert/key pair and feed the raw PEM through `from_pem` — the
+        // path explicit sslKey/sslCert files take — then confirm the server
+        // comes up and serves over TLS.
+        let ck = rcgen_pair();
+        let root = TempDir::new().expect("tempdir");
+        std::fs::write(
+            root.path().join("index.html"),
+            b"<html><body>ok</body></html>",
+        )
+        .expect("write index");
+        let cfg = DevServerConfig::new(root.path())
+            .with_port(0)
+            .with_tls(Some(TlsConfig::from_pem(ck.0, ck.1)));
+        let (_tx, rx) = channel::<DevServerEvent>();
+        let server = DevServer::start(cfg, rx).expect("start with explicit pem");
+
+        let mut stream = tls_stream(server.addr());
+        let req = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        stream.write_all(req.as_bytes()).expect("write");
+        stream.flush().expect("flush");
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).expect("read");
+        let text = String::from_utf8_lossy(&raw);
+        assert!(text.lines().next().unwrap_or("").contains("200"));
+    }
+
+    // Generate a (cert_pem, key_pem) pair the same way the production
+    // self-signed path does, but expose the raw PEM so the test can feed it
+    // through `TlsConfig::from_pem`.
+    fn rcgen_pair() -> (Vec<u8>, Vec<u8>) {
+        let ck = rcgen::generate_simple_self_signed(vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+        ])
+        .expect("rcgen");
+        (
+            ck.cert.pem().into_bytes(),
+            ck.signing_key.serialize_pem().into_bytes(),
+        )
+    }
 }

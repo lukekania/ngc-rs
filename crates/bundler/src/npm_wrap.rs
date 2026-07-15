@@ -15,7 +15,7 @@
 //! })(__ns_abc123);
 //! ```
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use ngc_diagnostics::{NgcError, NgcResult};
@@ -39,15 +39,29 @@ pub struct NpmModuleInfo {
 ///
 /// `resolve_import` is a closure that maps an import specifier to a namespace
 /// variable name, or `None` if the import should be left as-is (truly external).
+///
+/// `unused_exports` carries the set of exported names that per-provider
+/// shake decided no consumer reaches. When provided, both the declarations
+/// (`export const X = ...`) and the matching `__exports.X = ...` bridge
+/// lines are dropped, shrinking vendor chunks of large packages like
+/// `@angular/core` whose `index.mjs` re-exports far more than any consumer
+/// actually uses.
 pub fn wrap_npm_module<F>(
     js_code: &str,
     file_name: &str,
     namespace: &str,
+    unused_exports: Option<&HashSet<String>>,
     resolve_import: F,
 ) -> NgcResult<NpmModuleInfo>
 where
     F: Fn(&str) -> Option<String>,
 {
+    let is_unused = |name: &str| -> bool {
+        unused_exports
+            .map(|set| set.contains(name))
+            .unwrap_or(false)
+    };
+
     // Strip sourcemap comments upfront to prevent them from interfering with
     // the IIFE wrapping (they can eat export assignments on the same line).
     let cleaned_code = strip_sourcemap_comments(js_code);
@@ -133,6 +147,9 @@ where
                         for spec in &export.specifiers {
                             let exported = spec.exported.name().to_string();
                             let local = spec.local.name().to_string();
+                            if is_unused(&exported) {
+                                continue;
+                            }
                             // Don't add to exported_names — we handle the export inline
                             if let Some(ref ns) = target_ns {
                                 replacements.push(format!("__exports.{exported} = {ns}.{local};"));
@@ -150,21 +167,39 @@ where
                             end: export.span.end,
                             replacement,
                         });
-                    } else if export.declaration.is_some() {
-                        // export const X = ...; → strip "export "
-                        if let Some(decl) = &export.declaration {
-                            collect_decl_names(decl, &mut exported_names);
+                    } else if let Some(decl) = &export.declaration {
+                        // export const X = ...; — if X is unused, drop the
+                        // entire declaration so the body isn't pinned by
+                        // its `__exports.X = X` line and any const
+                        // initializer side-effect is also eliminated.
+                        let mut decl_names = Vec::new();
+                        collect_decl_names(decl, &mut decl_names);
+                        let all_unused =
+                            !decl_names.is_empty() && decl_names.iter().all(|n| is_unused(n));
+                        if all_unused {
+                            edits.push(TextEdit {
+                                start: export.span.start,
+                                end: export.span.end,
+                                replacement: None,
+                            });
+                        } else {
+                            for n in &decl_names {
+                                exported_names.push(n.clone());
+                            }
+                            edits.push(TextEdit {
+                                start: export.span.start,
+                                end: export.span.start + 7, // "export "
+                                replacement: None,
+                            });
                         }
-                        edits.push(TextEdit {
-                            start: export.span.start,
-                            end: export.span.start + 7, // "export "
-                            replacement: None,
-                        });
                     } else {
                         // export { X, Y }; or export { X as Y }; → collect names and remove
                         for spec in &export.specifiers {
                             let exported = spec.exported.name().to_string();
                             let local = spec.local.name().to_string();
+                            if is_unused(&exported) {
+                                continue;
+                            }
                             if exported != local {
                                 renamed_exports.insert(exported.clone(), local);
                             }
@@ -428,7 +463,7 @@ mod tests {
     #[test]
     fn test_wrap_simple_module() {
         let code = "export function hello() { return 42; }\n";
-        let result = wrap_npm_module(code, "test.js", "__ns_test", no_resolve).unwrap();
+        let result = wrap_npm_module(code, "test.js", "__ns_test", None, no_resolve).unwrap();
         assert!(result.wrapped_code.contains("var __ns_test = {};"));
         assert!(result.wrapped_code.contains("(function(__exports)"));
         assert!(result.wrapped_code.contains("__exports.hello = hello;"));
@@ -447,7 +482,7 @@ mod tests {
                 None
             }
         };
-        let result = wrap_npm_module(code, "test.js", "__ns_test", resolve).unwrap();
+        let result = wrap_npm_module(code, "test.js", "__ns_test", None, resolve).unwrap();
         assert!(result
             .wrapped_code
             .contains("var Component = __ns_core.Component;"));
@@ -465,7 +500,7 @@ mod tests {
                 None
             }
         };
-        let result = wrap_npm_module(code, "test.js", "__ns_test", resolve).unwrap();
+        let result = wrap_npm_module(code, "test.js", "__ns_test", None, resolve).unwrap();
         assert!(result
             .wrapped_code
             .contains("Object.assign(__exports, __ns_utils)"));
@@ -474,9 +509,41 @@ mod tests {
     #[test]
     fn test_wrap_default_export() {
         let code = "export default function helper() { return 1; }\n";
-        let result = wrap_npm_module(code, "test.js", "__ns_test", no_resolve).unwrap();
+        let result = wrap_npm_module(code, "test.js", "__ns_test", None, no_resolve).unwrap();
         assert!(result.wrapped_code.contains("function helper()"));
         assert!(result.wrapped_code.contains("__exports.default = helper;"));
+    }
+
+    #[test]
+    fn test_wrap_drops_unused_declaration() {
+        let code = "export const used = 1;\nexport const unused = 2;\n";
+        let mut unused: HashSet<String> = HashSet::new();
+        unused.insert("unused".to_string());
+        let result =
+            wrap_npm_module(code, "test.js", "__ns_test", Some(&unused), no_resolve).unwrap();
+        assert!(result.wrapped_code.contains("const used = 1"));
+        assert!(!result.wrapped_code.contains("const unused = 2"));
+        assert!(result.wrapped_code.contains("__exports.used = used;"));
+        assert!(!result.wrapped_code.contains("__exports.unused"));
+    }
+
+    #[test]
+    fn test_wrap_drops_unused_reexport_bridge() {
+        let code = "export { used, unused } from './impl';\n";
+        let resolve = |spec: &str| -> Option<String> {
+            if spec == "./impl" {
+                Some("__ns_impl".to_string())
+            } else {
+                None
+            }
+        };
+        let mut unused: HashSet<String> = HashSet::new();
+        unused.insert("unused".to_string());
+        let result = wrap_npm_module(code, "test.js", "__ns_test", Some(&unused), resolve).unwrap();
+        assert!(result
+            .wrapped_code
+            .contains("__exports.used = __ns_impl.used"));
+        assert!(!result.wrapped_code.contains("__exports.unused"));
     }
 
     #[test]

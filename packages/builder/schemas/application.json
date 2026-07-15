@@ -275,7 +275,7 @@
         { "type": "boolean" },
         { "type": "array", "items": { "type": "string" } }
       ],
-      "description": "Generate per-locale builds. When set to true ngc-rs is invoked with `--localize` and emits one output tree per `i18n.locales` entry in angular.json. Selecting a locale subset (array form) is NOT yet honoured by ngc-rs and logs a warning."
+      "description": "Generate per-locale builds. When set to true ngc-rs is invoked with `--localize` and emits one output tree per `i18n.locales` entry in angular.json. The array form `[\"en\", \"de\"]` serializes as `--localize=en,de` and restricts the output to the listed locales (useful for trimming CI builds)."
     },
     "inlineStyleLanguage": {
       "type": "string",

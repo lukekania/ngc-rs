@@ -27,6 +27,7 @@
 //!   mounts a full-page error overlay (dismissible with `Esc`) showing the
 //!   build error and source location.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -35,7 +36,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use ngc_diagnostics::{NgcError, NgcResult};
-use tiny_http::{Header, Method, Response, Server, StatusCode};
+use tiny_http::{Header, Method, Response, Server, SslConfig, StatusCode};
 
 /// An event the dev server fans out to connected browsers over SSE.
 ///
@@ -46,10 +47,32 @@ use tiny_http::{Header, Method, Response, Server, StatusCode};
 ///
 /// * [`DevServerEvent::Reload`] → `event: reload`
 /// * [`DevServerEvent::BuildFailed`] → `event: build-failed`
+/// * [`DevServerEvent::CssUpdate`] → `event: css-update`
 #[derive(Debug, Clone)]
 pub enum DevServerEvent {
     /// A successful rebuild — connected browsers should refresh the page.
     Reload,
+    /// A successful rebuild that only changed global stylesheet(s). HMR
+    /// clients swap the `styles.css` `<link>` in place (cache-busting with
+    /// `timestamp`) without reloading the page, preserving component and
+    /// form state. Only emitted when HMR is enabled; otherwise a plain
+    /// [`DevServerEvent::Reload`] is sent.
+    CssUpdate {
+        /// Monotonic cache-buster appended to the swapped stylesheet href.
+        timestamp: u64,
+    },
+    /// A successful rebuild that changed only a single component's template
+    /// and/or styles. HMR clients re-fetch that component's update module
+    /// from `/@ng/component?c=<id>&t=<timestamp>` and call
+    /// `ɵɵreplaceMetadata` to swap it in place — no reload, state preserved.
+    /// `id` is the percent-encoded `relpath@ClassName` the compiler embeds in
+    /// the component's HMR initializer. Only emitted when HMR is enabled.
+    ComponentUpdate {
+        /// Percent-encoded component id (`encodeURIComponent("relpath@Class")`).
+        id: String,
+        /// Monotonic cache-buster matching the `t` query param on the fetch.
+        timestamp: u64,
+    },
     /// A rebuild failed — connected browsers should display an error
     /// overlay with the message and (when available) the offending file
     /// and source coordinates.
@@ -78,6 +101,14 @@ impl From<ReloadEvent> for DevServerEvent {
     }
 }
 
+/// Shared registry of per-component HMR update modules, keyed by the
+/// percent-encoded component id (`encodeURIComponent("relpath@Class")`).
+/// The build pipeline replaces its contents after each rebuild; the
+/// `/@ng/component?c=<id>` endpoint reads it to serve the update module a
+/// running app dynamically imports. Cloning shares the same underlying map
+/// (`Arc`), so the serve loop and the build callback see each other's writes.
+pub type ComponentUpdates = Arc<Mutex<HashMap<String, String>>>;
+
 /// Configuration for [`DevServer`].
 #[derive(Debug, Clone)]
 pub struct DevServerConfig {
@@ -93,6 +124,24 @@ pub struct DevServerConfig {
     /// server mounts at `/`. Mirrors `@angular/build:dev-server`'s
     /// `servePath` option for subpath deploys.
     pub serve_path: Option<String>,
+    /// User-supplied `allowedHosts` patterns. Empty (= default) means
+    /// `auto`: loopback hosts plus the bind host. See [`AllowedHosts`].
+    pub allowed_hosts: Vec<String>,
+    /// Custom HTTP response headers to emit on every served response
+    /// (static assets, the SPA-fallback `index.html`, and the SSE
+    /// live-reload stream). Mirrors `@angular/build:dev-server`'s
+    /// `headers` option. Header names the server sets itself are never
+    /// overridden by these — see [`CustomHeaders`].
+    pub headers: Vec<(String, String)>,
+    /// TLS material to serve over HTTPS. When `None` (the default) the
+    /// server speaks plain HTTP. When `Some`, every connection — including
+    /// the long-lived SSE live-reload stream — is wrapped in TLS. Mirrors
+    /// `@angular/build:dev-server`'s `ssl`/`sslKey`/`sslCert` options.
+    pub tls: Option<TlsConfig>,
+    /// Registry of per-component HMR update modules served at
+    /// `/@ng/component?c=<id>`. Empty by default (live reload only); the
+    /// `serve` command shares a handle and populates it on each HMR rebuild.
+    pub component_updates: ComponentUpdates,
 }
 
 impl DevServerConfig {
@@ -104,7 +153,19 @@ impl DevServerConfig {
             host: "127.0.0.1".to_string(),
             port: 4200,
             serve_path: None,
+            allowed_hosts: Vec::new(),
+            headers: Vec::new(),
+            tls: None,
+            component_updates: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Share an external [`ComponentUpdates`] registry so the build pipeline
+    /// can publish per-component HMR update modules the `/@ng/component`
+    /// endpoint then serves. Pass a handle you retain a clone of.
+    pub fn with_component_updates(mut self, updates: ComponentUpdates) -> Self {
+        self.component_updates = updates;
+        self
     }
 
     /// Override the bind host.
@@ -125,6 +186,113 @@ impl DevServerConfig {
     pub fn with_serve_path(mut self, serve_path: Option<&str>) -> Self {
         self.serve_path = serve_path.and_then(normalize_serve_path);
         self
+    }
+
+    /// Replace the `allowedHosts` patterns the dev server's Host-header
+    /// check accepts. See [`AllowedHosts`] for the matching semantics.
+    pub fn with_allowed_hosts<I, S>(mut self, hosts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.allowed_hosts = hosts.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Replace the custom response headers emitted on every served
+    /// response. See [`CustomHeaders`] for how reserved headers (the ones
+    /// the server sets itself) are protected from being clobbered.
+    pub fn with_headers<I, K, V>(mut self, headers: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.headers = headers
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
+        self
+    }
+
+    /// Serve over HTTPS using the supplied [`TlsConfig`]. Passing `None`
+    /// (the default) keeps the server on plain HTTP.
+    pub fn with_tls(mut self, tls: Option<TlsConfig>) -> Self {
+        self.tls = tls;
+        self
+    }
+}
+
+/// PEM-encoded TLS material used to serve the dev server over HTTPS.
+///
+/// Construct one either from caller-supplied certificate and key files
+/// ([`TlsConfig::from_pem`]) or by minting a throwaway self-signed
+/// certificate for local development ([`TlsConfig::self_signed`]). The bytes
+/// are handed to `tiny_http`'s `ssl-rustls` backend, which performs the TLS
+/// handshake for every accepted connection.
+#[derive(Clone)]
+pub struct TlsConfig {
+    /// PEM-encoded certificate (chain).
+    cert_pem: Vec<u8>,
+    /// PEM-encoded private key.
+    key_pem: Vec<u8>,
+}
+
+impl TlsConfig {
+    /// Wrap caller-supplied PEM bytes (e.g. read from `sslCert`/`sslKey`
+    /// files) without inspecting them — `tiny_http` validates the material
+    /// when the server is created and surfaces a clear error if either is
+    /// malformed.
+    pub fn from_pem(cert_pem: Vec<u8>, key_pem: Vec<u8>) -> Self {
+        Self { cert_pem, key_pem }
+    }
+
+    /// Generate a throwaway self-signed certificate covering `hosts` plus the
+    /// loopback names (`localhost`, `127.0.0.1`, `::1`), matching what
+    /// `@angular/build:dev-server` does when `ssl: true` is set without an
+    /// explicit key/cert. Browsers will show the usual "untrusted
+    /// certificate" warning the first time.
+    ///
+    /// Each host string is added as an IP SAN when it parses as an IP
+    /// address and a DNS SAN otherwise, so `--host 192.168.1.10` produces a
+    /// certificate the browser accepts for that address.
+    pub fn self_signed(hosts: &[String]) -> NgcResult<Self> {
+        let mut sans: Vec<String> = vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+            "::1".to_string(),
+        ];
+        for host in hosts {
+            let trimmed = host.trim();
+            // Skip blanks and wildcard binds — `0.0.0.0`/`::` are never a
+            // hostname the browser connects to, and the loopback SANs above
+            // already cover local development.
+            if trimmed.is_empty() || matches!(trimmed, "0.0.0.0" | "::" | "[::]") {
+                continue;
+            }
+            let normalized = trimmed.trim_start_matches('[').trim_end_matches(']');
+            if !sans.iter().any(|s| s == normalized) {
+                sans.push(normalized.to_string());
+            }
+        }
+        let cert = rcgen::generate_simple_self_signed(sans).map_err(|e| NgcError::ServeError {
+            message: format!("could not generate self-signed certificate: {e}"),
+        })?;
+        Ok(Self {
+            cert_pem: cert.cert.pem().into_bytes(),
+            key_pem: cert.signing_key.serialize_pem().into_bytes(),
+        })
+    }
+}
+
+// Hand-written so the private key never lands in a `Debug` dump (e.g. when
+// `DevServerConfig` is logged).
+impl std::fmt::Debug for TlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsConfig")
+            .field("cert_pem", &format_args!("{} bytes", self.cert_pem.len()))
+            .field("key_pem", &"<redacted>")
+            .finish()
     }
 }
 
@@ -154,6 +322,222 @@ pub fn normalize_serve_path(raw: &str) -> Option<String> {
     }
 }
 
+/// Decides whether an incoming HTTP request's `Host:` header is permitted.
+///
+/// Mirrors `@angular/build:dev-server`'s `allowedHosts` option (which in
+/// turn matches Vite's `server.allowedHosts`). Loopback hosts
+/// (`localhost`, `127.0.0.1`, `[::1]`) are always accepted regardless of
+/// configuration — local development must always work. On top of that:
+///
+/// * The literal pattern `"all"` disables the check entirely.
+/// * The literal pattern `"auto"` (or an empty configuration) additionally
+///   accepts the bind host, so a server bound to `192.168.1.10` accepts
+///   `Host: 192.168.1.10` without further configuration.
+/// * Anything else is an exact, case-insensitive hostname match. The
+///   port portion of the `Host:` header is stripped before comparison.
+#[derive(Debug, Clone)]
+pub struct AllowedHosts {
+    accept_all: bool,
+    explicit: Vec<String>,
+    bind_host: Option<String>,
+}
+
+impl AllowedHosts {
+    /// Resolve the user-supplied `allowedHosts` patterns against the
+    /// `bind_host` the dev server is listening on.
+    ///
+    /// Empty input is treated as `"auto"` so callers that never opt in
+    /// still get the historical "loopback + bind host" behavior.
+    pub fn resolve(patterns: &[String], bind_host: &str) -> Self {
+        let mut accept_all = false;
+        let mut auto = false;
+        let mut explicit: Vec<String> = Vec::new();
+        let mut any = false;
+        for p in patterns {
+            any = true;
+            let trimmed = p.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let lower = trimmed.to_ascii_lowercase();
+            match lower.as_str() {
+                "all" => accept_all = true,
+                "auto" => auto = true,
+                _ => explicit.push(lower),
+            }
+        }
+        // Default (no patterns supplied) == "auto" — accept the bind host
+        // on top of the loopback defaults so projects that bind to a LAN
+        // IP still respond to that IP without explicit allow-listing.
+        if !any {
+            auto = true;
+        }
+        let bind_host = if auto {
+            normalized_bind_host(bind_host)
+        } else {
+            None
+        };
+        Self {
+            accept_all,
+            explicit,
+            bind_host,
+        }
+    }
+
+    /// Returns `true` when the dev server is configured to accept every
+    /// `Host:` header (i.e. the user passed `"all"`).
+    pub fn accepts_all(&self) -> bool {
+        self.accept_all
+    }
+
+    /// Decide whether a request bearing this `Host:` header value should
+    /// be served. A missing or empty header counts as a mismatch.
+    pub fn is_allowed(&self, host_header: &str) -> bool {
+        if self.accept_all {
+            return true;
+        }
+        let stripped = strip_port(host_header.trim());
+        if stripped.is_empty() {
+            return false;
+        }
+        let host = stripped.to_ascii_lowercase();
+        if is_loopback_host(&host) {
+            return true;
+        }
+        if let Some(bh) = &self.bind_host {
+            if &host == bh {
+                return true;
+            }
+        }
+        self.explicit.iter().any(|p| p == &host)
+    }
+}
+
+/// Lowercase + lookup-normalize a `bind_host` for use in `AllowedHosts`.
+///
+/// Returns `None` when the bind host is a wildcard (`0.0.0.0`, `::`, `[::]`)
+/// or a loopback alias — there's nothing useful to add beyond the
+/// loopback defaults the allowlist already accepts.
+fn normalized_bind_host(bind_host: &str) -> Option<String> {
+    let host = bind_host.trim().to_ascii_lowercase();
+    if host.is_empty()
+        || matches!(host.as_str(), "0.0.0.0" | "::" | "[::]")
+        || is_loopback_host(&host)
+    {
+        return None;
+    }
+    Some(host)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
+}
+
+/// Strip the port from a `Host:` header value, leaving the hostname
+/// (or IP literal) intact.
+///
+/// Handles three shapes:
+///   * `host`            → `host`
+///   * `host:port`       → `host`
+///   * `[v6]:port`       → `[v6]` (brackets preserved so the value can be
+///     compared against the canonical IPv6 loopback literal `[::1]`)
+fn strip_port(host: &str) -> &str {
+    if let Some(rest) = host.strip_prefix('[') {
+        if let Some(end_rel) = rest.find(']') {
+            // end_rel is the position of `]` within `rest`; +2 accounts
+            // for the opening `[` we stripped and the `]` itself.
+            return &host[..end_rel + 2];
+        }
+        return host;
+    }
+    match host.rfind(':') {
+        Some(i) => &host[..i],
+        None => host,
+    }
+}
+
+/// Custom HTTP response headers emitted on every served response.
+///
+/// Mirrors `@angular/build:dev-server`'s `headers` option, letting a
+/// project configure production-like security headers (CSP,
+/// `Cross-Origin-Opener-Policy`, …), CORS headers, or cache-control
+/// overrides for the dev server.
+///
+/// Two invariants matter:
+///
+/// * **Validated once.** Each name/value pair is checked against
+///   `tiny_http`'s header parser at construction time; an invalid entry is
+///   dropped with a warning rather than failing every request.
+/// * **Never clobbers server headers.** Headers the dev server sets itself
+///   (the response `Content-Type`, the `Cache-Control` on static files,
+///   and the SSE stream's `Connection` / `Access-Control-Allow-Origin`)
+///   take precedence — a user `headers` entry for one of those names is
+///   skipped for that response so the server stays correct.
+#[derive(Debug, Clone, Default)]
+pub struct CustomHeaders {
+    headers: Vec<(String, String)>,
+}
+
+impl CustomHeaders {
+    /// Validate and retain the user-supplied `headers` map. Entries with a
+    /// blank name, or a name/value `tiny_http` rejects, are dropped with a
+    /// `warn` so a typo in `angular.json` is visible without taking the
+    /// whole dev server down.
+    pub fn resolve(raw: &[(String, String)]) -> Self {
+        let mut headers = Vec::with_capacity(raw.len());
+        for (name, value) in raw {
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            if Header::from_bytes(name.as_bytes(), value.as_bytes()).is_err() {
+                tracing::warn!(header = %name, "ignoring invalid custom response header");
+                continue;
+            }
+            headers.push((name.to_string(), value.clone()));
+        }
+        Self { headers }
+    }
+
+    /// `true` when no custom headers are configured.
+    pub fn is_empty(&self) -> bool {
+        self.headers.is_empty()
+    }
+
+    /// Add every configured header to `resp`, skipping any whose name
+    /// matches (case-insensitively) an entry in `reserved` — those the
+    /// server already set and must not let a user value clobber.
+    fn apply<R: std::io::Read>(&self, resp: &mut Response<R>, reserved: &[&str]) {
+        for (name, value) in &self.headers {
+            if reserved.iter().any(|r| r.eq_ignore_ascii_case(name)) {
+                continue;
+            }
+            // Pre-validated in `resolve`, so `from_bytes` can't fail here;
+            // ignore the (impossible) error rather than propagating it.
+            if let Ok(h) = Header::from_bytes(name.as_bytes(), value.as_bytes()) {
+                resp.add_header(h);
+            }
+        }
+    }
+
+    /// Render the configured headers as raw `Name: value\r\n` lines for the
+    /// hand-written SSE response head, skipping any reserved name. The
+    /// returned string is empty when nothing applies.
+    fn header_lines(&self, reserved: &[&str]) -> String {
+        let mut out = String::new();
+        for (name, value) in &self.headers {
+            if reserved.iter().any(|r| r.eq_ignore_ascii_case(name)) {
+                continue;
+            }
+            out.push_str(name);
+            out.push_str(": ");
+            out.push_str(value);
+            out.push_str("\r\n");
+        }
+        out
+    }
+}
+
 /// Handle to a running dev server.
 ///
 /// Dropping the handle stops the server and closes any open SSE connections.
@@ -163,6 +547,7 @@ pub struct DevServer {
     server: Arc<Server>,
     accept_join: Option<JoinHandle<()>>,
     serve_path: Option<String>,
+    is_tls: bool,
 }
 
 impl DevServer {
@@ -195,9 +580,15 @@ impl DevServer {
             message: format!("could not read local address: {e}"),
         })?;
 
-        let server = Server::from_listener(listener, None).map_err(|e| NgcError::ServeError {
-            message: format!("tiny_http server init failed: {e}"),
-        })?;
+        let is_tls = config.tls.is_some();
+        let ssl_config = config.tls.as_ref().map(|t| SslConfig {
+            certificate: t.cert_pem.clone(),
+            private_key: t.key_pem.clone(),
+        });
+        let server =
+            Server::from_listener(listener, ssl_config).map_err(|e| NgcError::ServeError {
+                message: format!("tiny_http server init failed: {e}"),
+            })?;
         let server = Arc::new(server);
 
         let clients: SseClients = Arc::new(Mutex::new(Vec::new()));
@@ -211,9 +602,23 @@ impl DevServer {
         let request_clients = Arc::clone(&clients);
         let serve_path = config.serve_path.clone();
         let serve_path_for_loop = serve_path.clone();
+        let allowed_hosts = Arc::new(AllowedHosts::resolve(&config.allowed_hosts, &config.host));
+        let allowed_hosts_for_loop = Arc::clone(&allowed_hosts);
+        let custom_headers = Arc::new(CustomHeaders::resolve(&config.headers));
+        let component_updates = Arc::clone(&config.component_updates);
         let join = thread::Builder::new()
             .name("ngc-dev-server-accept".into())
-            .spawn(move || serve_loop(request_server, root, request_clients, serve_path_for_loop))
+            .spawn(move || {
+                serve_loop(
+                    request_server,
+                    root,
+                    request_clients,
+                    serve_path_for_loop,
+                    allowed_hosts_for_loop,
+                    custom_headers,
+                    component_updates,
+                )
+            })
             .map_err(|e| NgcError::ServeError {
                 message: format!("could not spawn accept thread: {e}"),
             })?;
@@ -226,6 +631,7 @@ impl DevServer {
             server,
             accept_join: Some(join),
             serve_path,
+            is_tls,
         })
     }
 
@@ -239,6 +645,17 @@ impl DevServer {
     /// or `None` when the server is mounted at `/`.
     pub fn serve_path(&self) -> Option<&str> {
         self.serve_path.as_deref()
+    }
+
+    /// The URL scheme the server answers on: `"https"` when TLS is enabled,
+    /// `"http"` otherwise. Use this to build a browser-facing URL that
+    /// matches the wire protocol.
+    pub fn scheme(&self) -> &'static str {
+        if self.is_tls {
+            "https"
+        } else {
+            "http"
+        }
     }
 
     /// Send a reload event to all connected browsers without going through
@@ -324,6 +741,15 @@ fn fanout_loop(rx: Receiver<DevServerEvent>, clients: SseClients) {
 pub fn sse_frame(event: &DevServerEvent) -> String {
     match event {
         DevServerEvent::Reload => "event: reload\ndata: rebuild\n\n".to_string(),
+        DevServerEvent::CssUpdate { timestamp } => {
+            format!("event: css-update\ndata: {{\"timestamp\":{timestamp}}}\n\n")
+        }
+        DevServerEvent::ComponentUpdate { id, timestamp } => {
+            // `id` is already percent-encoded JS-identifier-safe text, but
+            // route it through serde so any stray quote can't break the JSON.
+            let payload = serde_json::json!({ "id": id, "timestamp": timestamp });
+            format!("event: angular:component-update\ndata: {payload}\n\n")
+        }
         DevServerEvent::BuildFailed {
             message,
             file,
@@ -341,28 +767,57 @@ pub fn sse_frame(event: &DevServerEvent) -> String {
     }
 }
 
-fn serve_loop(server: Arc<Server>, root: PathBuf, clients: SseClients, serve_path: Option<String>) {
+#[allow(clippy::too_many_arguments)]
+fn serve_loop(
+    server: Arc<Server>,
+    root: PathBuf,
+    clients: SseClients,
+    serve_path: Option<String>,
+    allowed_hosts: Arc<AllowedHosts>,
+    headers: Arc<CustomHeaders>,
+    component_updates: ComponentUpdates,
+) {
     for request in server.incoming_requests() {
         let root = root.clone();
         let clients = Arc::clone(&clients);
         let serve_path = serve_path.clone();
+        let allowed_hosts = Arc::clone(&allowed_hosts);
+        let headers = Arc::clone(&headers);
+        let component_updates = Arc::clone(&component_updates);
         thread::spawn(move || {
-            if let Err(e) = handle_request(request, &root, &clients, serve_path.as_deref()) {
+            if let Err(e) = handle_request(
+                request,
+                &root,
+                &clients,
+                serve_path.as_deref(),
+                &allowed_hosts,
+                &headers,
+                &component_updates,
+            ) {
                 tracing::warn!(error = %e, "dev server request failed");
             }
         });
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_request(
     request: tiny_http::Request,
     root: &Path,
     clients: &SseClients,
     serve_path: Option<&str>,
+    allowed_hosts: &AllowedHosts,
+    headers: &CustomHeaders,
+    component_updates: &ComponentUpdates,
 ) -> NgcResult<()> {
     if !matches!(request.method(), Method::Get | Method::Head) {
         let resp = Response::from_string("method not allowed").with_status_code(StatusCode(405));
         return request.respond(resp).map_err(io_err);
+    }
+
+    let host_header = host_header_value(&request);
+    if !allowed_hosts.is_allowed(&host_header) {
+        return respond_disallowed_host(request, &host_header);
     }
 
     let url = request.url().to_string();
@@ -377,10 +832,92 @@ fn handle_request(
     };
 
     if stripped == "/__ngc_reload" {
-        return handle_sse(request, clients);
+        return handle_sse(request, clients, headers);
     }
 
-    serve_static(request, root, stripped, serve_path)
+    if stripped == "/@ng/component" {
+        return handle_component_update(request, &url, component_updates, headers);
+    }
+
+    serve_static(request, root, stripped, serve_path, headers)
+}
+
+/// Serve a per-component HMR update module for `GET /@ng/component?c=<id>`.
+///
+/// The `c` query value is the percent-encoded component id the compiler
+/// embedded in the component's HMR initializer; it's used verbatim as the
+/// registry key (the running app sends exactly what was embedded). When no
+/// module is registered for the id, an empty `200` is returned — the running
+/// app's loader guards on `m.default`, so an empty module is a safe no-op
+/// (mirrors `@angular/build`'s component middleware).
+fn handle_component_update(
+    request: tiny_http::Request,
+    url: &str,
+    component_updates: &ComponentUpdates,
+    headers: &CustomHeaders,
+) -> NgcResult<()> {
+    let Some(id) = query_param(url, "c") else {
+        let resp = Response::from_string("missing c parameter").with_status_code(StatusCode(400));
+        return request.respond(resp).map_err(io_err);
+    };
+    let code = component_updates
+        .lock()
+        .ok()
+        .and_then(|map| map.get(id).cloned())
+        .unwrap_or_default();
+    let mut resp = Response::from_data(code.into_bytes());
+    resp.add_header(header("Content-Type", "text/javascript")?);
+    resp.add_header(header("Cache-Control", "no-cache")?);
+    headers.apply(&mut resp, &["Content-Type", "Cache-Control"]);
+    request.respond(resp).map_err(io_err)
+}
+
+/// Extract a raw (still percent-encoded) query parameter value from a URL.
+///
+/// Returns the substring after `<name>=` up to the next `&`. The value is
+/// **not** percent-decoded: component ids are stored and matched in their
+/// encoded form, so decoding here would break the registry lookup.
+fn query_param<'a>(url: &'a str, name: &str) -> Option<&'a str> {
+    let query = url.split_once('?')?.1;
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == name).then_some(v)
+    })
+}
+
+/// Read the request's `Host:` header value, or return the empty string when
+/// the client didn't send one. HTTP/1.1 requires the header, but a misbehaving
+/// client (or a port scanner sending an HTTP/1.0 request) could omit it — in
+/// that case the allow-list check treats it as a mismatch.
+fn host_header_value(request: &tiny_http::Request) -> String {
+    request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Host"))
+        .map(|h| h.value.as_str().to_string())
+        .unwrap_or_default()
+}
+
+/// Render the 403 returned for a `Host:` header that's not in the allow
+/// list. The body is plain text and points the user at the two knobs that
+/// fix it — same wording for the CLI flag and the builder option so a
+/// search of either turns up the same hit.
+fn respond_disallowed_host(request: tiny_http::Request, host_header: &str) -> NgcResult<()> {
+    let display = if host_header.is_empty() {
+        "<missing Host header>".to_string()
+    } else {
+        host_header.to_string()
+    };
+    let body = format!(
+        "ngc-rs dev server: blocked request for host \"{display}\".\n\n\
+         The host is not in the dev server's allowedHosts list.\n\
+         To allow it, either:\n\
+           - add it to `architect.serve.options.allowedHosts` in angular.json, or\n\
+           - pass `--allowed-hosts {display}` to `ngc-rs serve`.\n\
+         Use `\"all\"` to disable the host check entirely.\n"
+    );
+    let resp = Response::from_string(body).with_status_code(StatusCode(403));
+    request.respond(resp).map_err(io_err)
 }
 
 /// Strip the `serve_path` prefix from `path`, returning the remainder
@@ -415,18 +952,32 @@ fn strip_serve_path<'a>(path: &'a str, serve_path: Option<&str>) -> Option<&'a s
     None
 }
 
-fn handle_sse(request: tiny_http::Request, clients: &SseClients) -> NgcResult<()> {
-    let response_head = b"HTTP/1.1 200 OK\r\n\
-Content-Type: text/event-stream\r\n\
-Cache-Control: no-cache\r\n\
-Connection: keep-alive\r\n\
-Access-Control-Allow-Origin: *\r\n\
-\r\n\
-: connected\n\n";
+fn handle_sse(
+    request: tiny_http::Request,
+    clients: &SseClients,
+    headers: &CustomHeaders,
+) -> NgcResult<()> {
+    // The SSE stream sets these itself; a user `headers` entry for any of
+    // them is skipped so the event-stream contract stays intact.
+    const SSE_RESERVED: &[&str] = &[
+        "Content-Type",
+        "Cache-Control",
+        "Connection",
+        "Access-Control-Allow-Origin",
+    ];
+    let mut response_head = String::from(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: text/event-stream\r\n\
+         Cache-Control: no-cache\r\n\
+         Connection: keep-alive\r\n\
+         Access-Control-Allow-Origin: *\r\n",
+    );
+    response_head.push_str(&headers.header_lines(SSE_RESERVED));
+    response_head.push_str("\r\n: connected\n\n");
 
     let mut writer = request.into_writer();
     writer
-        .write_all(response_head)
+        .write_all(response_head.as_bytes())
         .and_then(|_| writer.flush())
         .map_err(|e| NgcError::ServeError {
             message: format!("could not start SSE stream: {e}"),
@@ -444,6 +995,7 @@ fn serve_static(
     root: &Path,
     url_path: &str,
     serve_path: Option<&str>,
+    headers: &CustomHeaders,
 ) -> NgcResult<()> {
     let decoded = decode_path(url_path);
     let candidate = match resolve_under_root(root, &decoded) {
@@ -455,8 +1007,8 @@ fn serve_static(
     };
 
     match pick_file(&candidate) {
-        Some(file_path) => respond_with_file(request, &file_path, serve_path),
-        None => spa_fallback(request, root, serve_path),
+        Some(file_path) => respond_with_file(request, &file_path, serve_path, headers),
+        None => spa_fallback(request, root, serve_path, headers),
     }
 }
 
@@ -477,10 +1029,11 @@ fn spa_fallback(
     request: tiny_http::Request,
     root: &Path,
     serve_path: Option<&str>,
+    headers: &CustomHeaders,
 ) -> NgcResult<()> {
     let index = root.join("index.html");
     if index.is_file() {
-        respond_with_file(request, &index, serve_path)
+        respond_with_file(request, &index, serve_path, headers)
     } else {
         let resp = Response::from_string("not found").with_status_code(StatusCode(404));
         request.respond(resp).map_err(io_err)
@@ -491,6 +1044,7 @@ fn respond_with_file(
     request: tiny_http::Request,
     path: &Path,
     serve_path: Option<&str>,
+    headers: &CustomHeaders,
 ) -> NgcResult<()> {
     let bytes = std::fs::read(path).map_err(|e| NgcError::Io {
         path: path.to_path_buf(),
@@ -507,6 +1061,10 @@ fn respond_with_file(
     let mut resp = Response::from_data(body);
     resp.add_header(header("Content-Type", mime)?);
     resp.add_header(header("Cache-Control", "no-cache")?);
+    // Apply user-configured headers last, but never let them clobber the
+    // `Content-Type` (correct for the file) or the dev-server
+    // `Cache-Control` (live reload depends on responses not being cached).
+    headers.apply(&mut resp, &["Content-Type", "Cache-Control"]);
     request.respond(resp).map_err(io_err)
 }
 
@@ -624,7 +1182,18 @@ pub fn mime_for(path: &Path) -> &'static str {
 /// Malformed `data:` payloads (non-JSON, missing keys) are tolerated and
 /// fall back to a generic "build failed" message rather than crashing the
 /// listener.
-pub const LIVE_RELOAD_SCRIPT: &str = r#"<script>(function(){try{var ID='__ngc_rs_overlay__';function dismiss(){var n=document.getElementById(ID);if(n){n.remove();}window.__ngcRsOverlay=null;}function show(payload){dismiss();var data={};try{data=JSON.parse(payload)||{};}catch(_){}var msg=typeof data.message==='string'&&data.message?data.message:'ngc-rs rebuild failed';var loc='';if(typeof data.file==='string'&&data.file){loc=data.file;if(typeof data.line==='number'){loc+=':'+data.line;if(typeof data.column==='number'){loc+=':'+data.column;}}}var overlay=document.createElement('div');overlay.id=ID;overlay.setAttribute('role','alert');overlay.style.cssText='position:fixed;inset:0;z-index:2147483647;background:rgba(20,20,20,0.92);color:#ff6b6b;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:14px;line-height:1.5;padding:32px;overflow:auto;white-space:pre-wrap;word-break:break-word;';var header=document.createElement('div');header.textContent='ngc-rs build failed';header.style.cssText='font-weight:bold;font-size:16px;margin-bottom:16px;color:#ff8a8a;';overlay.appendChild(header);if(loc){var locEl=document.createElement('div');locEl.textContent=loc;locEl.style.cssText='color:#ffd166;margin-bottom:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';overlay.appendChild(locEl);}var body=document.createElement('pre');body.textContent=msg;body.style.cssText='margin:0;color:#ff6b6b;white-space:pre-wrap;word-break:break-word;';overlay.appendChild(body);var hint=document.createElement('div');hint.textContent='Press Esc to dismiss · overlay reappears on next failed rebuild';hint.style.cssText='margin-top:24px;color:#888;font-size:12px;';overlay.appendChild(hint);(document.body||document.documentElement).appendChild(overlay);window.__ngcRsOverlay=overlay;}function onKey(e){if(e.key==='Escape'){dismiss();}}document.addEventListener('keydown',onKey);var s=new EventSource('/__ngc_reload');s.addEventListener('reload',function(){dismiss();location.reload();});s.addEventListener('build-failed',function(e){show(e.data);});}catch(e){console.warn('[ngc-rs] live reload unavailable',e);}})();</script>"#;
+pub const LIVE_RELOAD_SCRIPT: &str = r#"<script>(function(){try{var ID='__ngc_rs_overlay__';function dismiss(){var n=document.getElementById(ID);if(n){n.remove();}window.__ngcRsOverlay=null;}function show(payload){dismiss();var data={};try{data=JSON.parse(payload)||{};}catch(_){}var msg=typeof data.message==='string'&&data.message?data.message:'ngc-rs rebuild failed';var loc='';if(typeof data.file==='string'&&data.file){loc=data.file;if(typeof data.line==='number'){loc+=':'+data.line;if(typeof data.column==='number'){loc+=':'+data.column;}}}var overlay=document.createElement('div');overlay.id=ID;overlay.setAttribute('role','alert');overlay.style.cssText='position:fixed;inset:0;z-index:2147483647;background:rgba(20,20,20,0.92);color:#ff6b6b;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:14px;line-height:1.5;padding:32px;overflow:auto;white-space:pre-wrap;word-break:break-word;';var header=document.createElement('div');header.textContent='ngc-rs build failed';header.style.cssText='font-weight:bold;font-size:16px;margin-bottom:16px;color:#ff8a8a;';overlay.appendChild(header);if(loc){var locEl=document.createElement('div');locEl.textContent=loc;locEl.style.cssText='color:#ffd166;margin-bottom:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';overlay.appendChild(locEl);}var body=document.createElement('pre');body.textContent=msg;body.style.cssText='margin:0;color:#ff6b6b;white-space:pre-wrap;word-break:break-word;';overlay.appendChild(body);var hint=document.createElement('div');hint.textContent='Press Esc to dismiss · overlay reappears on next failed rebuild';hint.style.cssText='margin-top:24px;color:#888;font-size:12px;';overlay.appendChild(hint);(document.body||document.documentElement).appendChild(overlay);window.__ngcRsOverlay=overlay;}function onKey(e){if(e.key==='Escape'){dismiss();}}document.addEventListener('keydown',onKey);function swapCss(t){var links=document.querySelectorAll('link[rel="stylesheet"]');for(var i=0;i < links.length;i++){(function(link){var href=link.getAttribute('href');if(!href){return;}var base=href.split('?')[0];if(!/(^|\/)styles\.css$/.test(base)){return;}var next=link.cloneNode(false);next.setAttribute('href',base+'?ngcss='+t);next.addEventListener('load',function(){if(link.parentNode){link.parentNode.removeChild(link);}});next.addEventListener('error',function(){if(next.parentNode){next.parentNode.removeChild(next);}});link.parentNode.insertBefore(next,link.nextSibling);})(links[i]);}}var hmrHandlers={};function emitHmr(ev,d){var a=hmrHandlers[ev]||[];for(var i=0;i < a.length;i++){try{a[i](d);}catch(err){console.error('[ngc-rs] hmr handler error',err);}}}window.__ngcHmr={on:function(ev,cb){(hmrHandlers[ev]=hmrHandlers[ev]||[]).push(cb);},off:function(ev,cb){var a=hmrHandlers[ev];if(a){var i=a.indexOf(cb);if(i>=0){a.splice(i,1);}}},send:function(){}};var s=new EventSource('/__ngc_reload');s.addEventListener('reload',function(){dismiss();location.reload();});s.addEventListener('build-failed',function(e){show(e.data);});s.addEventListener('css-update',function(e){var t=0;try{t=(JSON.parse(e.data)||{}).timestamp||0;}catch(_){}if(!t){t=(new Date()).getTime();}dismiss();swapCss(t);});s.addEventListener('angular:component-update',function(e){var d={};try{d=JSON.parse(e.data)||{};}catch(_){}dismiss();emitHmr('angular:component-update',d);});}catch(e){console.warn('[ngc-rs] live reload unavailable',e);}})();</script>"#;
+
+/// Module-scope prelude prepended to the entry chunk (`main.js`) when HMR is
+/// enabled. The per-component HMR initializers the compiler emits reference
+/// `import.meta.hot`, which only exists inside a module's `import.meta`; this
+/// binds it to the event bus the injected [`LIVE_RELOAD_SCRIPT`] publishes on
+/// `window.__ngcHmr`. The inline script runs before the deferred module, so
+/// `window.__ngcHmr` is already defined when this line executes. A no-op stub
+/// is used as a fallback so the bundle never throws if live reload failed to
+/// initialise.
+pub const HMR_RUNTIME_PRELUDE: &str =
+    "import.meta.hot=globalThis.__ngcHmr||{on:function(){},off:function(){},send:function(){}};\n";
 
 /// Insert the live-reload client script into an HTML byte buffer.
 ///
@@ -794,6 +1363,73 @@ mod tests {
             sse_frame(&DevServerEvent::Reload),
             "event: reload\ndata: rebuild\n\n"
         );
+    }
+
+    #[test]
+    fn sse_frame_for_css_update_emits_named_event_with_timestamp() {
+        let frame = sse_frame(&DevServerEvent::CssUpdate { timestamp: 7 });
+        assert!(frame.starts_with("event: css-update\n"));
+        let data_line = frame.lines().nth(1).expect("data line");
+        let json: serde_json::Value =
+            serde_json::from_str(data_line.strip_prefix("data: ").expect("data: prefix"))
+                .expect("css-update payload is JSON");
+        assert_eq!(json["timestamp"], 7);
+        assert!(frame.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn live_reload_script_handles_css_update_in_place() {
+        // The injected client must subscribe to `css-update` and swap the
+        // global styles.css link instead of reloading the page.
+        assert!(LIVE_RELOAD_SCRIPT.contains("addEventListener('css-update'"));
+        assert!(LIVE_RELOAD_SCRIPT.contains("function swapCss"));
+        assert!(LIVE_RELOAD_SCRIPT.contains("styles\\.css"));
+        // CSS updates must not trigger a full reload.
+        let after_css = LIVE_RELOAD_SCRIPT
+            .split("addEventListener('css-update'")
+            .nth(1)
+            .expect("css-update handler present");
+        let handler_body = after_css.split("});").next().unwrap_or("");
+        assert!(
+            !handler_body.contains("location.reload"),
+            "css-update handler must not reload the page"
+        );
+    }
+
+    #[test]
+    fn sse_frame_for_component_update_emits_angular_event() {
+        let frame = sse_frame(&DevServerEvent::ComponentUpdate {
+            id: "src%2Fapp%2Fapp.component.ts%40AppComponent".to_string(),
+            timestamp: 42,
+        });
+        assert!(frame.starts_with("event: angular:component-update\n"));
+        let data_line = frame.lines().nth(1).expect("data line");
+        let json: serde_json::Value =
+            serde_json::from_str(data_line.strip_prefix("data: ").expect("data: prefix"))
+                .expect("component-update payload is JSON");
+        assert_eq!(json["id"], "src%2Fapp%2Fapp.component.ts%40AppComponent");
+        assert_eq!(json["timestamp"], 42);
+        assert!(frame.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn query_param_extracts_raw_encoded_value() {
+        let url = "/@ng/component?c=src%2Fapp%40App&t=17";
+        assert_eq!(query_param(url, "c"), Some("src%2Fapp%40App"));
+        assert_eq!(query_param(url, "t"), Some("17"));
+        assert_eq!(query_param(url, "missing"), None);
+        assert_eq!(query_param("/@ng/component", "c"), None);
+    }
+
+    #[test]
+    fn live_reload_script_exposes_hmr_bus() {
+        // The injected client must publish the `__ngcHmr` bus and dispatch
+        // component-update events to registered handlers.
+        assert!(LIVE_RELOAD_SCRIPT.contains("window.__ngcHmr"));
+        assert!(LIVE_RELOAD_SCRIPT.contains("addEventListener('angular:component-update'"));
+        // The runtime prelude binds import.meta.hot to that bus.
+        assert!(HMR_RUNTIME_PRELUDE.contains("import.meta.hot"));
+        assert!(HMR_RUNTIME_PRELUDE.contains("globalThis.__ngcHmr"));
     }
 
     #[test]
@@ -973,5 +1609,211 @@ mod tests {
         // Other behavior is preserved.
         assert!(script.contains("addEventListener('reload'"));
         assert!(script.contains("addEventListener('build-failed'"));
+    }
+
+    #[test]
+    fn strip_port_handles_bare_hostname() {
+        assert_eq!(strip_port("example.com"), "example.com");
+        assert_eq!(strip_port("localhost"), "localhost");
+    }
+
+    #[test]
+    fn strip_port_drops_port_from_ipv4_and_hostname() {
+        assert_eq!(strip_port("example.com:4200"), "example.com");
+        assert_eq!(strip_port("127.0.0.1:4200"), "127.0.0.1");
+    }
+
+    #[test]
+    fn strip_port_preserves_ipv6_brackets() {
+        assert_eq!(strip_port("[::1]"), "[::1]");
+        assert_eq!(strip_port("[::1]:4200"), "[::1]");
+        assert_eq!(strip_port("[2001:db8::1]:8080"), "[2001:db8::1]");
+    }
+
+    #[test]
+    fn allowed_hosts_default_accepts_loopback_and_bind_host() {
+        let ah = AllowedHosts::resolve(&[], "192.168.1.10");
+        assert!(ah.is_allowed("localhost"));
+        assert!(ah.is_allowed("localhost:4200"));
+        assert!(ah.is_allowed("127.0.0.1"));
+        assert!(ah.is_allowed("[::1]:4200"));
+        assert!(ah.is_allowed("192.168.1.10"));
+        assert!(ah.is_allowed("192.168.1.10:4200"));
+        assert!(!ah.is_allowed("my-app.ngrok.io"));
+        assert!(!ah.is_allowed("evil.example.com"));
+    }
+
+    #[test]
+    fn allowed_hosts_all_accepts_anything() {
+        let ah = AllowedHosts::resolve(&["all".to_string()], "127.0.0.1");
+        assert!(ah.accepts_all());
+        assert!(ah.is_allowed("evil.example.com"));
+        assert!(ah.is_allowed("my-app.ngrok.io:443"));
+        // An empty Host header still counts as accepted when the user
+        // opted in to "all" — that's the documented bypass.
+        assert!(ah.is_allowed(""));
+    }
+
+    #[test]
+    fn allowed_hosts_explicit_matches_exact_hostnames_case_insensitively() {
+        let ah = AllowedHosts::resolve(&["my-app.ngrok.io".to_string()], "127.0.0.1");
+        assert!(ah.is_allowed("my-app.ngrok.io"));
+        assert!(ah.is_allowed("My-App.NgRoK.io"));
+        assert!(ah.is_allowed("my-app.ngrok.io:8443"));
+        assert!(!ah.is_allowed("other.ngrok.io"));
+        assert!(!ah.is_allowed("evil.com"));
+        // Loopback is always accepted on top of explicit entries.
+        assert!(ah.is_allowed("localhost"));
+        assert!(ah.is_allowed("127.0.0.1"));
+    }
+
+    #[test]
+    fn allowed_hosts_explicit_without_auto_does_not_accept_bind_host() {
+        // Without "auto", the bind host is NOT auto-allowed — the user
+        // explicitly listed which non-loopback hosts to trust.
+        let ah = AllowedHosts::resolve(&["my-app.ngrok.io".to_string()], "192.168.1.10");
+        assert!(!ah.is_allowed("192.168.1.10"));
+        assert!(ah.is_allowed("my-app.ngrok.io"));
+    }
+
+    #[test]
+    fn allowed_hosts_auto_re_enables_bind_host_alongside_explicit_entries() {
+        let ah = AllowedHosts::resolve(
+            &["auto".to_string(), "my-app.ngrok.io".to_string()],
+            "192.168.1.10",
+        );
+        assert!(ah.is_allowed("192.168.1.10"));
+        assert!(ah.is_allowed("my-app.ngrok.io"));
+        assert!(!ah.is_allowed("evil.com"));
+    }
+
+    #[test]
+    fn allowed_hosts_rejects_missing_host_header_by_default() {
+        let ah = AllowedHosts::resolve(&[], "127.0.0.1");
+        assert!(!ah.is_allowed(""));
+        assert!(!ah.is_allowed("   "));
+    }
+
+    #[test]
+    fn allowed_hosts_skips_wildcard_bind_address() {
+        // Binding to 0.0.0.0 doesn't auto-allow "0.0.0.0" as a hostname —
+        // that's never a meaningful Host: header value. Loopback still works.
+        let ah = AllowedHosts::resolve(&[], "0.0.0.0");
+        assert!(ah.is_allowed("localhost"));
+        assert!(ah.is_allowed("127.0.0.1"));
+        assert!(!ah.is_allowed("0.0.0.0"));
+        assert!(!ah.is_allowed("192.168.1.10"));
+    }
+
+    #[test]
+    fn allowed_hosts_ignores_empty_and_whitespace_patterns() {
+        let ah = AllowedHosts::resolve(
+            &["".to_string(), "   ".to_string(), "ok.example".to_string()],
+            "127.0.0.1",
+        );
+        assert!(ah.is_allowed("ok.example"));
+        assert!(ah.is_allowed("localhost"));
+        assert!(!ah.is_allowed("nope.example"));
+    }
+
+    fn pair(name: &str, value: &str) -> (String, String) {
+        (name.to_string(), value.to_string())
+    }
+
+    #[test]
+    fn custom_headers_empty_by_default() {
+        assert!(CustomHeaders::default().is_empty());
+        assert!(CustomHeaders::resolve(&[]).is_empty());
+    }
+
+    #[test]
+    fn custom_headers_resolve_keeps_valid_entries() {
+        let ch = CustomHeaders::resolve(&[
+            pair("X-Frame-Options", "DENY"),
+            pair("Cross-Origin-Opener-Policy", "same-origin"),
+        ]);
+        assert!(!ch.is_empty());
+        assert_eq!(ch.headers.len(), 2);
+    }
+
+    #[test]
+    fn custom_headers_resolve_drops_blank_names() {
+        let ch = CustomHeaders::resolve(&[pair("", "x"), pair("   ", "y"), pair("X-Ok", "z")]);
+        assert_eq!(ch.headers.len(), 1);
+        assert_eq!(ch.headers[0].0, "X-Ok");
+    }
+
+    #[test]
+    fn custom_headers_resolve_drops_invalid_names() {
+        // A non-ASCII header name cannot be represented on the wire and is
+        // dropped rather than failing every request.
+        let ch = CustomHeaders::resolve(&[pair("Föö", "bar")]);
+        assert!(ch.is_empty());
+    }
+
+    #[test]
+    fn custom_headers_header_lines_skips_reserved_names() {
+        let ch = CustomHeaders::resolve(&[
+            pair("Content-Type", "text/evil"),
+            pair("X-Frame-Options", "DENY"),
+        ]);
+        let lines = ch.header_lines(&["Content-Type", "Cache-Control"]);
+        assert!(!lines.to_ascii_lowercase().contains("content-type"));
+        assert!(lines.contains("X-Frame-Options: DENY\r\n"));
+    }
+
+    #[test]
+    fn custom_headers_header_lines_reserved_match_is_case_insensitive() {
+        let ch = CustomHeaders::resolve(&[pair("content-type", "x")]);
+        assert!(ch.header_lines(&["Content-Type"]).is_empty());
+    }
+
+    #[test]
+    fn devserver_config_with_headers_stores_pairs() {
+        let cfg = DevServerConfig::new("/tmp/dist").with_headers([("X-A", "1"), ("X-B", "2")]);
+        assert_eq!(cfg.headers.len(), 2);
+        assert_eq!(cfg.headers[0], ("X-A".to_string(), "1".to_string()));
+    }
+
+    #[test]
+    fn devserver_config_tls_defaults_to_none() {
+        assert!(DevServerConfig::new("/tmp/dist").tls.is_none());
+    }
+
+    #[test]
+    fn devserver_config_with_tls_stores_material() {
+        let tls = TlsConfig::from_pem(b"CERT".to_vec(), b"KEY".to_vec());
+        let cfg = DevServerConfig::new("/tmp/dist").with_tls(Some(tls));
+        let stored = cfg.tls.expect("tls present");
+        assert_eq!(stored.cert_pem, b"CERT");
+        assert_eq!(stored.key_pem, b"KEY");
+    }
+
+    #[test]
+    fn tls_self_signed_emits_pem_for_cert_and_key() {
+        let tls = TlsConfig::self_signed(&["app.local".to_string()]).expect("generate");
+        let cert = String::from_utf8(tls.cert_pem.clone()).expect("utf8 cert");
+        let key = String::from_utf8(tls.key_pem.clone()).expect("utf8 key");
+        assert!(cert.contains("BEGIN CERTIFICATE"));
+        assert!(cert.contains("END CERTIFICATE"));
+        assert!(key.contains("PRIVATE KEY"));
+    }
+
+    #[test]
+    fn tls_self_signed_skips_blank_and_wildcard_hosts() {
+        // Should not error on wildcard/blank binds — they're dropped and the
+        // loopback SANs still cover local development.
+        let tls =
+            TlsConfig::self_signed(&["0.0.0.0".to_string(), "".to_string(), "::".to_string()])
+                .expect("generate");
+        assert!(!tls.cert_pem.is_empty());
+    }
+
+    #[test]
+    fn tls_config_debug_redacts_private_key() {
+        let tls = TlsConfig::from_pem(b"CERTBYTES".to_vec(), b"SECRETKEY".to_vec());
+        let rendered = format!("{tls:?}");
+        assert!(rendered.contains("redacted"));
+        assert!(!rendered.contains("SECRETKEY"));
     }
 }

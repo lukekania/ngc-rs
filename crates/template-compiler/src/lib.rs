@@ -10,6 +10,7 @@ mod codegen;
 mod directive_codegen;
 mod extract;
 mod factory_codegen;
+pub mod hmr;
 pub mod host_codegen;
 pub mod i18n;
 mod injectable_codegen;
@@ -73,6 +74,11 @@ pub struct CompileOptions {
     /// `@angular/build:application`'s `strictTemplates` behaviour, which has
     /// no JIT fallback.
     pub strict_templates: bool,
+    /// When `true`, emit Angular HMR codegen for each compiled `@Component`:
+    /// a per-component initializer IIFE appended to the module, plus a
+    /// separate update module returned in [`CompiledFile::hmr`]. Dev-only
+    /// (`ngc-rs serve --hmr`); production builds leave this `false`.
+    pub hmr: bool,
 }
 
 /// Lightweight metadata for template compilation without `ExtractedComponent`.
@@ -255,6 +261,36 @@ pub struct CompiledFile {
     pub compiled: bool,
     /// Whether JIT fallback was used (decorator left as-is).
     pub jit_fallback: bool,
+    /// HMR artifacts for this file, present only when [`CompileOptions::hmr`]
+    /// is set and a component was compiled. `None` otherwise.
+    pub hmr: Option<HmrArtifacts>,
+}
+
+/// HMR artifacts produced for one source file when HMR codegen is enabled.
+#[derive(Debug, Clone)]
+pub struct HmrArtifacts {
+    /// One entry per `@Component` in the file. Today the compiler emits at
+    /// most one (the pipeline is single-component per file); a `Vec` keeps
+    /// the shape forward-compatible.
+    pub components: Vec<HmrComponent>,
+}
+
+/// HMR codegen for a single component: its id, the update module the dev
+/// server serves at `/@ng/component?c=<id>`, and the resource files whose
+/// edits map back to this component.
+#[derive(Debug, Clone)]
+pub struct HmrComponent {
+    /// The component class name.
+    pub class_name: String,
+    /// `encodeURIComponent("<relpath>@<ClassName>")` — the dev-server
+    /// registry key and the id embedded in the component's initializer.
+    pub id: String,
+    /// The update module source (already transformed to JS): an ES module
+    /// whose `export default` re-applies the component's `ɵcmp`.
+    pub update_module_source: String,
+    /// Absolute paths of external resources (`templateUrl` + `styleUrls`).
+    /// A change to one of these maps the rebuild to this component id.
+    pub resource_files: Vec<PathBuf>,
 }
 
 /// Compile all Angular decorators in the given TypeScript source files.
@@ -408,6 +444,7 @@ fn compile_file_fallthrough(
         source: source.to_string(),
         compiled: false,
         jit_fallback: false,
+        hmr: None,
     })
 }
 
@@ -435,6 +472,7 @@ fn compile_file_dispatch(
             source: source.to_string(),
             compiled: false,
             jit_fallback: false,
+            hmr: None,
         });
     }
 
@@ -470,6 +508,7 @@ fn compile_file_dispatch(
         source: source.to_string(),
         compiled: false,
         jit_fallback: false,
+        hmr: None,
     })
 }
 
@@ -486,6 +525,7 @@ fn finalize_injectable(
         source: rewritten,
         compiled: true,
         jit_fallback: false,
+        hmr: None,
     })
 }
 
@@ -502,6 +542,7 @@ fn finalize_directive(
         source: rewritten,
         compiled: true,
         jit_fallback: false,
+        hmr: None,
     })
 }
 
@@ -518,6 +559,7 @@ fn finalize_pipe(
         source: rewritten,
         compiled: true,
         jit_fallback: false,
+        hmr: None,
     })
 }
 
@@ -534,6 +576,7 @@ fn finalize_ng_module(
         source: rewritten,
         compiled: true,
         jit_fallback: false,
+        hmr: None,
     })
 }
 
@@ -686,6 +729,7 @@ pub fn compile_component_with_options(
                 source: source.to_string(),
                 compiled: false,
                 jit_fallback: false,
+                hmr: None,
             });
         }
     };
@@ -711,6 +755,7 @@ pub fn compile_component_with_options(
             source: source.to_string(),
             compiled: false,
             jit_fallback: true,
+            hmr: None,
         });
     }
 
@@ -737,6 +782,7 @@ pub fn compile_component_with_options(
             source: source.to_string(),
             compiled: false,
             jit_fallback: false,
+            hmr: None,
         });
     };
 
@@ -746,8 +792,43 @@ pub fn compile_component_with_options(
     // Generate Ivy code
     let ivy_output = codegen::generate_ivy(&extracted, &template_ast)?;
 
-    // Rewrite the source
-    let rewritten = rewrite::rewrite_source(source, &extracted, &ivy_output)?;
+    // Rewrite the source. In HMR mode the rewrite also adds an
+    // `import * as i0 from '@angular/core'` so the appended initializer can
+    // reach `i0.ɵɵreplaceMetadata` and pass the core namespace to the update.
+    let mut rewritten = rewrite::rewrite_source(source, &extracted, &ivy_output, compile_opts.hmr)?;
+
+    // HMR codegen: build the per-component update module and append the
+    // initializer IIFE to the module. The update module is returned in
+    // `CompiledFile::hmr` for the dev server to serve on demand.
+    let hmr = if compile_opts.hmr {
+        let id = hmr::component_hmr_id(&style_ctx.project_root, file_path, &extracted.class_name);
+        let locals = &extracted.imports_identifiers;
+        let update_ts = hmr::build_update_module_ts(&extracted.class_name, &ivy_output, locals);
+        let update_module_source =
+            ngc_ts_transform::transform_source(&update_ts, "ngc-hmr-update.ts")?;
+        rewritten.push('\n');
+        rewritten.push_str(&hmr::build_initializer(&extracted.class_name, &id, locals));
+
+        let base_dir = file_path.parent().unwrap_or(Path::new("."));
+        let mut resource_files = Vec::new();
+        if let Some(ref url) = extracted.template_url {
+            resource_files.push(base_dir.join(url));
+        }
+        for url in &extracted.style_urls {
+            resource_files.push(base_dir.join(url));
+        }
+
+        Some(HmrArtifacts {
+            components: vec![HmrComponent {
+                class_name: extracted.class_name.clone(),
+                id,
+                update_module_source,
+                resource_files,
+            }],
+        })
+    } else {
+        None
+    };
 
     debug!(path = %file_path.display(), "compiled template to Ivy");
 
@@ -756,6 +837,7 @@ pub fn compile_component_with_options(
         source: rewritten,
         compiled: true,
         jit_fallback: false,
+        hmr,
     })
 }
 
@@ -798,6 +880,7 @@ export class XComponent {}
         let style_ctx = StyleContext::default();
         let strict = CompileOptions {
             strict_templates: true,
+            ..Default::default()
         };
         let lenient = CompileOptions::default();
 
@@ -829,6 +912,77 @@ export class XComponent {}
             js.err(),
             result.source
         );
+    }
+
+    #[test]
+    fn test_hmr_codegen_produces_valid_artifacts() {
+        let source = "import { Component } from '@angular/core';\n\n@Component({\n  selector: 'app-counter',\n  standalone: true,\n  template: '<button (click)=\"inc()\">{{ count }}</button>',\n  styles: ['button { color: red; }'],\n})\nexport class CounterComponent {\n  count = 0;\n  inc() { this.count++; }\n}\n";
+        let path = PathBuf::from("/proj/src/app/counter.component.ts");
+        let style_ctx = StyleContext {
+            project_root: PathBuf::from("/proj"),
+            ..Default::default()
+        };
+        let opts = CompileOptions {
+            hmr: true,
+            ..Default::default()
+        };
+        let result = compile_component_with_options(source, &path, &style_ctx, &opts)
+            .expect("hmr compile should succeed");
+        assert!(result.compiled);
+
+        // The rewritten module must add the `i0` namespace import and the
+        // appended HMR initializer wired to `import.meta.hot`.
+        assert!(result
+            .source
+            .contains("import * as i0 from '@angular/core';"));
+        assert!(result
+            .source
+            .contains("import.meta.hot.on('angular:component-update'"));
+        assert!(result
+            .source
+            .contains("i0.\u{0275}\u{0275}replaceMetadata(CounterComponent"));
+
+        // HMR artifacts present, with the expected id, and the update module
+        // is valid JavaScript that re-applies ɵcmp.
+        let hmr = result.hmr.expect("hmr artifacts present");
+        assert_eq!(hmr.components.len(), 1);
+        let comp = &hmr.components[0];
+        assert_eq!(comp.class_name, "CounterComponent");
+        assert_eq!(
+            comp.id,
+            "src%2Fapp%2Fcounter.component.ts%40CounterComponent"
+        );
+        assert!(comp
+            .update_module_source
+            .contains("CounterComponent.\u{0275}cmp"));
+        // The served update module must already be valid JS (TS stripped).
+        let alloc = oxc_allocator::Allocator::default();
+        let parsed = oxc_parser::Parser::new(
+            &alloc,
+            &comp.update_module_source,
+            oxc_span::SourceType::mjs(),
+        )
+        .parse();
+        assert!(
+            parsed.errors.is_empty(),
+            "update module should be valid JS: {:?}\n\n{}",
+            parsed.errors,
+            comp.update_module_source
+        );
+        // No factory reassignment (template/style-only update path).
+        assert!(!comp.update_module_source.contains(".\u{0275}fac"));
+    }
+
+    #[test]
+    fn test_no_hmr_artifacts_when_disabled() {
+        let source = "import { Component } from '@angular/core';\n\n@Component({\n  selector: 'app-x',\n  standalone: true,\n  template: '<div>{{ x }}</div>',\n})\nexport class XComponent { x = 1; }\n";
+        let path = PathBuf::from("/proj/src/x.component.ts");
+        let style_ctx = StyleContext::default();
+        let result =
+            compile_component_with_options(source, &path, &style_ctx, &CompileOptions::default())
+                .expect("compile");
+        assert!(result.hmr.is_none());
+        assert!(!result.source.contains("import * as i0"));
     }
 
     #[test]

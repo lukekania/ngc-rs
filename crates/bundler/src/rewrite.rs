@@ -66,6 +66,7 @@ pub fn rewrite_module(
         None,
         &HashSet::new(),
         &HashMap::new(),
+        &HashSet::new(),
         false,
     )
 }
@@ -83,6 +84,7 @@ pub fn rewrite_module_with_shaking(
     unused_exports: Option<&HashSet<String>>,
     bundled_specifiers: &HashSet<String>,
     namespace_map: &HashMap<String, String>,
+    external_specifiers: &HashSet<String>,
     preserve_exports: bool,
 ) -> NgcResult<RewrittenModule> {
     let allocator = Allocator::new();
@@ -116,6 +118,7 @@ pub fn rewrite_module_with_shaking(
                 unused_exports,
                 bundled_specifiers,
                 namespace_map,
+                external_specifiers,
                 preserve_exports,
             )
         } else {
@@ -158,12 +161,18 @@ fn collect_module_decl_edits(
     unused_exports: Option<&HashSet<String>>,
     bundled_specifiers: &HashSet<String>,
     namespace_map: &HashMap<String, String>,
+    external_specifiers: &HashSet<String>,
     preserve_exports: bool,
 ) -> bool {
     match module_decl {
         ModuleDeclaration::ImportDeclaration(import) => {
             let source = import.source.value.as_str();
-            if is_local(source, local_prefixes, bundled_specifiers) {
+            if is_local(
+                source,
+                local_prefixes,
+                bundled_specifiers,
+                external_specifiers,
+            ) {
                 // Check if this import has a namespace mapping (npm module)
                 if let Some(ns) = namespace_map.get(source) {
                     // Replace import with namespace lookups
@@ -326,6 +335,7 @@ fn collect_module_decl_edits(
                 export.source.value.as_str(),
                 local_prefixes,
                 bundled_specifiers,
+                external_specifiers,
             ) =>
         {
             edits.push(TextEdit {
@@ -774,15 +784,44 @@ fn get_declaration_name(decl: &oxc_ast::ast::Declaration) -> Option<String> {
 }
 
 /// Check if an import specifier is local based on known prefixes or bundled specifiers.
+///
+/// `external_specifiers` is a *veto* set — when a specifier matches one of
+/// its entries (by exact name or `<name>/...` subpath), it is treated as
+/// external no matter what else would classify it. This is how
+/// `angular.json`'s `externalDependencies` keeps imports like
+/// `import $ from 'jquery'` from being inlined.
 fn is_local(
     specifier: &str,
     local_prefixes: &[&str],
     bundled_specifiers: &HashSet<String>,
+    external_specifiers: &HashSet<String>,
 ) -> bool {
+    if matches_external_specifier(specifier, external_specifiers) {
+        return false;
+    }
     local_prefixes
         .iter()
         .any(|prefix| specifier.starts_with(prefix))
         || bundled_specifiers.contains(specifier)
+}
+
+/// Returns true when `specifier` is either an exact entry in
+/// `external_specifiers` or a subpath of one (e.g. `jquery/dist/jquery.slim`
+/// when `external_specifiers` lists `jquery`). Mirrors esbuild's `--external`
+/// matching, which is what `@angular/build:application` uses under the hood.
+pub(crate) fn matches_external_specifier(
+    specifier: &str,
+    external_specifiers: &HashSet<String>,
+) -> bool {
+    if external_specifiers.is_empty() {
+        return false;
+    }
+    if external_specifiers.contains(specifier) {
+        return true;
+    }
+    external_specifiers
+        .iter()
+        .any(|ext| specifier.starts_with(ext) && specifier[ext.len()..].starts_with('/'))
 }
 
 /// Apply text edits to the source, producing the rewritten code.
@@ -1094,6 +1133,7 @@ mod tests {
             Some(&unused),
             &HashSet::new(),
             &HashMap::new(),
+            &HashSet::new(),
             false,
         )
         .expect("should rewrite");
@@ -1128,6 +1168,7 @@ mod tests {
             Some(&empty_unused),
             &HashSet::new(),
             &HashMap::new(),
+            &HashSet::new(),
             false,
         )
         .expect("should rewrite");
@@ -1155,6 +1196,7 @@ mod tests {
             Some(&unused),
             &HashSet::new(),
             &HashMap::new(),
+            &HashSet::new(),
             false,
         )
         .expect("should rewrite");
@@ -1185,6 +1227,7 @@ mod tests {
             Some(&empty_unused),
             &HashSet::new(),
             &HashMap::new(),
+            &HashSet::new(),
             false,
         )
         .expect("should rewrite");

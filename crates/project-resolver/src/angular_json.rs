@@ -93,6 +93,32 @@ pub enum RawLocaleEntry {
 pub struct RawArchitect {
     /// Build target configuration.
     pub build: Option<RawBuildTarget>,
+    /// Serve (dev-server) target configuration. Only the options ngc-rs
+    /// honours are modelled — currently just `hmr`.
+    pub serve: Option<RawServeTarget>,
+}
+
+/// A serve target (`@angular/build:dev-server`) with default options and
+/// named configurations. Only the subset ngc-rs reads is modelled.
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RawServeTarget {
+    /// Default serve options.
+    pub options: Option<RawServeOptions>,
+    /// Named configurations (e.g. "production", "development").
+    pub configurations: Option<HashMap<String, RawServeOptions>>,
+    /// Default configuration name used when none is specified.
+    pub default_configuration: Option<String>,
+}
+
+/// Serve options from `architect.serve.options` (or a per-configuration
+/// block). Only `hmr` is honoured today.
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RawServeOptions {
+    /// Enable Hot Module Replacement. When absent, ngc-rs defaults to `false`
+    /// (full-reload live reload).
+    pub hmr: Option<bool>,
 }
 
 /// A build target with default options and named configurations.
@@ -160,6 +186,11 @@ pub struct RawBuildOptions {
     /// CDN libraries, polyfill shims that don't fit through `polyfills.ts`).
     /// Each entry is a string path or `{ input, inject, bundleName }` object.
     pub scripts: Option<Vec<RawScriptEntry>>,
+    /// npm package names that should NOT be bundled — their `import` statements
+    /// stay as bare ESM specifiers for the runtime (browser import map, CDN
+    /// loader, etc.) to resolve. Matches `@angular/build:application`'s
+    /// `externalDependencies` option.
+    pub external_dependencies: Option<Vec<String>>,
 }
 
 /// One entry in `architect.build.options.budgets` (or in a per-configuration
@@ -376,6 +407,11 @@ pub struct RawBuildConfiguration {
     /// of the base `define` map: same-key entries replace the base value,
     /// keys that appear only in the base are preserved.
     pub define: Option<HashMap<String, String>>,
+    /// Override for `externalDependencies`. When present, replaces the
+    /// base list (matches `@angular/build:application`'s semantics — the
+    /// configuration value wholly substitutes for the base value rather
+    /// than appending).
+    pub external_dependencies: Option<Vec<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -515,6 +551,18 @@ pub struct ResolvedAngularProject {
     /// entry that shares the same `bundleName`. Empty when no `scripts`
     /// are declared.
     pub scripts: Vec<ResolvedScriptBundle>,
+    /// npm package names declared as `externalDependencies` in
+    /// `angular.json`. Imports matching one of these specifiers stay as
+    /// bare ESM specifiers in the emitted bundle — the package is not
+    /// inlined and the resolver does not BFS into its modules. Matching
+    /// is by exact name or `<name>/...` prefix, mirroring how
+    /// `@angular/build:application` (esbuild) treats package externals.
+    pub external_dependencies: Vec<String>,
+    /// Resolved `architect.serve.options.hmr` (with the active
+    /// configuration's override layered on top). `false` when absent —
+    /// matching ngc-rs's default of full-reload live reload. The CLI
+    /// `--hmr`/`--no-hmr` flag takes precedence over this value.
+    pub hmr: bool,
 }
 
 /// Type of a resolved size budget.
@@ -816,6 +864,29 @@ pub fn resolve_angular_project(
         .map(|raw_scripts| resolve_scripts(raw_scripts, &base_dir))
         .unwrap_or_default();
 
+    // `externalDependencies` resolution: per-configuration override wholly
+    // replaces the base list when present (matching ng build's behaviour).
+    let external_dependencies = build_config
+        .and_then(|bc| bc.external_dependencies.clone())
+        .or_else(|| options.and_then(|o| o.external_dependencies.clone()))
+        .unwrap_or_default();
+
+    // Resolve serve `hmr`: base serve options, with the active
+    // configuration's serve override layered on top when present. Absent →
+    // `false` (full-reload live reload). The serve target reuses the same
+    // configuration name as the build (matching `ng serve -c <config>`).
+    let serve_target = project.architect.as_ref().and_then(|a| a.serve.as_ref());
+    let serve_options = serve_target.and_then(|st| st.options.as_ref());
+    let serve_config = config_name.as_deref().and_then(|cn| {
+        serve_target
+            .and_then(|st| st.configurations.as_ref())
+            .and_then(|configs| configs.get(cn))
+    });
+    let hmr = serve_config
+        .and_then(|sc| sc.hmr)
+        .or_else(|| serve_options.and_then(|o| o.hmr))
+        .unwrap_or(false);
+
     debug!(
         project = %name,
         output_path = %output_path.display(),
@@ -847,6 +918,8 @@ pub fn resolve_angular_project(
         budgets,
         define,
         scripts,
+        external_dependencies,
+        hmr,
     })
 }
 
@@ -1079,6 +1152,61 @@ mod tests {
         assert_eq!(result.project_name, "my-app");
         assert!(result.output_path.ends_with("dist/my-app"));
         assert!(result.ts_config.ends_with("tsconfig.app.json"));
+    }
+
+    #[test]
+    fn test_hmr_defaults_to_false_when_no_serve_target() {
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "architect": {
+                        "build": { "options": { "tsConfig": "tsconfig.json" } }
+                    }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let result = resolve_angular_project(f.path(), None, None).unwrap();
+        assert!(!result.hmr);
+    }
+
+    #[test]
+    fn test_hmr_read_from_serve_options() {
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "architect": {
+                        "build": { "options": { "tsConfig": "tsconfig.json" } },
+                        "serve": { "options": { "hmr": true } }
+                    }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let result = resolve_angular_project(f.path(), None, None).unwrap();
+        assert!(result.hmr);
+    }
+
+    #[test]
+    fn test_hmr_serve_configuration_overrides_base() {
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "architect": {
+                        "build": { "options": { "tsConfig": "tsconfig.json" } },
+                        "serve": {
+                            "options": { "hmr": false },
+                            "configurations": { "development": { "hmr": true } }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let base = resolve_angular_project(f.path(), None, None).unwrap();
+        assert!(!base.hmr, "base serve options keep hmr false");
+        let dev = resolve_angular_project(f.path(), None, Some("development")).unwrap();
+        assert!(dev.hmr, "development configuration overrides hmr to true");
     }
 
     #[test]
@@ -1809,6 +1937,81 @@ mod tests {
         let f = write_temp_json(json);
         let result = resolve_angular_project(f.path(), None, None).unwrap();
         assert!(result.define.is_empty());
+    }
+
+    #[test]
+    fn test_parse_external_dependencies() {
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "architect": {
+                        "build": {
+                            "options": {
+                                "outputPath": "dist",
+                                "tsConfig": "tsconfig.json",
+                                "externalDependencies": ["jquery", "@stripe/stripe-js"]
+                            }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let result = resolve_angular_project(f.path(), None, None).unwrap();
+        assert_eq!(
+            result.external_dependencies,
+            vec!["jquery".to_string(), "@stripe/stripe-js".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_external_dependencies_default_to_empty() {
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "architect": {
+                        "build": {
+                            "options": { "outputPath": "dist", "tsConfig": "tsconfig.json" }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let result = resolve_angular_project(f.path(), None, None).unwrap();
+        assert!(result.external_dependencies.is_empty());
+    }
+
+    #[test]
+    fn test_external_dependencies_configuration_override_replaces_base() {
+        // Per-configuration `externalDependencies` wholly replaces the base
+        // list (matches @angular/build:application).
+        let json = r#"{
+            "projects": {
+                "app": {
+                    "architect": {
+                        "build": {
+                            "options": {
+                                "outputPath": "dist",
+                                "tsConfig": "tsconfig.json",
+                                "externalDependencies": ["jquery"]
+                            },
+                            "configurations": {
+                                "production": {
+                                    "externalDependencies": ["@stripe/stripe-js"]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let f = write_temp_json(json);
+        let result = resolve_angular_project(f.path(), None, Some("production")).unwrap();
+        assert_eq!(
+            result.external_dependencies,
+            vec!["@stripe/stripe-js".to_string()]
+        );
     }
 
     #[test]
