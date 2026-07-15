@@ -349,13 +349,13 @@ pub fn transform_host_directives_array(source_text: &str) -> Option<String> {
     }
 
     let arr = match parsed.program.body.first() {
-        Some(Statement::VariableDeclaration(decl)) => match decl.declarations.first() {
-            Some(d) => match &d.init {
+        Some(Statement::VariableDeclaration(decl)) => {
+            let d = decl.declarations.first()?;
+            match &d.init {
                 Some(Expression::ArrayExpression(a)) => a,
                 _ => return None,
-            },
-            None => return None,
-        },
+            }
+        }
         _ => return None,
     };
 
